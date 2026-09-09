@@ -1,0 +1,73 @@
+[package]
+name = "remgr"
+version = "0.1.0"
+edition = "2021"
+description = "ReMgr - Relay Manager - All-in-one relay server manager for OpenBSD"
+default-run = "remgr"
+
+[[bin]]
+name = "remgr"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Web server  
+axum = { version = "0.7", features = ["ws", "macros"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["fs", "cors", "trace"] }
+hyper = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+bytes = "1"
+
+# Database (bundled sqlite for static linking)
+rusqlite = { version = "0.32", features = ["bundled"] }
+uuid = { version = "1", features = ["v4"] }
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+# Utility crates
+libc = "0.2"
+once_cell = "1"
+parking_lot = "0.12"
+async-trait = "0.1"
+futures-util = "0.3"
+pin-project-lite = "0.2"
+
+# TLS - Using rustls for secure connections
+rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+
+# Certificate generation - P-384 support via rcgen
+rcgen = "0.11"
+ring = "0.17"
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+
+# Argon2 password hashing
+argon2 = { version = "0.5", features = ["std"] }
+password-hash = "0.5"
+rand = "0.8"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = true
+
+[profile.dev]
+opt-level = 0
+debug = true
