@@ -292,7 +292,7 @@ async fn start_stun_turn(Extension(state): Extension<SharedState>) -> Json<bool>
         return Json(false);
     }
     st.stun_turn.running = true;
-    let inst = st.stun_turn_instance.write().await;
+    let mut inst = st.stun_turn_instance.write().await;
     inst.start().await.ok();
     Json(true)
 }
@@ -300,7 +300,7 @@ async fn start_stun_turn(Extension(state): Extension<SharedState>) -> Json<bool>
 async fn stop_stun_turn(Extension(state): Extension<SharedState>) -> Json<bool> {
     let mut st = state.write().await;
     st.stun_turn.running = false;
-    let inst = st.stun_turn_instance.write().await;
+    let mut inst = st.stun_turn_instance.write().await;
     inst.stop().await.ok();
     Json(true)
 }
