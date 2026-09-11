@@ -127,7 +127,7 @@ pub struct FrpsConfig {
     pub vhost_https_port: u16,
     #[serde(default = "default_frps_token")]
     pub token: String,
-    #[serde(default = "default_dashboard_user")]
+    #[serde(default = "default_dashboard_user_frps")]
     pub dashboard_user: String,
     #[serde(default)]
     pub dashboard_pwd: String,
@@ -149,7 +149,7 @@ fn default_dashboard_port() -> u16 { 7500 }
 fn default_vhost_http_port() -> u16 { 80 }
 fn default_vhost_https_port() -> u16 { 443 }
 fn default_frps_token() -> String { "default_token".to_string() }
-fn default_dashboard_user() -> String { "admin".to_string() }
+fn default_dashboard_user_frps() -> String { "admin".to_string() }
 fn default_max_pool_count() -> u32 { 200 }
 fn default_sub_modules() -> u32 { 10 }
 fn default_bind_addr() -> String { "0.0.0.0".to_string() }
@@ -179,8 +179,8 @@ impl Config {
         if self.dashboard.username.is_empty() {
             self.dashboard.username = "admin".to_string();
         }
-        let password = auth::generate_random_password(16);
-        self.dashboard.password_hash = auth::hash_password(&password);
+        let password = crate::auth::generate_random_password(16);
+        self.dashboard.password_hash = crate::auth::hash_password(&password);
         self.save()?;
         Ok(Some(password))
     }

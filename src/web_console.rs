@@ -22,6 +22,30 @@ pub async fn websocket_handler(ws: WebSocketUpgrade, Extension(state): Extension
     ws.on_upgrade(|socket| handle_socket(socket, state))
 }
 
+async fn handle_socket(socket: WebSocket, state: SharedState) {
+    let (mut sender, mut receiver) = socket.split();
+
+    // Send initial status
+    let initial_status = state.read().await.clone();
+    if let Ok(json) = serde_json::to_string(&initial_status) {
+        let _ = sender.send(Message::Text(json)).await;
+    }
+
+    // Keep connection alive and listen for messages
+    while let Some(msg) = receiver.next().await {
+        match msg {
+            Ok(Message::Text(text)) => {
+                if text == "ping" {
+                    let _ = sender.send(Message::Text("pong".to_string())).await;
+                }
+            }
+            Ok(Message::Close(_)) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+}
+
 /// Embedded Web UI with all services and their full configurations
 const EMBEDDED_UI: &str = r#"<!DOCTYPE html>
 <html lang="en">

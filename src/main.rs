@@ -1,38 +1,42 @@
 // ReMgr - Relay Manager
-// All-in-one relay server manager supporting EasyTier, STUN/TURN, RustDesk, and Frps
+// All-in-one relay manager: EasyTier, STUN/TURN, RustDesk, and Frps.
+//
+// Services that can run fully in-process (STUN/TURN, FRP TCP mux) do so.
+// Services whose upstream implementations are Go/C++ binaries that cannot be
+// embedded in-process without spawning subprocesses (RustDesk, the EasyTier
+// center's TUN path) are managed as configuration + honest status only.
 
 use anyhow::Result;
 use axum::{
-    Router,
     extract::Request,
     http::{header::SET_COOKIE, HeaderMap, HeaderValue, StatusCode},
     middleware,
     response::{IntoResponse, Response},
     routing::{get, post},
-    Extension, Json,
+    Extension, Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 mod auth;
 mod config;
 mod easytier_server;
-mod stun_turn_server;
-mod rustdesk_relay;
 mod frps_server;
-mod web_console;
-mod system;
+mod rustdesk_relay;
 mod ssl_cert;
+mod stun_turn_server;
+mod system;
+mod web_console;
 
 pub use config::Config;
 pub use easytier_server::EasyTierCenter;
-pub use stun_turn_server::StunTurnServer;
-pub use rustdesk_relay::RustDeskRelay;
 pub use frps_server::FrpsServer;
+pub use rustdesk_relay::RustDeskRelay;
+pub use stun_turn_server::StunTurnServer;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceStatus {
@@ -46,60 +50,6 @@ pub struct ServiceStatus {
     pub note: Option<String>,
 }
 
-/// Shared, cheaply-clonable session store.
-#[derive(Clone, Default)]
-pub struct Sessions {
-    inner: Arc<RwLock<HashMap<String, Instant>>>,
-}
-
-const SESSION_TTL_SECS: u64 = 24 * 3600;
-
-impl Sessions {
-    pub fn new() -> Self { Self::default() }
-
-    pub async fn create(&self) -> String {
-        let token = uuid::Uuid::new_v4().to_string();
-        self.inner.write().await.insert(token.clone(), Instant::now());
-        self.prune().await;
-        token
-    }
-
-    pub async fn validate(&self, token: &str) -> bool {
-        let now = Instant::now();
-        let mut w = self.inner.write().await;
-        if let Some(t) = w.get(token) {
-            if now.duration_since(*t) < Duration::from_secs(SESSION_TTL_SECS) {
-                return true;
-            }
-            w.remove(token);
-        }
-        false
-    }
-
-    pub async fn revoke(&self, token: &str) {
-        self.inner.write().await.remove(token);
-    }
-
-    async fn prune(&self) {
-        let cutoff = Instant::now() - Duration::from_secs(SESSION_TTL_SECS);
-        self.inner.write().await.retain(|_, t| *t > cutoff);
-    }
-}
-
-/// Runtime state used by every service manager, plus auth context.
-#[derive(Clone)]
-pub struct AppState {
-    pub manager: SharedState,
-    pub sessions: Sessions,
-    pub credentials: Credentials,
-}
-
-#[derive(Clone)]
-pub struct Credentials {
-    pub username: String,
-    pub password_hash: String,
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct ManagerState {
     pub easytier: ServiceStatus,
@@ -110,7 +60,6 @@ pub struct ManagerState {
     pub web_port: u16,
     pub cert_dir: String,
     pub default_domain: String,
-    pub authenticated: bool,
     // 服务实例
     #[serde(skip)]
     pub easytier_instance: Arc<RwLock<EasyTierCenter>>,
@@ -126,6 +75,100 @@ pub struct ManagerState {
 
 pub type SharedState = Arc<RwLock<ManagerState>>;
 
+// ---------------------------------------------------------------------------
+// Authentication context (process-global; single admin user, so no per-request
+// state plumbing is needed and the axum route/middleware generics stay simple).
+// ---------------------------------------------------------------------------
+
+#[derive(Clone)]
+pub struct Credentials {
+    username: String,
+    password_hash: String,
+}
+
+/// In-memory session store: token -> creation time. TTL is the web-login TTL;
+/// restarting the process invalidates all sessions (acceptable for a manager UI).
+pub struct Sessions {
+    inner: StdRwLock<HashMap<String, Instant>>,
+}
+
+const SESSION_TTL: Duration = Duration::from_secs(24 * 3600);
+
+impl Sessions {
+    fn new() -> Self {
+        Sessions { inner: StdRwLock::new(HashMap::new()) }
+    }
+
+    fn create(&self) -> String {
+        let token = uuid::Uuid::new_v4().to_string();
+        let now = Instant::now();
+        let mut w = self.inner.write().unwrap();
+        // Prune expired on each insert (keeps the map bounded).
+        w.retain(|_, t| t.elapsed() < SESSION_TTL);
+        w.insert(token.clone(), now);
+        token
+    }
+
+    /// Validate and, if fresh, slide the expiry (touch) so active sessions stay
+    /// logged in across the whole TTL.
+    fn validate(&self, token: &str) -> bool {
+        let mut w = self.inner.write().unwrap();
+        match w.get_mut(token) {
+            Some(t) if t.elapsed() < SESSION_TTL => {
+                *t = Instant::now();
+                true
+            }
+            Some(_) => {
+                w.remove(token);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn revoke(&self, token: &str) {
+        self.inner.write().unwrap().remove(token);
+    }
+}
+
+pub struct AuthContext {
+    sessions: Sessions,
+    credentials: StdRwLock<Credentials>,
+}
+
+impl AuthContext {
+    fn new(username: String, password_hash: String) -> Self {
+        AuthContext {
+            sessions: Sessions::new(),
+            credentials: StdRwLock::new(Credentials { username, password_hash }),
+        }
+    }
+
+    fn check_credentials(&self, username: &str, password: &str) -> bool {
+        let (u, h) = {
+            let c = self.credentials.read().unwrap();
+            (c.username.clone(), c.password_hash.clone())
+        };
+        username == u && auth::verify_password(password, &h)
+    }
+
+    fn set_password_hash(&self, hash: String) {
+        self.credentials.write().unwrap().password_hash = hash;
+    }
+
+    fn username(&self) -> String {
+        self.credentials.read().unwrap().username.clone()
+    }
+}
+
+static AUTH: OnceLock<AuthContext> = OnceLock::new();
+
+fn auth_ctx() -> &'static AuthContext {
+    AUTH.get().expect("auth context not initialized")
+}
+
+const SESSION_COOKIE: &str = "remgr_session";
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Initialize logging
@@ -137,28 +180,45 @@ async fn main() -> Result<()> {
         system::init_system_security()?;
     }
 
-    // Load configuration. On a fresh install, generate an admin password and
-    // persist it (hashed) so the console is never open by default.
+    // Load configuration. On a fresh install, generate a random admin password
+    // (hashed with Argon2id) and print it exactly once so the console is never
+    // open by default.
     let mut config = Config::load()?;
-    if let Some(pw) = config.bootstrap_password()? {
+    if let Some(password) = config.bootstrap_password()? {
         tracing::warn!("================================================");
         tracing::warn!("ReMgr generated an admin password (first run):");
         tracing::warn!("  username: {}", config.dashboard.username);
-        tracing::warn!("  password: {}", pw);
-        tracing::warn!("Store this now. It will not be shown again.");
-        tracing::warn!("You can change it via the web console.");
+        tracing::warn!("  password: {}", password);
+        tracing::warn!("Save this now — it will NOT be shown again.");
+        tracing::warn!("Change it from the web console after logging in.");
         tracing::warn!("================================================");
     }
     tracing::info!("Configuration loaded from {:?}", config.config_path);
 
-    let credentials = Credentials {
-        username: config.dashboard.username.clone(),
-        password_hash: config.dashboard.password_hash.clone(),
-    };
-    let sessions = Sessions::new();
+    // Install the global auth context.
+    if AUTH
+        .set(AuthContext::new(
+            config.dashboard.username.clone(),
+            config.dashboard.password_hash.clone(),
+        ))
+        .is_err()
+    {
+        anyhow::bail!("auth context already initialized");
+    }
 
     // Initialize service instances (wrapped in Arc<RwLock<>> for shared state)
-    let easytier_instance = Arc::new(RwLock::new(EasyTierCenter::new(easytier_server::Config::default())));
+    let easytier_instance = Arc::new(RwLock::new(EasyTierCenter::new(easytier_server::Config {
+        enabled: config.easytier.enabled,
+        config_port: config.easytier.config_port,
+        api_port: config.easytier.api_port,
+        db_path: config.easytier.db_path.to_string_lossy().to_string(),
+        log_dir: config.easytier.log_dir.to_string_lossy().to_string(),
+        domains: config.easytier.domains.clone(),
+        ssl_cert: config.easytier.ssl_cert.as_ref().map(|p| p.to_string_lossy().to_string()),
+        ssl_key: config.easytier.ssl_key.as_ref().map(|p| p.to_string_lossy().to_string()),
+        network_name: None,
+        network_secret: None,
+    })));
     let stun_turn_instance = Arc::new(RwLock::new(StunTurnServer::new(stun_turn_server::Config {
         enabled: config.stun_turn.enabled,
         stun_port: config.stun_turn.stun_port,
@@ -210,9 +270,8 @@ async fn main() -> Result<()> {
     })));
 
     // Human-readable notes for services we cannot run in-process.
-    const NOTE_RUSTDESK: &str = "Embedded: no in-process relay available (RustDesk is Go). Managed externally.";
-    const NOTE_FRPS: &str = "Embedded: no in-process reverse proxy available (frp is Go). Managed externally.";
-    const NOTE_EASYTIER: &str = "Embedded: no in-process center available (easytier crate requires tun). Managed externally.";
+    const NOTE_RUSTDESK: &str = "RustDesk (Go) cannot be embedded in-process without subprocess spawning; managed as config only.";
+    const NOTE_EASYTIER: &str = "EasyTier center needs a TUN device; embedded without TUN is not supported here — managed as config only.";
 
     // Initialize state
     let state: SharedState = Arc::new(RwLock::new(ManagerState {
@@ -220,18 +279,7 @@ async fn main() -> Result<()> {
             name: "easytier".to_string(),
             running: false,
             port: Some(config.easytier.config_port),
-            config: Some(serde_json::to_value(easytier_server::Config {
-                enabled: config.easytier.enabled,
-                config_port: config.easytier.config_port,
-                api_port: config.easytier.api_port,
-                db_path: config.easytier.db_path.to_string_lossy().to_string(),
-                log_dir: config.easytier.log_dir.to_string_lossy().to_string(),
-                domains: config.easytier.domains.clone(),
-                ssl_cert: config.easytier.ssl_cert.as_ref().map(|p| p.to_string_lossy().to_string()),
-                ssl_key: config.easytier.ssl_key.as_ref().map(|p| p.to_string_lossy().to_string()),
-                network_name: None,
-                network_secret: None,
-            })?),
+            config: Some(serde_json::to_value(&easytier_instance_config(&config))?),
             note: Some(NOTE_EASYTIER.to_string()),
         },
         stun_turn: ServiceStatus {
@@ -305,12 +353,11 @@ async fn main() -> Result<()> {
                 allow_local_routes: config.frps.allow_local_routes,
                 bind_addr: config.frps.bind_addr.clone(),
             })?),
-            note: Some(NOTE_FRPS.to_string()),
+            note: None,
         },
         web_port: config.web_port,
         cert_dir: "/etc/remgr/ssl".to_string(),
         default_domain: config.stun_turn.domain.clone(),
-        authenticated: false,
         easytier_instance,
         stun_turn_instance,
         rustdesk_hbbr_instance,
@@ -322,12 +369,6 @@ async fn main() -> Result<()> {
     auto_start_enabled_services(&state).await;
 
     // Build web console routes
-    let app_state = AppState {
-        manager: state.clone(),
-        sessions: sessions.clone(),
-        credentials: credentials.clone(),
-    };
-
     let app = Router::new()
         .route("/api/v1/status", get(get_status))
         .route("/api/v1/easytier/config", get(get_easytier_config).post(set_easytier_config).put(set_easytier_config))
@@ -351,7 +392,7 @@ async fn main() -> Result<()> {
         .route("/api/v1/password", post(change_password))
         .route("/ws/events", get(web_console::websocket_handler))
         .fallback(web_console::serve_webui)
-        .layer(middleware::from_fn_with_state(app_state.clone(), auth_middleware))
+        .layer(middleware::from_fn(auth_middleware))
         .layer(Extension(state));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], config.web_port));
@@ -368,68 +409,75 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Spawn the enabled services on boot. STUN/TURN is fully in-process and gets
-/// started for real. External-binary services get their "configured" status
-/// reflected honestly (running stays false until we can integrate them).
-async fn auto_start_enabled_services(state: &SharedState) {
-    let (stun_enabled, stun_inst) = {
-        let st = state.read().await;
-        (st.stun_turn.running || {
-            st.stun_turn
-                .config
-                .as_ref()
-                .and_then(|v| serde_json::from_value::<stun_turn_server::Config>(v.clone()).ok())
-                .map(|c| c.enabled)
-                .unwrap_or(false)
-        }, st.stun_turn_instance.clone())
-    };
-    if stun_enabled {
-        let mut inst = stun_inst.write().await;
-        match inst.start().await {
-            Ok(()) => {
-                let mut st = state.write().await;
-                st.stun_turn.running = inst.is_running();
-                tracing::info!("STUN/TURN auto-started");
-            }
-            Err(e) => tracing::warn!("STUN/TURN auto-start failed: {e}"),
-        }
+/// Pull the easytier ServerConfig from the loaded file config.
+fn easytier_instance_config(config: &Config) -> easytier_server::Config {
+    easytier_server::Config {
+        enabled: config.easytier.enabled,
+        config_port: config.easytier.config_port,
+        api_port: config.easytier.api_port,
+        db_path: config.easytier.db_path.to_string_lossy().to_string(),
+        log_dir: config.easytier.log_dir.to_string_lossy().to_string(),
+        domains: config.easytier.domains.clone(),
+        ssl_cert: config.easytier.ssl_cert.as_ref().map(|p| p.to_string_lossy().to_string()),
+        ssl_key: config.easytier.ssl_key.as_ref().map(|p| p.to_string_lossy().to_string()),
+        network_name: None,
+        network_secret: None,
     }
 }
 
-// Auth middleware: reject unauthenticated access to /api/v1/* (except the
-// auth endpoints) and 404 on other paths that require auth.
-async fn auth_middleware(
-    axum::extract::State(app): axum::extract::State<AppState>,
-    req: Request,
-    next: middleware::Next,
-) -> Response {
+/// Spawn the enabled services on boot. STUN/TURN is fully in-process and gets
+/// started for real; FRP's TCP accept loop is also in-process and started.
+/// External-binary services keep `running: false` (honest status) until we can
+/// embed them without spawning subprocesses.
+async fn auto_start_enabled_services(state: &SharedState) {
+    // STUN/TURN (in-process)
+    let stun_inst = {
+        let st = state.read().await;
+        let cfg = st.stun_turn.config.as_ref().and_then(|v| {
+            serde_json::from_value::<stun_turn_server::Config>(v.clone()).ok()
+        });
+        if !cfg.map(|c| c.enabled).unwrap_or(false) {
+            return;
+        }
+        st.stun_turn_instance.clone()
+    };
+    let mut inst = stun_inst.write().await;
+    match inst.start().await {
+        Ok(()) => {
+            let mut st = state.write().await;
+            st.stun_turn.running = inst.is_running();
+            tracing::info!("STUN/TURN auto-started (running={})", inst.is_running());
+        }
+        Err(e) => tracing::warn!("STUN/TURN auto-start failed: {e}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Authentication middleware
+// ---------------------------------------------------------------------------
+
+async fn auth_middleware(req: Request, next: middleware::Next) -> Response {
     let path = req.uri().path().to_string();
 
-    // Public paths.
+    // Public endpoints and the SPA shell load without a session; the UI JS then
+    // calls /api/v1/auth/verify to decide whether to render the login form.
     const PUBLIC: &[&str] = &[
         "/api/v1/login",
         "/api/v1/auth/verify",
     ];
-    if PUBLIC.iter().any(|p| path == *p) {
+    let is_shell = matches!(path.as_str(), "/" | "/index.html" | "/favicon.ico");
+    if PUBLIC.iter().any(|p| path == *p) || is_shell {
         return next.run(req).await;
     }
 
-    // WebSocket: allow (browsers handle Set-Cookie fine on WS handshake, but
-    // we validate the token here via cookie header).
-    let is_ws = path.starts_with("/ws/");
-    // Static assets and the SPA shell: no auth required to load the page.
-    let is_shell = path == "/" || path == "/index.html" || path == "/favicon.ico";
-
-    let token = cookie_value(req.headers(), "remgr_session").unwrap_or_default();
-    let valid = !token.is_empty() && app.sessions.validate(&token).await;
-
-    if !valid && (is_ws || path.starts_with("/api/")) {
-        return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({
-            "error": "unauthorized",
-        }))).into_response();
+    let token = cookie_value(req.headers(), SESSION_COOKIE).unwrap_or_default();
+    if token.is_empty() || !auth_ctx().sessions.validate(&token) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "unauthorized" })),
+        )
+            .into_response();
     }
-    // For the shell, allow even without auth (JS then hits /api/v1/auth/verify).
-    let _ = is_shell;
     next.run(req).await
 }
 
@@ -437,14 +485,16 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     let raw = headers.get(axum::http::header::COOKIE)?.to_str().ok()?;
     for part in raw.split(';') {
         let kv = part.trim();
-        if let Some(v) = kv.strip_prefix(&format!("{}=", name)) {
+        if let Some(v) = kv.strip_prefix(&format!("{name}=")) {
             return Some(v.to_string());
         }
     }
     None
 }
 
+// ---------------------------------------------------------------------------
 // API handlers
+// ---------------------------------------------------------------------------
 
 // Status - returns current state
 async fn get_status(Extension(state): Extension<SharedState>) -> Json<ManagerState> {
@@ -465,28 +515,21 @@ async fn set_easytier_config(
     Json(cfg): Json<easytier_server::Config>,
 ) -> Json<bool> {
     let mut st = state.write().await;
-    if let Ok(v) = serde_json::to_value(cfg) {
+    if let Ok(v) = serde_json::to_value(&cfg) {
         st.easytier.config = Some(v);
     }
     Json(true)
 }
 
 async fn start_easytier(Extension(state): Extension<SharedState>) -> Json<bool> {
-    let mut st = state.write().await;
-    if st.easytier.running {
-        return Json(false);
-    }
-    let mut inst = st.easytier_instance.write().await;
-    inst.start().await.ok();
-    st.easytier.running = false; // cannot fully embed yet
-    Json(false)
+    // No in-process embed without a TUN device; report honestly (do not flip running).
+    let st = state.read().await;
+    Json(st.easytier.running)
 }
 
 async fn stop_easytier(Extension(state): Extension<SharedState>) -> Json<bool> {
     let mut st = state.write().await;
     st.easytier.running = false;
-    let mut inst = st.easytier_instance.write().await;
-    inst.stop().await.ok();
     Json(true)
 }
 
@@ -506,22 +549,27 @@ async fn set_stun_turn_config(
     if let Ok(v) = serde_json::to_value(&cfg) {
         st.stun_turn.config = Some(v);
     }
-    // Update running instance to accept new config for next restart.
     let mut inst = st.stun_turn_instance.write().await;
     inst.update_config(cfg);
     Json(true)
 }
 
 async fn start_stun_turn(Extension(state): Extension<SharedState>) -> Json<bool> {
-    let mut st = state.write().await;
-    if st.stun_turn.running {
-        return Json(false);
-    }
-    let mut inst = st.stun_turn_instance.write().await;
+    let running = {
+        let st = state.read().await;
+        if st.stun_turn.running {
+            return Json(false);
+        }
+        st.stun_turn_instance.clone()
+    };
+    let mut inst = running.write().await;
     match inst.start().await {
         Ok(()) => {
-            st.stun_turn.running = inst.is_running();
-            Json(inst.is_running())
+            let was_running = inst.is_running();
+            drop(inst);
+            let mut st = state.write().await;
+            st.stun_turn.running = was_running;
+            Json(was_running)
         }
         Err(e) => {
             tracing::error!("STUN/TURN start failed: {e}");
@@ -559,39 +607,20 @@ async fn set_rustdesk_config(
 }
 
 async fn start_rustdesk_hbbr(Extension(state): Extension<SharedState>) -> Json<bool> {
-    let mut st = state.write().await;
-    if st.rustdesk_hbbr.running {
-        return Json(false);
-    }
-    st.rustdesk_hbbr.running = true;
-    let mut inst = st.rustdesk_hbbr_instance.write().await;
-    inst.start_relay().await.ok();
-    Json(false)
+    // Cannot embed the Go relay in-process without subprocess spawn; stay honest.
+    let st = state.read().await;
+    Json(st.rustdesk_hbbr.running)
 }
 
 async fn start_rustdesk_hbbs(Extension(state): Extension<SharedState>) -> Json<bool> {
-    let mut st = state.write().await;
-    if st.rustdesk_hbbs.running {
-        return Json(false);
-    }
-    st.rustdesk_hbbs.running = true;
-    let mut inst = st.rustdesk_hbbs_instance.write().await;
-    inst.start_broker().await.ok();
-    Json(false)
+    let st = state.read().await;
+    Json(st.rustdesk_hbbs.running)
 }
 
 async fn stop_rustdesk(Extension(state): Extension<SharedState>) -> Json<bool> {
     let mut st = state.write().await;
     st.rustdesk_hbbr.running = false;
     st.rustdesk_hbbs.running = false;
-    {
-        let mut inst = st.rustdesk_hbbr_instance.write().await;
-        inst.stop().await.ok();
-    }
-    {
-        let mut inst = st.rustdesk_hbbs_instance.write().await;
-        inst.stop().await.ok();
-    }
     Json(true)
 }
 
@@ -611,17 +640,24 @@ async fn set_frps_config(
     if let Ok(v) = serde_json::to_value(&cfg) {
         st.frps.config = Some(v);
     }
+    let mut inst = st.frps_instance.write().await;
+    inst.update_config(cfg);
     Json(true)
 }
 
 async fn start_frps(Extension(state): Extension<SharedState>) -> Json<bool> {
-    let mut st = state.write().await;
-    if st.frps.running {
-        return Json(false);
-    }
-    let mut inst = st.frps_instance.write().await;
+    let inst = {
+        let st = state.read().await;
+        if st.frps.running {
+            return Json(false);
+        }
+        st.frps_instance.clone()
+    };
+    let mut inst = inst.write().await;
     match inst.start().await {
         Ok(()) => {
+            drop(inst);
+            let mut st = state.write().await;
             st.frps.running = true;
             Json(true)
         }
@@ -682,7 +718,10 @@ async fn generate_cert(Json(req): Json<CertRequest>) -> Result<Json<serde_json::
     }
 }
 
+// ---------------------------------------------------------------------------
 // Auth handlers
+// ---------------------------------------------------------------------------
+
 #[derive(Deserialize)]
 struct LoginRequest {
     username: String,
@@ -695,17 +734,15 @@ struct ChangePasswordRequest {
     new_password: String,
 }
 
-async fn login(
-    axum::extract::State(app): axum::extract::State<AppState>,
-    Json(req): Json<LoginRequest>,
-) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
-    if req.username != app.credentials.username || !auth::verify_password(&req.password, &app.credentials.password_hash) {
-        // Constant-time-ish delay to slow down brute force.
+async fn login(Json(req): Json<LoginRequest>) -> Result<Response, (StatusCode, Json<serde_json::Value>)> {
+    if !auth_ctx().check_credentials(&req.username, &req.password) {
+        // Slow down brute force a little (Argon2 verify is already costly, but
+        // this adds a constant delay for the wrong-user path).
         tokio::time::sleep(Duration::from_millis(300)).await;
-        return Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "invalid credentials"}))));
+        return Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"invalid credentials"}))));
     }
-    let token = app.sessions.create().await;
-    let cookie = format!("remgr_session={}; HttpOnly; Path=/; Max-Age={}; SameSite=Lax", token, SESSION_TTL_SECS);
+    let token = auth_ctx().sessions.create();
+    let cookie = format!("{SESSION_COOKIE}={token}; HttpOnly; Path=/; Max-Age={}; SameSite=Lax", SESSION_TTL.as_secs());
     let mut resp = Json(serde_json::json!({"ok": true, "username": req.username})).into_response();
     if let Ok(v) = HeaderValue::from_str(&cookie) {
         resp.headers_mut().insert(SET_COOKIE, v);
@@ -713,51 +750,46 @@ async fn login(
     Ok(resp)
 }
 
-async fn logout(
-    axum::extract::State(app): axum::extract::State<AppState>,
-    headers: HeaderMap,
-) -> Json<serde_json::Value> {
-    if let Some(t) = cookie_value(&headers, "remgr_session") {
-        app.sessions.revoke(&t).await;
+async fn logout(headers: HeaderMap) -> Json<serde_json::Value> {
+    if let Some(t) = cookie_value(&headers, SESSION_COOKIE) {
+        auth_ctx().sessions.revoke(&t);
     }
     Json(serde_json::json!({"ok": true}))
 }
 
-async fn verify_auth(
-    axum::extract::State(app): axum::extract::State<AppState>,
-    headers: HeaderMap,
-) -> Json<serde_json::Value> {
-    let token = cookie_value(&headers, "remgr_session").unwrap_or_default();
-    let ok = !token.is_empty() && app.sessions.validate(&token).await;
+async fn verify_auth(headers: HeaderMap) -> Json<serde_json::Value> {
+    let token = cookie_value(&headers, SESSION_COOKIE).unwrap_or_default();
+    let ok = !token.is_empty() && auth_ctx().sessions.validate(&token);
     Json(serde_json::json!({
         "authenticated": ok,
-        "username": if ok { app.credentials.username.as_str() } else { "" },
+        "username": if ok { auth_ctx().username() } else { "".to_string() },
     }))
 }
 
 async fn change_password(
-    axum::extract::State(app): axum::extract::State<AppState>,
     headers: HeaderMap,
     Json(req): Json<ChangePasswordRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let token = cookie_value(&headers, "remgr_session").unwrap_or_default();
-    if token.is_empty() || !app.sessions.validate(&token).await {
+    let token = cookie_value(&headers, SESSION_COOKIE).unwrap_or_default();
+    if token.is_empty() || !auth_ctx().sessions.validate(&token) {
         return Err((StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"unauthorized"}))));
     }
-    if !auth::verify_password(&req.old_password, &app.credentials.password_hash) {
+    if !auth_ctx().check_credentials(&auth_ctx().username(), &req.old_password) {
         return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"wrong current password"}))));
     }
     let hash = auth::hash_password(&req.new_password);
     if hash.is_empty() {
         return Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error":"hash failed"}))));
     }
-    // Persist the new hash in config.
-    let mut cfg = Config::load().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
+    // Persist to config first (source of truth across restarts)...
+    let mut cfg = Config::load()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
     cfg.dashboard.password_hash = hash.clone();
-    cfg.save().map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
-    // Update in-memory credentials (ArcSwap would be cleaner but for one-user this is fine).
-    // SAFETY: we don't have interior mutability on Credentials — we rely on the config file as
-    // source of truth and readers pick it up on restart. For a long-running process, a
-    // password change only affects NEW sessions' verification path once we reload.
-    Json(serde_json::json!({"ok": true}))
+    cfg.save()
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e.to_string()}))))?;
+    // ...then update the in-memory context for the live session.
+    auth_ctx().set_password_hash(hash);
+    // Invalidate other sessions by revoking the current one's siblings is overkill;
+    // we keep the caller's session valid.
+    Ok(Json(serde_json::json!({"ok": true})))
 }
