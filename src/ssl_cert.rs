@@ -2,10 +2,10 @@
 // Generates self-signed certificates using P-384 elliptic curve.
 // Pure Rust implementation (no Python) for production use.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use rcgen::{
     CertificateParams, DistinguishedName, DnType,
-    KeyPair, SanType, PKCS_ECDSA_P384_SHA384,
+    KeyPair, PKCS_ECDSA_P384_SHA384, SanType,
 };
 use std::net::IpAddr;
 use std::path::PathBuf;
@@ -55,43 +55,36 @@ pub struct GeneratedCert {
 }
 
 /// Generate a self-signed certificate using P-384 ECDSA.
-/// Pure Rust, no Python, suitable for production deployment.
 pub fn generate_self_signed_p384(opts: &CertOptions) -> Result<GeneratedCert> {
     // Build a P-384 key pair
-    let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P384_SHA384)
-        .context("Failed to generate P-384 key pair")?;
+    let key_pair = KeyPair::generate(&PKCS_ECDSA_P384_SHA384)?;
 
     // Collect SAN DNS names
-    let mut params = CertificateParams::new(opts.dns_names.clone())
-        .context("Failed to create certificate params")?;
+    let mut params = CertificateParams::new(opts.dns_names.clone());
 
     params.distinguished_name = build_dn(opts);
     params.not_before = time::OffsetDateTime::now_utc();
     params.not_after = params.not_before + time::Duration::days(opts.validity_days as i64);
 
-    // Add IP SANs (rcgen 0.11 uses IpAddr directly in SanType)
+    // Add IP SANs
     for ip in &opts.ips {
-        params
-            .subject_alt_names
-            .push(SanType::IpAddress(*ip));
+        params.subject_alt_names.push(SanType::IpAddress(*ip));
     }
 
     // Self-sign the certificate
-    let cert = params
-        .self_signed(&key_pair)
-        .context("Failed to self-sign certificate")?;
+    let cert = rcgen::Certificate::from_params(params)?;
+
+    let cert_pem = cert.serialize_pem()?;
+    let key_pem = key_pair.serialize_pem();
 
     // Write to disk
-    std::fs::create_dir_all(&opts.output_dir)
-        .with_context(|| format!("Failed to create cert dir: {:?}", opts.output_dir))?;
+    std::fs::create_dir_all(&opts.output_dir)?;
 
     let cert_path = opts.output_dir.join(DEFAULT_CERT_FILE);
     let key_path = opts.output_dir.join(DEFAULT_KEY_FILE);
 
-    std::fs::write(&cert_path, cert.pem().as_bytes())
-        .with_context(|| format!("Failed to write cert to {:?}", cert_path))?;
-    std::fs::write(&key_path, key_pair.serialize_pem().as_bytes())
-        .with_context(|| format!("Failed to write key to {:?}", key_path))?;
+    std::fs::write(&cert_path, cert_pem.as_bytes())?;
+    std::fs::write(&key_path, key_pem.as_bytes())?;
 
     // Set proper permissions (0600 for key, 0644 for cert)
     #[cfg(unix)]
@@ -108,8 +101,8 @@ pub fn generate_self_signed_p384(opts: &CertOptions) -> Result<GeneratedCert> {
     );
 
     Ok(GeneratedCert {
-        cert_pem: cert.pem(),
-        key_pem: key_pair.serialize_pem(),
+        cert_pem,
+        key_pem,
         cert_path,
         key_path,
     })

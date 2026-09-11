@@ -8,6 +8,7 @@ use tokio::sync::RwLock;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    pub enabled: bool,
     pub server_port: u16,
     pub dashboard_port: u16,
     pub vhost_http_port: u16,
@@ -25,6 +26,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            enabled: true,
             server_port: 7000,
             dashboard_port: 7500,
             vhost_http_port: 80,
@@ -32,8 +34,8 @@ impl Default for Config {
             token: "default_token".to_string(),
             dashboard_user: "admin".to_string(),
             dashboard_pwd: "admin".to_string(),
-            max_pool_count: 20,
-            sub_modules_per_pool: 5,
+            max_pool_count: 200,
+            sub_modules_per_pool: 10,
             tcp_mux: true,
             allow_local_routes: false,
             bind_addr: "0.0.0.0".to_string(),
@@ -48,6 +50,17 @@ pub struct FrpsServer {
     clients: Arc<RwLock<HashMap<String, ClientInfo>>>,
     // Track proxy tasks
     proxies: Arc<RwLock<HashMap<String, ProxyInfo>>>,
+}
+
+impl std::fmt::Debug for FrpsServer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FrpsServer")
+            .field("config", &self.config)
+            .field("running", &self.running)
+            .field("clients", &self.clients)
+            .field("proxies", &self.proxies)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -3,11 +3,11 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
 use tokio::sync::RwLock;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
+    pub enabled: bool,
     pub config_port: u16,
     pub api_port: u16,
     pub db_path: String,
@@ -22,11 +22,12 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            enabled: true,
             config_port: 22020,
             api_port: 11211,
-            db_path: "/var/db/easytier/et.db".to_string(),
-            log_dir: "/var/log/easytier".to_string(),
-            domains: vec!["easytier://center".to_string()],
+            db_path: "/var/db/remgr/easytier/et.db".to_string(),
+            log_dir: "/var/log/remgr/easytier".to_string(),
+            domains: vec![],
             ssl_cert: None,
             ssl_key: None,
             network_name: None,
@@ -37,7 +38,16 @@ impl Default for Config {
 
 pub struct EasyTierCenter {
     config: Config,
-    networks: Arc<RwLock<HashMap<String, NetworkInfo>>>,
+    networks: RwLock<HashMap<String, NetworkInfo>>,
+}
+
+impl std::fmt::Debug for EasyTierCenter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EasyTierCenter")
+            .field("config", &self.config)
+            .field("networks", &"RwLock<HashMap<...>>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -52,29 +62,29 @@ impl EasyTierCenter {
     pub fn new(config: Config) -> Self {
         Self {
             config,
-            networks: Arc::new(RwLock::new(HashMap::new())),
+            networks: RwLock::new(HashMap::new()),
         }
     }
-    
+
     pub async fn start(&self) -> anyhow::Result<()> {
         // Ensure directories exist
         let db_path = std::path::Path::new(&self.config.db_path);
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        
+
         let log_path = std::path::Path::new(&self.config.log_dir);
         std::fs::create_dir_all(log_path)?;
-        
+
         // Initialize database
         self.init_database().await?;
-        
+
         // TODO: FFI integration with easytier-core library
         // For OpenBSD, we integrate with the existing easytier-core via FFI
-        
+
         Ok(())
     }
-    
+
     pub async fn stop(&self) -> anyhow::Result<()> {
         // Stop all managed networks
         let networks = self.networks.write().await;
@@ -84,12 +94,12 @@ impl EasyTierCenter {
         }
         Ok(())
     }
-    
+
     pub async fn list_networks(&self) -> Vec<NetworkInfo> {
         let networks = self.networks.read().await;
         networks.values().cloned().collect()
     }
-    
+
     pub async fn create_network(&self, name: &str, secret: &str) -> anyhow::Result<()> {
         let mut networks = self.networks.write().await;
         networks.insert(name.to_string(), NetworkInfo {
@@ -100,7 +110,7 @@ impl EasyTierCenter {
         });
         Ok(())
     }
-    
+
     pub async fn add_machine(&self, network: &str, machine_id: &str) -> anyhow::Result<()> {
         let mut networks = self.networks.write().await;
         if let Some(info) = networks.get_mut(network) {
@@ -110,7 +120,7 @@ impl EasyTierCenter {
         }
         Ok(())
     }
-    
+
     pub async fn remove_machine(&self, network: &str, machine_id: &str) -> anyhow::Result<()> {
         let mut networks = self.networks.write().await;
         if let Some(info) = networks.get_mut(network) {
@@ -118,12 +128,12 @@ impl EasyTierCenter {
         }
         Ok(())
     }
-    
+
     async fn init_database(&self) -> anyhow::Result<()> {
-        use rusqlite::{Connection, NO_PARAMS};
-        
+        use rusqlite::Connection;
+
         let conn = Connection::open(&self.config.db_path)?;
-        
+
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS networks (
@@ -148,16 +158,16 @@ impl EasyTierCenter {
                 config TEXT,
                 FOREIGN KEY (network_name) REFERENCES networks(name)
             );
-            "#
+            "#,
         )?;
-        
+
         Ok(())
     }
-    
+
     pub fn get_config(&self) -> &Config {
         &self.config
     }
-    
+
     pub fn update_config(&mut self, new_config: Config) {
         self.config = new_config;
     }

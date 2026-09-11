@@ -5,21 +5,21 @@
 mod openbsd {
     use std::ffi::CString;
     use std::os::raw::c_char;
-    
+
     // External pledge function from libutil
     extern "C" {
         pub fn pledge(promises: *const c_char, execprom: *const c_char) -> i32;
         pub fn unveil(path: *const c_char, permissions: *const c_char) -> i32;
         pub fn umakedir(path: *const c_char, mode: libc::mode_t) -> i32;
     }
-    
+
     pub fn apply_pledge_unveil() -> anyhow::Result<()> {
         let promises = CString::new("stdio rpath wpath cpath inet")?;
         let result = unsafe { pledge(promises.as_ptr(), std::ptr::null()) };
         if result < 0 {
             anyhow::bail!("pledge failed");
         }
-        
+
         // Unveil allowed paths
         let unveil_paths = [
             ("/etc/remgr", "rwc"),
@@ -29,7 +29,7 @@ mod openbsd {
             ("/root", "r"),
             ("/usr/local", "rx"),
         ];
-        
+
         for (path, perms) in unveil_paths {
             let c_path = CString::new(path)?;
             let c_perms = CString::new(perms)?;
@@ -39,22 +39,22 @@ mod openbsd {
                 log::warn!("unveil failed for {}: {}", path, std::io::Error::last_os_error());
             }
         }
-        
+
         // Reveal current directory
         let c_path = CString::new(".")?;
         unsafe { unveil(c_path.as_ptr(), std::ptr::null()) };
-        
+
         Ok(())
     }
-    
+
     pub fn create_secure_dirs() -> anyhow::Result<()> {
         let paths = [
             "/var/lib/remgr",
-            "/var/log/remgr", 
+            "/var/log/remgr",
             "/var/run/remgr",
             "/etc/remgr",
         ];
-        
+
         for path in paths {
             let c_path = CString::new(path)?;
             let result = unsafe {
@@ -64,7 +64,7 @@ mod openbsd {
                 log::warn!("Failed to create directory {}: {}", path, std::io::Error::last_os_error());
             }
         }
-        
+
         Ok(())
     }
 }
@@ -78,11 +78,6 @@ pub fn init_system_security() -> anyhow::Result<()> {
 #[cfg(target_os = "openbsd")]
 pub fn apply_pledge_unveil() -> anyhow::Result<()> {
     openbsd::apply_pledge_unveil()
-}
-
-#[cfg(target_os = "openbsd")]
-pub fn init_system_security() -> anyhow::Result<()> {
-    openbsd::init_system_security()
 }
 
 #[cfg(not(target_os = "openbsd"))]
