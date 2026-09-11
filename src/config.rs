@@ -10,9 +10,25 @@ pub struct Config {
     pub stun_turn: StunTurnConfig,
     pub rustdesk: RustDeskConfig,
     pub frps: FrpsConfig,
+    #[serde(default)]
+    pub dashboard: DashboardConfig,
     #[serde(skip)]
     pub config_path: PathBuf,
 }
+
+/// Web console login credentials. The password is stored only as an Argon2
+/// PHC hash; it is never serialized back to disk in plaintext.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DashboardConfig {
+    #[serde(default = "default_dashboard_user")]
+    pub username: String,
+    /// Argon2id PHC string hash of the console password. Empty on a fresh
+    /// install; a random password is then generated, hashed, and persisted.
+    #[serde(default)]
+    pub password_hash: String,
+}
+
+fn default_dashboard_user() -> String { "remgr".to_string() }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct EasyTierConfig {
@@ -153,6 +169,22 @@ impl Config {
         }
     }
 
+    /// On a fresh install, auto-generate a random admin password (hashed with
+    /// Argon2id) and persist it. Returns Some(plaintext) only on the run that
+    /// created it, so the operator can see it exactly once in the log.
+    pub fn bootstrap_password(&mut self) -> anyhow::Result<Option<String>> {
+        if !self.dashboard.password_hash.is_empty() {
+            return Ok(None);
+        }
+        if self.dashboard.username.is_empty() {
+            self.dashboard.username = "admin".to_string();
+        }
+        let password = auth::generate_random_password(16);
+        self.dashboard.password_hash = auth::hash_password(&password);
+        self.save()?;
+        Ok(Some(password))
+    }
+
     pub fn save(&self) -> anyhow::Result<()> {
         if let Some(parent) = self.config_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -179,6 +211,10 @@ impl Default for Config {
             stun_turn: StunTurnConfig::default(),
             rustdesk: RustDeskConfig::default(),
             frps: FrpsConfig::default(),
+            dashboard: DashboardConfig {
+                username: "admin".to_string(),
+                password_hash: String::new(),
+            },
             config_path,
         }
     }

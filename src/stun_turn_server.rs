@@ -179,10 +179,10 @@ impl StunTurnServer {
                 let software_len = software.len();
                 let software_padded = (software_len + 3) / 4 * 4;
 
-                // Calculate total attribute length (headers + values)
+                // Calculate total attribute length (headers + values + padding)
                 // XOR-MAPPED-ADDRESS: 4 header + xor_val.len()
-                // SOFTWARE: 4 header + software_len (padded)
-                let attr_len: u16 = 4 + xor_val.len() as u16 + 4 + software_len as u16;
+                // SOFTWARE: 4 header + software_padded
+                let attr_len: u16 = 4 + xor_val.len() as u16 + 4 + software_padded as u16;
 
                 let mut response: Vec<u8> = Vec::with_capacity(20 + attr_len as usize);
                 // Header: type(2) + length(2) + cookie(4) + tid(12) = 20 bytes

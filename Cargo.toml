@@ -48,9 +48,9 @@ futures-util = "0.3"
 pin-project-lite = "0.2"
 
 # TLS - Using rustls for secure connections
-rustls = { version = "0.23", features = ["ring"] }
-tokio-rustls = "0.26"
-rustls-pemfile = "2"
+# rustls = { version = "0.23", features = ["ring"] }
+# tokio-rustls = "0.26"
+# rustls-pemfile = "2"
 
 # Certificate generation - P-384 support via rcgen
 rcgen = "0.11"
