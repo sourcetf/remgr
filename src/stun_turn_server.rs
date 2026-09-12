@@ -83,6 +83,10 @@ impl StunTurnServer {
             return Ok(());
         }
 
+        if self.config.stun_port == 0 {
+            anyhow::bail!("stun_port is 0; refusing to bind an ephemeral port");
+        }
+
         // Bind STUN socket
         let stun_addr: SocketAddr = format!("0.0.0.0:{}", self.config.stun_port).parse()?;
         let stun_socket = UdpSocket::bind(stun_addr).await?;
