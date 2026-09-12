@@ -134,7 +134,24 @@ const EMBEDDED_UI: &str = r#"<!DOCTYPE html>
         </div>
     </header>
     
-    <div class="container">
+    <!-- Login overlay (shown when not authenticated) -->
+    <div class="modal-overlay" id="login-overlay" style="display: flex;">
+        <div class="modal">
+            <h2 style="margin-bottom: 16px;">ReMgr Login</h2>
+            <div class="form-group">
+                <label>Username</label>
+                <input type="text" id="login-username" placeholder="admin" />
+            </div>
+            <div class="form-group">
+                <label>Password</label>
+                <input type="password" id="login-password" placeholder="••••••••" />
+            </div>
+            <button id="btn-login" class="btn btn-primary" style="width: 100%; margin-top: 12px;">Log In</button>
+        </div>
+    </div>
+    
+    <div class="container" id="app-container" style="display: none;">
+        <!-- System Card -->
         <!-- System Card -->
         <div class="service-card" style="margin-bottom: 20px;">
             <h3>&#x1F3D9; System Settings</h3>
@@ -606,12 +623,86 @@ const EMBEDDED_UI: &str = r#"<!DOCTYPE html>
             };
         }
         
-        // Initialize
-        loadStatus();
-        loadConfig();
-        setInterval(loadStatus, 15000);
-        connectWebSocket();
-        addLog('info', 'ReMgr Web Console loaded - P-384 SSL ready');
+        // Authentication helpers
+        async function checkAuth() {
+            try {
+                const resp = await fetch('/api/v1/auth/verify');
+                const data = await resp.json();
+                return data.authenticated === true;
+            } catch (e) {
+                return false;
+            }
+        }
+
+        async function doLogin() {
+            const username = document.getElementById('login-username').value;
+            const password = document.getElementById('login-password').value;
+            const btn = document.getElementById('btn-login');
+            btn.disabled = true;
+            try {
+                const resp = await fetch('/api/v1/login', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, password })
+                });
+                if (resp.ok) {
+                    const d = await resp.json();
+                    showApp();
+                    addLog('info', 'Logged in as ' + (d.username || username));
+                } else {
+                    alert('Invalid credentials');
+                }
+            } catch (e) {
+                alert('Login failed: ' + e.message);
+            } finally {
+                btn.disabled = false;
+            }
+        }
+
+        async function doLogout() {
+            try { await fetch('/api/v1/logout', { method: 'POST' }); } catch (e) {}
+            location.reload();
+        }
+
+        function showApp() {
+            document.getElementById('login-overlay').style.display = 'none';
+            document.getElementById('app-container').style.display = 'block';
+        }
+
+        function showLogin() {
+            document.getElementById('login-overlay').style.display = 'flex';
+            document.getElementById('app-container').style.display = 'none';
+        }
+
+        function authFetch(url, opts) {
+            return fetch(url, opts).then(function (r) {
+                if (r.status === 401) { showLogin(); throw new Error('unauthorized'); }
+                return r;
+            });
+        }
+
+        // Initialize: verify session, then boot the dashboard (or show login).
+        async function boot() {
+            const authed = await checkAuth();
+            if (authed) {
+                showApp();
+                loadStatus();
+                loadConfig();
+                setInterval(loadStatus, 15000);
+                connectWebSocket();
+                addLog('info', 'ReMgr Web Console loaded - P-384 SSL ready');
+            } else {
+                showLogin();
+                const u = document.getElementById('login-username');
+                const p = document.getElementById('login-password');
+                const b = document.getElementById('btn-login');
+                b.onclick = doLogin;
+                const submit = function (e) { if (e.key === 'Enter') doLogin(); };
+                u.onkeydown = submit;
+                p.onkeydown = submit;
+            }
+        }
+        boot();
     </script>
 </body>
 </html>
