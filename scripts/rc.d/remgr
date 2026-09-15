@@ -1,0 +1,12 @@
+#!/bin/ksh
+# /etc/rc.d/remgr — OpenBSD rc.d script for the ReMgr relay manager
+
+daemon="/usr/local/bin/remgr"
+daemon_flags="--config /etc/remgr/config.toml"
+daemon_logger="daemon.info"
+daemon_timeout="120"
+
+. /etc/rc.d/rc.subr
+
+rc_reload=NO
+rc_cmd $1

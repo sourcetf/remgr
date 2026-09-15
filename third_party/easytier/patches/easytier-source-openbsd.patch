@@ -1,0 +1,587 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 6c00510..0d221b7 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -901,8 +901,6 @@ dependencies = [
+ [[package]]
+ name = "boringtun-easytier"
+ version = "0.6.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "2f09b4d1ada8affba260cb185bbdf6d5acff42f924dea1a17f938cf3e8fbe475"
+ dependencies = [
+  "aead",
+  "atomic-shim",
+@@ -3747,8 +3745,6 @@ dependencies = [
+ [[package]]
+ name = "guarden"
+ version = "0.2.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "b8408903291a7d0cc74169d5de4dd1919a9a402a2f67fcd7df3303ed045fae73"
+ dependencies = [
+  "futures-core",
+  "guarden-macros 0.2.0",
+@@ -10495,7 +10491,6 @@ checksum = "7b3e06c9b9d80ed6b745c7159c40b311ad2916abb34a49e9be2653b90db0d8dd"
+ [[package]]
+ name = "tun-easytier"
+ version = "1.1.1"
+-source = "git+https://github.com/EasyTier/rust-tun#12378839e7985283df0e4fb536b7137230356db5"
+ dependencies = [
+  "bytes",
+  "cfg-if",
+diff --git a/Cargo.toml b/Cargo.toml
+index 5492867..194021c 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -36,3 +36,11 @@ strip = true
+ inherits = "release"
+ opt-level = "z"
+ strip = "symbols"
++
++# --- OpenBSD support patches (see patches/) ---
++[patch.crates-io]
++guarden = { path = "patches/guarden" }
++boringtun-easytier = { path = "patches/boringtun-easytier" }
++
++[patch."https://github.com/EasyTier/rust-tun"]
++tun-easytier = { path = "patches/rust-tun" }
+diff --git a/easytier/src/common/ifcfg/darwin.rs b/easytier/src/common/ifcfg/darwin.rs
+index 0412d9e..16de86f 100644
+--- a/easytier/src/common/ifcfg/darwin.rs
++++ b/easytier/src/common/ifcfg/darwin.rs
+@@ -4,6 +4,18 @@ use super::{Error, IfConfiguerTrait, cidr_to_subnet_mask, run_shell_cmd};
+ use async_trait::async_trait;
+ use cidr::{Ipv4Inet, Ipv6Inet};
+ 
++// On OpenBSD, an interface route needs the gateway to be an address assigned to
++// the interface (route(8) -iface flag), and does not support -hopcount.
++#[cfg(target_os = "openbsd")]
++fn get_iface_ipv4_cmd(name: &str) -> String {
++    format!("ifconfig {} | awk '/inet /{{print $2; exit}}'", name)
++}
++
++#[cfg(target_os = "openbsd")]
++fn get_iface_ipv6_cmd(name: &str) -> String {
++    format!("ifconfig {} | awk '/inet6 /{{print $2; exit}}'", name)
++}
++
+ pub struct MacIfConfiger {}
+ #[async_trait]
+ impl IfConfiguerTrait for MacIfConfiger {
+@@ -14,17 +26,23 @@ impl IfConfiguerTrait for MacIfConfiger {
+         cidr_prefix: u8,
+         cost: Option<i32>,
+     ) -> Result<(), Error> {
+-        run_shell_cmd(
+-            format!(
+-                "route -n add {} -netmask {} -interface {} -hopcount {}",
+-                address,
+-                cidr_to_subnet_mask(cidr_prefix),
+-                name,
+-                cost.unwrap_or(7)
+-            )
+-            .as_str(),
+-        )
+-        .await
++        #[cfg(target_os = "openbsd")]
++        let cmd = format!(
++            "route -n add {}/{} $( {} ) -iface",
++            address,
++            cidr_prefix,
++            get_iface_ipv4_cmd(name)
++        );
++        #[cfg(not(target_os = "openbsd"))]
++        let cmd = format!(
++            "route -n add {} -netmask {} -interface {} -hopcount {}",
++            address,
++            cidr_to_subnet_mask(cidr_prefix),
++            name,
++            cost.unwrap_or(7)
++        );
++        let _ = cost;
++        run_shell_cmd(cmd.as_str()).await
+     }
+ 
+     async fn remove_ipv4_route(
+@@ -33,16 +51,17 @@ impl IfConfiguerTrait for MacIfConfiger {
+         address: Ipv4Addr,
+         cidr_prefix: u8,
+     ) -> Result<(), Error> {
+-        run_shell_cmd(
+-            format!(
+-                "route -n delete {} -netmask {} -interface {}",
+-                address,
+-                cidr_to_subnet_mask(cidr_prefix),
+-                name
+-            )
+-            .as_str(),
+-        )
+-        .await
++        #[cfg(target_os = "openbsd")]
++        let cmd = format!("route -n delete {}/{}", address, cidr_prefix);
++        #[cfg(not(target_os = "openbsd"))]
++        let cmd = format!(
++            "route -n delete {} -netmask {} -interface {}",
++            address,
++            cidr_to_subnet_mask(cidr_prefix),
++            name
++        );
++        let _ = name;
++        run_shell_cmd(cmd.as_str()).await
+     }
+ 
+     async fn add_ipv4_ip(
+@@ -84,8 +103,11 @@ impl IfConfiguerTrait for MacIfConfiger {
+         address: std::net::Ipv6Addr,
+         cidr_prefix: u8,
+     ) -> Result<(), Error> {
+-        run_shell_cmd(format!("ifconfig {} inet6 {}/{} add", name, address, cidr_prefix).as_str())
+-            .await
++        #[cfg(target_os = "openbsd")]
++        let cmd = format!("ifconfig {} inet6 {}/{} alias", name, address, cidr_prefix);
++        #[cfg(not(target_os = "openbsd"))]
++        let cmd = format!("ifconfig {} inet6 {}/{} add", name, address, cidr_prefix);
++        run_shell_cmd(cmd.as_str()).await
+     }
+ 
+     async fn remove_ipv6(&self, name: &str, ip: Option<Ipv6Inet>) -> Result<(), Error> {
+@@ -104,6 +126,14 @@ impl IfConfiguerTrait for MacIfConfiger {
+         cidr_prefix: u8,
+         cost: Option<i32>,
+     ) -> Result<(), Error> {
++        #[cfg(target_os = "openbsd")]
++        let cmd = format!(
++            "route -n add -inet6 {}/{} $( {} ) -iface",
++            address,
++            cidr_prefix,
++            get_iface_ipv6_cmd(name)
++        );
++        #[cfg(not(target_os = "openbsd"))]
+         let cmd = if let Some(cost) = cost {
+             format!(
+                 "route -n add -inet6 {}/{} -interface {} -hopcount {}",
+@@ -115,6 +145,7 @@ impl IfConfiguerTrait for MacIfConfiger {
+                 address, cidr_prefix, name
+             )
+         };
++        let _ = cost;
+         run_shell_cmd(cmd.as_str()).await
+     }
+ 
+@@ -124,13 +155,14 @@ impl IfConfiguerTrait for MacIfConfiger {
+         address: std::net::Ipv6Addr,
+         cidr_prefix: u8,
+     ) -> Result<(), Error> {
+-        run_shell_cmd(
+-            format!(
+-                "route -n delete -inet6 {}/{} -interface {}",
+-                address, cidr_prefix, name
+-            )
+-            .as_str(),
+-        )
+-        .await
++        #[cfg(target_os = "openbsd")]
++        let cmd = format!("route -n delete -inet6 {}/{}", address, cidr_prefix);
++        #[cfg(not(target_os = "openbsd"))]
++        let cmd = format!(
++            "route -n delete -inet6 {}/{} -interface {}",
++            address, cidr_prefix, name
++        );
++        let _ = name;
++        run_shell_cmd(cmd.as_str()).await
+     }
+ }
+diff --git a/easytier/src/common/ifcfg/mod.rs b/easytier/src/common/ifcfg/mod.rs
+index 0a64a33..8bfadc5 100644
+--- a/easytier/src/common/ifcfg/mod.rs
++++ b/easytier/src/common/ifcfg/mod.rs
+@@ -5,7 +5,8 @@
+ 
+ #[cfg(any(
+     all(target_os = "macos", not(feature = "macos-ne")),
+-    target_os = "freebsd"
++    target_os = "freebsd",
++    target_os = "openbsd"
+ ))]
+ mod darwin;
+ #[cfg(all(target_os = "linux", feature = "linux-netlink"))]
+@@ -23,7 +24,8 @@ use async_trait::async_trait;
+ use cidr::{Ipv4Inet, Ipv6Inet};
+ #[cfg(any(
+     all(target_os = "macos", not(feature = "macos-ne")),
+-    target_os = "freebsd"
++    target_os = "freebsd",
++    target_os = "openbsd"
+ ))]
+ use tokio::process::Command;
+ 
+@@ -100,7 +102,8 @@ pub trait IfConfiguerTrait: Send + Sync {
+ 
+ #[cfg(any(
+     all(target_os = "macos", not(feature = "macos-ne")),
+-    target_os = "freebsd"
++    target_os = "freebsd",
++    target_os = "openbsd"
+ ))]
+ fn cidr_to_subnet_mask(prefix_length: u8) -> Ipv4Addr {
+     if prefix_length > 32 {
+@@ -120,7 +123,8 @@ fn cidr_to_subnet_mask(prefix_length: u8) -> Ipv4Addr {
+ 
+ #[cfg(any(
+     all(target_os = "macos", not(feature = "macos-ne")),
+-    target_os = "freebsd"
++    target_os = "freebsd",
++    target_os = "openbsd"
+ ))]
+ async fn run_shell_cmd(cmd: &str) -> Result<(), Error> {
+     let cmd_out: std::process::Output;
+@@ -168,7 +172,8 @@ pub type IfConfiger = DummyIfConfiger;
+ 
+ #[cfg(any(
+     all(target_os = "macos", not(feature = "macos-ne")),
+-    target_os = "freebsd"
++    target_os = "freebsd",
++    target_os = "openbsd"
+ ))]
+ pub type IfConfiger = darwin::MacIfConfiger;
+ 
+@@ -180,6 +185,7 @@ pub type IfConfiger = windows::WindowsIfConfiger;
+     target_os = "linux",
+     target_os = "windows",
+     target_os = "freebsd",
++    target_os = "openbsd",
+ )))]
+ pub type IfConfiger = DummyIfConfiger;
+ 
+diff --git a/easytier/src/common/machine_id.rs b/easytier/src/common/machine_id.rs
+index ce90424..85ebc32 100644
+--- a/easytier/src/common/machine_id.rs
++++ b/easytier/src/common/machine_id.rs
+@@ -89,38 +89,58 @@ fn default_linux_machine_id_state_dir(
+     PathBuf::from("/var/lib/easytier")
+ }
+ 
++#[cfg(target_os = "linux")]
+ fn default_machine_id_state_dir() -> anyhow::Result<PathBuf> {
+-    cfg_select! {
+-        target_os = "linux" => Ok(default_linux_machine_id_state_dir(
+-            env::var_os("XDG_DATA_HOME"),
+-            env::var_os("HOME"),
+-        )),
+-        all(target_os = "macos", not(feature = "macos-ne")) => {
+-            let home = non_empty_os_string(env::var_os("HOME"))
+-                .ok_or_else(|| anyhow::anyhow!("HOME is not set, cannot resolve machine id state directory"))?;
+-            Ok(PathBuf::from(home)
+-                .join("Library")
+-                .join("Application Support")
+-                .join("com.easytier"))
+-        },
+-        target_os = "windows" => {
+-            let local_app_data = non_empty_os_string(env::var_os("LOCALAPPDATA")).ok_or_else(|| {
+-                anyhow::anyhow!("LOCALAPPDATA is not set, cannot resolve machine id state directory")
+-            })?;
+-            Ok(PathBuf::from(local_app_data).join("easytier"))
+-        },
+-        target_os = "freebsd" => {
+-            let home = non_empty_os_string(env::var_os("HOME"))
+-                .ok_or_else(|| anyhow::anyhow!("HOME is not set, cannot resolve machine id state directory"))?;
+-            Ok(PathBuf::from(home).join(".local").join("share").join("easytier"))
+-        },
+-        target_os = "android" => {
+-            anyhow::bail!("machine id state directory must be provided explicitly on Android");
+-        },
+-        _ => anyhow::bail!("machine id state directory is unsupported on this platform"),
+-    }
++    Ok(default_linux_machine_id_state_dir(
++        env::var_os("XDG_DATA_HOME"),
++        env::var_os("HOME"),
++    ))
++}
++
++#[cfg(all(target_os = "macos", not(feature = "macos-ne")))]
++fn default_machine_id_state_dir() -> anyhow::Result<PathBuf> {
++    let home = non_empty_os_string(env::var_os("HOME")).ok_or_else(|| {
++        anyhow::anyhow!("HOME is not set, cannot resolve machine id state directory")
++    })?;
++    Ok(PathBuf::from(home)
++        .join("Library")
++        .join("Application Support")
++        .join("com.easytier"))
++}
++
++#[cfg(target_os = "windows")]
++fn default_machine_id_state_dir() -> anyhow::Result<PathBuf> {
++    let local_app_data = non_empty_os_string(env::var_os("LOCALAPPDATA")).ok_or_else(|| {
++        anyhow::anyhow!("LOCALAPPDATA is not set, cannot resolve machine id state directory")
++    })?;
++    Ok(PathBuf::from(local_app_data).join("easytier"))
++}
++
++#[cfg(target_os = "freebsd")]
++fn default_machine_id_state_dir() -> anyhow::Result<PathBuf> {
++    let home = non_empty_os_string(env::var_os("HOME")).ok_or_else(|| {
++        anyhow::anyhow!("HOME is not set, cannot resolve machine id state directory")
++    })?;
++    Ok(PathBuf::from(home).join(".local").join("share").join("easytier"))
++}
++
++#[cfg(target_os = "android")]
++fn default_machine_id_state_dir() -> anyhow::Result<PathBuf> {
++    anyhow::bail!("machine id state directory must be provided explicitly on Android");
+ }
+ 
++#[cfg(not(any(
++    target_os = "linux",
++    all(target_os = "macos", not(feature = "macos-ne")),
++    target_os = "windows",
++    target_os = "freebsd",
++    target_os = "android"
++)))]
++fn default_machine_id_state_dir() -> anyhow::Result<PathBuf> {
++    anyhow::bail!("machine id state directory is unsupported on this platform");
++}
++
++
+ fn read_state_machine_id(path: &Path) -> anyhow::Result<Option<uuid::Uuid>> {
+     let Some(contents) = read_optional_file(path)? else {
+         return Ok(None);
+diff --git a/easytier/src/common/network.rs b/easytier/src/common/network.rs
+index 408fb10..00d2b4c 100644
+--- a/easytier/src/common/network.rs
++++ b/easytier/src/common/network.rs
+@@ -243,6 +243,14 @@ impl InterfaceFilter {
+     }
+ }
+ 
++#[cfg(target_os = "openbsd")]
++impl InterfaceFilter {
++    async fn filter_iface(&self) -> bool {
++        // tun(4) devices are point-to-point, loopback is excluded as usual.
++        !self.state.is_point_to_point && !self.state.is_loopback && self.state.is_up
++    }
++}
++
+ #[cfg(target_os = "windows")]
+ impl InterfaceFilter {
+     async fn filter_iface(&self) -> bool {
+diff --git a/easytier/src/instance/virtual_nic.rs b/easytier/src/instance/virtual_nic.rs
+index 43c97aa..d1a0de1 100644
+--- a/easytier/src/instance/virtual_nic.rs
++++ b/easytier/src/instance/virtual_nic.rs
+@@ -135,6 +135,16 @@ impl PacketProtocol {
+         }
+     }
+ 
++    #[cfg(target_os = "openbsd")]
++    fn into_pi_field(self) -> Result<u16, io::Error> {
++        use nix::libc;
++        match self {
++            PacketProtocol::IPv4 => Ok(libc::PF_INET as u16),
++            PacketProtocol::IPv6 => Ok(libc::PF_INET6 as u16),
++            PacketProtocol::Other => Err(io::Error::other("neither an IPv4 nor IPv6 packet")),
++        }
++    }
++
+     #[cfg(target_os = "windows")]
+     fn into_pi_field(self) -> Result<u16, io::Error> {
+         unimplemented!()
+diff --git a/easytier/src/socket/fake_tcp/netfilter/mod.rs b/easytier/src/socket/fake_tcp/netfilter/mod.rs
+index 9817bfb..d0319c4 100644
+--- a/easytier/src/socket/fake_tcp/netfilter/mod.rs
++++ b/easytier/src/socket/fake_tcp/netfilter/mod.rs
+@@ -2,88 +2,73 @@ pub mod pnet;
+ 
+ use std::{io, net::SocketAddr, sync::Arc};
+ 
+-cfg_select! {
+-    target_os = "linux" => {
+-        pub mod linux_bpf;
++#[cfg(target_os = "linux")]
++pub mod linux_bpf;
+ 
+-        pub fn create_tun(
+-            interface_name: &str,
+-            src_addr: Option<SocketAddr>,
+-            dst_addr: SocketAddr,
+-        ) -> io::Result<Arc<dyn super::stack::Tun>> {
+-            match linux_bpf::LinuxBpfTun::new(interface_name, src_addr, dst_addr) {
+-                Ok(tun) => Ok(Arc::new(tun)),
+-                Err(e) => {
+-                    tracing::warn!(
+-                        ?e,
+-                        interface_name,
+-                        "LinuxBpfTun init failed, falling back to PnetTun"
+-                    );
+-                    Ok(Arc::new(pnet::PnetTun::new(
+-                        interface_name,
+-                        pnet::create_packet_filter(src_addr, dst_addr),
+-                    )?))
+-                }
+-            }
+-        }
+-    }
++#[cfg(all(target_os = "macos", not(feature = "macos-ne")))]
++pub mod macos_bpf;
+ 
+-    all(target_os = "macos", not(feature = "macos-ne")) => {
+-        pub mod macos_bpf;
++#[cfg(all(windows, any(target_arch = "x86_64", target_arch = "x86")))]
++pub mod windivert;
+ 
+-        pub fn create_tun(
+-            interface_name: &str,
+-            src_addr: Option<SocketAddr>,
+-            dst_addr: SocketAddr,
+-        ) -> io::Result<Arc<dyn super::stack::Tun>> {
+-            match macos_bpf::MacosBpfTun::new(interface_name, src_addr, dst_addr) {
+-                Ok(tun) => Ok(Arc::new(tun)),
+-                Err(e) => {
+-                    tracing::warn!(
+-                        ?e,
+-                        interface_name,
+-                        "MacosBpfTun init failed, falling back to PnetTun"
+-                    );
+-                    Ok(Arc::new(pnet::PnetTun::new(
+-                        interface_name,
+-                        pnet::create_packet_filter(src_addr, dst_addr),
+-                    )?))
+-                }
+-            }
++#[cfg(target_os = "linux")]
++pub fn create_tun(
++    interface_name: &str,
++    src_addr: Option<SocketAddr>,
++    dst_addr: SocketAddr,
++) -> io::Result<Arc<dyn super::stack::Tun>> {
++    match linux_bpf::LinuxBpfTun::new(interface_name, src_addr, dst_addr) {
++        Ok(tun) => Ok(Arc::new(tun)),
++        Err(e) => {
++            tracing::warn!(
++                ?e,
++                interface_name,
++                "LinuxBpfTun init failed, falling back to PnetTun"
++            );
++            Ok(Arc::new(pnet::PnetTun::new(
++                interface_name,
++                pnet::create_packet_filter(src_addr, dst_addr),
++            )?))
+         }
+     }
++}
+ 
+-    all(windows, any(target_arch = "x86_64", target_arch = "x86")) => {
+-        pub mod windivert;
+-
+-        pub fn create_tun(
+-            interface_name: &str,
+-            src_addr: Option<SocketAddr>,
+-            dst_addr: SocketAddr,
+-        ) -> io::Result<Arc<dyn super::stack::Tun>> {
+-            match windivert::WinDivertTun::new(src_addr, dst_addr) {
+-                Ok(tun) => Ok(Arc::new(tun)),
+-                Err(e) => {
+-                    tracing::warn!(
+-                        ?e,
+-                        ?dst_addr,
+-                        "WinDivertTun init failed, falling back to PnetTun"
+-                    );
+-                    Ok(Arc::new(pnet::PnetTun::new(
+-                        interface_name,
+-                        pnet::create_packet_filter(src_addr, dst_addr),
+-                    )?))
+-                }
+-            }
++#[cfg(all(target_os = "macos", not(feature = "macos-ne")))]
++pub fn create_tun(
++    interface_name: &str,
++    src_addr: Option<SocketAddr>,
++    dst_addr: SocketAddr,
++) -> io::Result<Arc<dyn super::stack::Tun>> {
++    match macos_bpf::MacosBpfTun::new(interface_name, src_addr, dst_addr) {
++        Ok(tun) => Ok(Arc::new(tun)),
++        Err(e) => {
++            tracing::warn!(
++                ?e,
++                interface_name,
++                "MacosBpfTun init failed, falling back to PnetTun"
++            );
++            Ok(Arc::new(pnet::PnetTun::new(
++                interface_name,
++                pnet::create_packet_filter(src_addr, dst_addr),
++            )?))
+         }
+     }
++}
+ 
+-    _ => {
+-        pub fn create_tun(
+-            interface_name: &str,
+-            src_addr: Option<SocketAddr>,
+-            dst_addr: SocketAddr,
+-        ) -> io::Result<Arc<dyn super::stack::Tun>> {
++#[cfg(all(windows, any(target_arch = "x86_64", target_arch = "x86")))]
++pub fn create_tun(
++    interface_name: &str,
++    src_addr: Option<SocketAddr>,
++    dst_addr: SocketAddr,
++) -> io::Result<Arc<dyn super::stack::Tun>> {
++    match windivert::WinDivertTun::new(src_addr, dst_addr) {
++        Ok(tun) => Ok(Arc::new(tun)),
++        Err(e) => {
++            tracing::warn!(
++                ?e,
++                ?dst_addr,
++                "WinDivertTun init failed, falling back to PnetTun"
++            );
+             Ok(Arc::new(pnet::PnetTun::new(
+                 interface_name,
+                 pnet::create_packet_filter(src_addr, dst_addr),
+@@ -91,3 +76,19 @@ cfg_select! {
+         }
+     }
+ }
++
++#[cfg(not(any(
++    target_os = "linux",
++    all(target_os = "macos", not(feature = "macos-ne")),
++    all(windows, any(target_arch = "x86_64", target_arch = "x86"))
++)))]
++pub fn create_tun(
++    interface_name: &str,
++    src_addr: Option<SocketAddr>,
++    dst_addr: SocketAddr,
++) -> io::Result<Arc<dyn super::stack::Tun>> {
++    Ok(Arc::new(pnet::PnetTun::new(
++        interface_name,
++        pnet::create_packet_filter(src_addr, dst_addr),
++    )?))
++}
+diff --git a/easytier/src/socket/tcp.rs b/easytier/src/socket/tcp.rs
+index db9709d..d2e614b 100644
+--- a/easytier/src/socket/tcp.rs
++++ b/easytier/src/socket/tcp.rs
+@@ -350,11 +350,20 @@ pub(crate) fn prepare_proxy_tcp_socket(stream: &TcpStream) -> io::Result<()> {
+     #[cfg(not(target_os = "windows"))]
+     const TCP_KEEPALIVE_RETRIES: u32 = 2;
+ 
+-    let keepalive = TcpKeepalive::new()
+-        .with_time(TCP_KEEPALIVE_TIME)
+-        .with_interval(TCP_KEEPALIVE_INTERVAL);
+-
+-    #[cfg(not(target_os = "windows"))]
++    let keepalive = TcpKeepalive::new().with_time(TCP_KEEPALIVE_TIME);
++
++    // socket2 does not provide with_interval/with_retries on OpenBSD
++    #[cfg(not(any(
++        target_os = "openbsd",
++        target_os = "solaris",
++        target_os = "illumos",
++        target_os = "haiku",
++        target_os = "vita",
++        target_os = "espidf"
++    )))]
++    let keepalive = keepalive.with_interval(TCP_KEEPALIVE_INTERVAL);
++
++    #[cfg(not(any(target_os = "windows", target_os = "openbsd")))]
+     let keepalive = keepalive.with_retries(TCP_KEEPALIVE_RETRIES);
+ 
+     let socket = SockRef::from(stream);

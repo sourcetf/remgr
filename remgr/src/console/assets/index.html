@@ -1,0 +1,436 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ReMgr — Relay Manager Console</title>
+<style>
+:root{
+  --bg:#0d1117;--bg2:#161b22;--bg3:#1c2330;--border:#30363d;
+  --tx:#e6edf3;--tx2:#8b949e;--blue:#58a6ff;--green:#3fb950;--red:#f85149;--yellow:#d29922;
+}
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:system-ui,-apple-system,'Segoe UI',sans-serif;background:var(--bg);color:var(--tx);min-height:100vh}
+a{color:var(--blue);text-decoration:none}
+.hidden{display:none!important}
+/* login */
+#login{position:fixed;inset:0;background:var(--bg);display:flex;align-items:center;justify-content:center;z-index:100}
+#login .box{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:36px;width:340px}
+#login h1{font-size:20px;margin-bottom:6px;text-align:center}
+#login p{color:var(--tx2);font-size:12px;text-align:center;margin-bottom:20px}
+input,select{width:100%;padding:9px 11px;border:1px solid var(--border);border-radius:7px;background:var(--bg);color:var(--tx);font-size:13px;outline:none}
+input:focus{border-color:var(--blue)}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:8px 15px;border:none;border-radius:7px;cursor:pointer;font-size:13px;font-weight:500;color:#fff;background:var(--bg3);transition:filter .15s}
+.btn:hover{filter:brightness(1.2)}
+.btn.primary{background:var(--blue)}.btn.success{background:var(--green)}.btn.danger{background:var(--red)}.btn.warn{background:var(--yellow)}
+.btn.sm{padding:5px 10px;font-size:12px}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+/* layout */
+header{background:var(--bg2);border-bottom:1px solid var(--border);padding:0 22px;display:flex;align-items:center;justify-content:space-between;height:52px;position:sticky;top:0;z-index:10}
+header .logo{font-weight:700;font-size:16px}
+header .logo span{color:var(--blue)}
+nav{display:flex;gap:2px;height:100%}
+nav button{background:none;border:none;color:var(--tx2);padding:0 14px;font-size:13px;cursor:pointer;border-bottom:2px solid transparent;height:100%}
+nav button.active{color:var(--tx);border-bottom-color:var(--blue)}
+#conn{font-size:12px;color:var(--tx2)}
+#conn .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--red);margin-right:5px}
+#conn.ok .dot{background:var(--green)}
+main{max-width:1180px;margin:0 auto;padding:22px}
+.card{background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:18px;margin-bottom:16px}
+.card h3{font-size:14px;margin-bottom:14px;display:flex;align-items:center;gap:10px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px}
+.kv{background:var(--bg3);border-radius:7px;padding:10px}
+.kv .l{font-size:11px;color:var(--tx2);margin-bottom:3px}
+.kv .v{font-size:14px;font-family:ui-monospace,Consolas,monospace;word-break:break-all}
+.badge{display:inline-block;padding:3px 10px;border-radius:10px;font-size:11px;font-weight:600}
+.badge.run{background:rgba(63,185,80,.15);color:var(--green)}
+.badge.stop{background:rgba(248,81,73,.15);color:var(--red)}
+.badge.off{background:rgba(139,148,158,.15);color:var(--tx2)}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:12px}
+.switch{display:flex;align-items:center;gap:7px;font-size:13px;cursor:pointer;margin-left:auto}
+table{width:100%;border-collapse:collapse;font-size:12px;margin-top:8px}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--border)}
+th{color:var(--tx2);font-weight:500}
+/* modal */
+#modal{position:fixed;inset:0;background:rgba(0,0,0,.65);display:flex;align-items:center;justify-content:center;z-index:50}
+#modal .box{background:var(--bg2);border:1px solid var(--border);border-radius:12px;padding:22px;width:620px;max-width:92vw;max-height:86vh;overflow-y:auto}
+#modal h3{margin-bottom:16px;font-size:15px}
+.fg{margin-bottom:11px}
+.fg label{display:block;font-size:11px;color:var(--tx2);margin-bottom:4px}
+.fg .hint{font-size:10px;color:var(--tx2);margin-top:3px}
+.fg-row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+/* logs */
+#logs{background:#0a0d12;border:1px solid var(--border);border-radius:8px;padding:12px;height:340px;overflow-y:auto;font-family:ui-monospace,Consolas,monospace;font-size:11.5px;line-height:1.55;white-space:pre-wrap;word-break:break-all}
+/* toast */
+#toast{position:fixed;bottom:22px;right:22px;z-index:99;display:flex;flex-direction:column;gap:8px}
+.toast{padding:11px 17px;border-radius:8px;font-size:13px;color:#fff;animation:slide .25s ease}
+.toast.ok{background:var(--green)}.toast.err{background:var(--red)}
+@keyframes slide{from{transform:translateX(40px);opacity:0}to{transform:none;opacity:1}}
+@media(max-width:720px){nav{overflow-x:auto}.fg-row{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+
+<div id="login">
+  <div class="box">
+    <h1>⚙ ReMgr</h1>
+    <p>Relay Manager Console</p>
+    <div class="fg"><input type="password" id="login-pw" placeholder="管理密码" onkeydown="if(event.key==='Enter')doLogin()"></div>
+    <button class="btn primary" style="width:100%" onclick="doLogin()">登录</button>
+    <p id="login-err" style="color:var(--red);margin-top:12px;min-height:14px"></p>
+  </div>
+</div>
+
+<div id="app" class="hidden">
+<header>
+  <div class="logo">⚙ <span>ReMgr</span></div>
+  <nav id="nav"></nav>
+  <div id="conn"><span class="dot"></span><span id="conn-tx">…</span>
+    <button class="btn sm" style="margin-left:10px" onclick="doLogout()">退出</button></div>
+</header>
+<main>
+  <div id="tab-dashboard"></div>
+  <div id="tab-easytier" class="hidden"></div>
+  <div id="tab-stun_turn" class="hidden"></div>
+  <div id="tab-rustdesk" class="hidden"></div>
+  <div id="tab-frps" class="hidden"></div>
+  <div id="tab-system" class="hidden">
+    <div class="card">
+      <h3>📜 日志</h3>
+      <div id="logs"></div>
+      <div class="row"><label class="switch"><input type="checkbox" id="log-follow" checked> 实时跟随</label></div>
+    </div>
+  </div>
+</main>
+</div>
+
+<div id="modal" class="hidden"><div class="box">
+  <h3 id="modal-title"></h3>
+  <div id="modal-body"></div>
+  <div class="row" style="justify-content:flex-end;margin-top:16px">
+    <button class="btn" onclick="closeModal()">取消</button>
+    <button class="btn primary" onclick="saveModal()">保存</button>
+  </div>
+</div></div>
+
+<div id="toast"></div>
+
+<script>
+"use strict";
+const API = {
+  get: (p) => fetch(p, {headers: {'x-remgr-csrf':'1'}}),
+  send: (p, method, body) => fetch(p, {method, headers:{'Content-Type':'application/json','x-remgr-csrf':'1'}, body: body!==undefined?JSON.stringify(body):undefined}),
+};
+const SERVICES = ['easytier','stun_turn','rustdesk','frps'];
+const TITLES = {easytier:'⚡ EasyTier 中心', stun_turn:'🌐 STUN / TURN', rustdesk:'🖥 RustDesk 中继', frps:'📡 frps 反向代理'};
+let status=null, configs={}, curTab='dashboard', editService=null, ws=null, logTimer=null;
+
+function toast(msg, ok=true){
+  const t=document.createElement('div');t.className='toast '+(ok?'ok':'err');t.textContent=msg;
+  document.getElementById('toast').appendChild(t);
+  setTimeout(()=>t.remove(), 3500);
+}
+async function j(p, opt){const r=await API.get(p) , o=opt; return r}
+async function api(p, method, body){
+  const r = method ? await API.send(p, method, body) : await API.get(p);
+  if(r.status===401){showLogin();throw new Error('未登录')}
+  const d = await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(d.error||('HTTP '+r.status));
+  return d;
+}
+
+/* ---------- auth ---------- */
+async function doLogin(){
+  const pw=document.getElementById('login-pw').value;
+  try{
+    await api('/api/login','POST',{password:pw});
+    document.getElementById('login').classList.add('hidden');
+    document.getElementById('app').classList.remove('hidden');
+    boot();
+  }catch(e){document.getElementById('login-err').textContent=e.message}
+}
+async function doLogout(){try{await api('/api/logout','POST')}catch(e){} location.reload()}
+function showLogin(){document.getElementById('login').classList.remove('hidden');document.getElementById('app').classList.add('hidden')}
+
+/* ---------- boot ---------- */
+async function boot(){
+  buildNav(); switchTab('dashboard');
+  await refreshAll();
+  connectWS();
+  logTimer = setInterval(tickLogs, 4000);
+}
+async function refreshAll(){
+  try{
+    status = await api('/api/status');
+    for(const s of SERVICES){ try{ configs[s]=await api('/api/config/'+s); }catch(e){} }
+    render();
+  }catch(e){ if(e.message!=='未登录') toast(e.message,false) }
+}
+function buildNav(){
+  const nav=document.getElementById('nav');
+  const tabs=[['dashboard','总览'],['easytier','EasyTier'],['stun_turn','STUN/TURN'],['rustdesk','RustDesk'],['frps','frps'],['system','系统']];
+  nav.innerHTML=tabs.map(([id,label])=>`<button data-t="${id}" class="${id===curTab?'active':''}" onclick="switchTab('${id}')">${label}</button>`).join('');
+}
+function switchTab(t){
+  curTab=t;
+  document.querySelectorAll('#nav button').forEach(b=>b.classList.toggle('active',b.dataset.t===t));
+  for(const id of ['dashboard','easytier','stun_turn','rustdesk','frps','system'])
+    document.getElementById('tab-'+id).classList.toggle('hidden', id!==t);
+  if(t==='system'){tickLogs(); scrollLogs()}
+  render();
+}
+
+/* ---------- render ---------- */
+function render(){
+  if(!status) return;
+  renderDashboard(); renderServiceTabs(); if(curTab==='system') tickLogs();
+}
+function badge(run, enabled){
+  if(!enabled) return '<span class="badge off">已禁用</span>';
+  return run?'<span class="badge run">运行中</span>':'<span class="badge stop">已停止</span>';
+}
+function fmtBytes(n){
+  if(n<1024) return n+' B';
+  const u=['KB','MB','GB','TB'];let i=-1;
+  do{n/=1024;i++}while(n>=1024&&i<u.length-1);
+  return n.toFixed(1)+' '+u[i];
+}
+function svcCard(name, running, enabled, kvs, extraButtons=''){
+  const c = configs[name]||{};
+  return `<div class="card"><h3>${TITLES[name]} ${badge(running,enabled)}</h3>
+    <div class="grid">${kvs.map(([l,v])=>`<div class="kv"><div class="l">${l}</div><div class="v">${v??'—'}</div></div>`).join('')}</div>
+    <div class="row">
+      <button class="btn success sm" onclick="svcAction('${name}','start')" ${enabled?'':'disabled'}>▶ 启动</button>
+      <button class="btn danger sm" onclick="svcAction('${name}','stop')">■ 停止</button>
+      <button class="btn primary sm" onclick="openConfig('${name}')">⚙ 配置</button>
+      ${extraButtons}
+      <label class="switch"><input type="checkbox" ${enabled?'checked':''} onchange="toggleEnabled('${name}',this.checked)"> 开机启用</label>
+    </div></div>`;
+}
+function renderDashboard(){
+  const s=status, up=s.uptime_s, d=Math.floor(up/86400), h=Math.floor(up%86400/3600), m=Math.floor(up%3600/60);
+  const el=document.getElementById('tab-dashboard');
+  let html=`<div class="card"><h3>🖥 系统</h3>
+    <div class="grid">
+      <div class="kv"><div class="l">版本</div><div class="v">ReMgr ${s.version} (${s.os})</div></div>
+      <div class="kv"><div class="l">运行时间</div><div class="v">${d}天 ${h}时 ${m}分</div></div>
+      <div class="kv"><div class="l">控制台</div><div class="v">${s.console.tls?'HTTPS':'HTTP'} :${s.console.port}</div></div>
+      <div class="kv"><div class="l">在线 frps 客户端</div><div class="v">${s.services.frps?.clients_online??0}</div></div>
+    </div></div>`;
+  const sv=s.services;
+  html += svcCard('easytier', sv.easytier?.running, sv.easytier?.enabled, [
+    ['配置服务器端口', sv.easytier?.config_server_port],['API 端口', sv.easytier?.api_port],
+    ['本地节点', sv.easytier?.node_enabled?(sv.easytier?.node_name||'—'):'关闭'],
+    ['网络名', sv.easytier?.network_name||'—'],
+  ]);
+  html += svcCard('stun_turn', sv.stun_turn?.running, sv.stun_turn?.enabled, [
+    ['STUN/TURN 端口', sv.stun_turn?.stun_port],['TLS 端口', sv.stun_turn?.tls_port],
+    ['域名', sv.stun_turn?.domain||'—'],['中继端口范围', sv.stun_turn?.relay_ports],
+  ]);
+  html += svcCard('rustdesk', sv.rustdesk?.running, sv.rustdesk?.enabled, [
+    ['中继端口 (hbbr)', sv.rustdesk?.relay_port],['ID 端口 (hbbs)', sv.rustdesk?.hbbs_port],
+    ['服务器 Key', sv.rustdesk?.key_set?'已设置':'未设置'],['', ''],
+  ]);
+  const fp=sv.frps||{};
+  html += svcCard('frps', fp.running, fp.enabled, [
+    ['监听', fp.bind],['在线客户端', fp.clients_online],
+    ['入站流量', fmtBytes(fp.bytes_in||0)],['出站流量', fmtBytes(fp.bytes_out||0)],
+  ]);
+  el.innerHTML=html;
+}
+function renderServiceTabs(){
+  const s=status?.services||{};
+  const fp=s.frps||{};
+  document.getElementById('tab-easytier').innerHTML =
+    svcCard('easytier', s.easytier?.running, s.easytier?.enabled, [
+      ['配置服务器端口 (UDP)', s.easytier?.config_server_port],['REST API', s.easytier?.api_addr+':'+s.easytier?.api_port],
+      ['本地节点', s.easytier?.node_enabled?'启用':'关闭'],['数据库', s.easytier?.db_path],
+      ['监听器', (s.easytier?.listeners||[]).length+' 个'],['网络名', s.easytier?.network_name||'—'],
+    ]);
+  document.getElementById('tab-stun_turn').innerHTML =
+    svcCard('stun_turn', s.stun_turn?.running, s.stun_turn?.enabled, [
+      ['STUN/TURN 端口', s.stun_turn?.stun_port],['TLS 端口', s.stun_turn?.tls_port],
+      ['域名', s.stun_turn?.domain||'—'],['外部 IP', s.stun_turn?.external_ip||'自动'],
+      ['中继端口范围', s.stun_turn?.relay_ports],['用户数', s.stun_turn?.users_count],
+    ]);
+  document.getElementById('tab-rustdesk').innerHTML =
+    svcCard('rustdesk', s.rustdesk?.running, s.rustdesk?.enabled, [
+      ['中继端口 (hbbr)', s.rustdesk?.relay_port],['ID 端口 (hbbs)', s.rustdesk?.hbbs_port],
+      ['NAT 测试端口', s.rustdesk?.nat_test_port],['WebSocket 端口', s.rustdesk?.websocket_port],
+      ['Key', s.rustdesk?.key_set?'已设置':'未设置'],['', ''],
+    ]);
+  let proxyRows='';
+  if(fp.proxies && fp.proxies.length){
+    proxyRows = `<table><tr><th>代理名</th><th>类型</th><th>远程端口</th><th>用户</th></tr>`+
+      fp.proxies.map(p=>`<tr><td>${p.proxy_name}</td><td>${p.proxy_type}</td><td>${p.remote_port}</td><td>${p.user||''}</td></tr>`).join('')+'</table>';
+  }
+  document.getElementById('tab-frps').innerHTML =
+    svcCard('frps', fp.running, fp.enabled, [
+      ['监听', fp.bind],['tcp_mux', String(fp.tcp_mux)],
+      ['入站', fmtBytes(fp.bytes_in||0)],['出站', fmtBytes(fp.bytes_out||0)],
+      ['累计登录', fp.total_logins],['用户连接', fp.total_user_conns],
+    ]) + `<div class="card"><h3>📋 活跃代理</h3>${proxyRows||'<p style="color:var(--tx2);font-size:13px">暂无</p>'}</div>`;
+}
+
+/* ---------- actions ---------- */
+async function svcAction(name, action){
+  try{
+    await api(`/api/service/${name}/${action}`,'POST',{});
+    toast(`${name} ${action==='start'?'已启动':action==='stop'?'已停止':''}`);
+    await refreshAll();
+  }catch(e){toast(e.message,false)}
+}
+async function toggleEnabled(name, enabled){
+  try{
+    const cfg = configs[name]||{};
+    cfg.enabled = enabled;
+    await api('/api/config/'+name,'PUT',cfg);
+    toast(`${name} ${enabled?'已启用':'已禁用'}`);
+    await refreshAll();
+  }catch(e){toast(e.message,false);refreshAll()}
+}
+
+/* ---------- config modal ---------- */
+function F(label, path, hint='', type='text'){
+  return `<div class="fg"><label>${label}</label><input type="${type}" data-path="${path}" value="">
+    ${hint?`<div class="hint">${hint}</div>`:''}</div>`;
+}
+const SCHEMAS = {
+  easytier: [
+    ['开关', [['enabled','启用模块','',['checkbox']]],
+    ['easytier-web', [
+      ['enabled','(同上)','','hidden'],
+      ['config_server_port','配置服务器端口 (UDP)','实例注册端口'],
+      ['api_addr','REST API 绑定地址',''],
+      ['api_port','REST API 端口','控制台会代理到 /et'],
+      ['db_path','数据库路径','']],
+    ['本地中心节点', [
+      ['node_enabled','启用本地节点','',['checkbox']],
+      ['node_name','节点名称',''],
+      ['network_name','网络名称 (Network Name)',''],
+      ['network_secret','网络密钥 (Network Secret)',''],
+      ['virtual_ipv4','虚拟 IPv4 (留空=DHCP)','例如 10.126.126.1'],
+      ['listeners','监听器 (每行一个 URL)','tcp://0.0.0.0:11010 等','textarea']],
+  ],
+  stun_turn: [
+    [['enabled','启用模块','',['checkbox']]],
+    [['bind_addr','绑定地址',''],['stun_port','STUN/TURN 端口','']],
+    [['turn_enabled','启用 TURN 中继 (coturn 内核)','',['checkbox']]],
+    [['domain','域名',''],['external_ip','外部 IP (留空自动)','']],
+    [['tls_port','TURN over TLS 端口',''],['realm','Realm','']],
+    [['relay_min_port','中继最小端口',''],['relay_max_port','中继最大端口','']],
+    [['users','用户凭证 (每行 user:pass)','TURN 长期凭证','textarea']],
+    [['cert_path','TLS 证书路径',''],['key_path','TLS 私钥路径','']],
+  ],
+  rustdesk: [
+    [['enabled','启用模块','',['checkbox']]],
+    [['relay_port','中继端口 (hbbr)','默认 21117'],['hbbs_port','ID 端口 (hbbs)','默认 21116']],
+    [['key','服务器 Key','留空自动生成；客户端 ID/中继服务器需填同域 Key','textarea']],
+  ],
+  frps: [
+    [['enabled','启用模块','',['checkbox']]],
+    [['bind_addr','绑定地址',''],['server_port','服务端口 (frpc 连接)','']],
+    [['token','认证 Token','frpc 的 auth.token 必须一致']],
+    [['tcp_mux','启用 yamux 多路复用 (frpc 默认开启)','',['checkbox']]],
+    [['max_pool_count','最大连接池',''],['heartbeat_timeout','心跳超时 (秒)','']],
+    [['allow_ports','允许的远程端口范围','如 6000-6100,7000；留空不限']],
+    [['tls_cert_path','TLS 证书路径','留空=自动生成自签证书'],['tls_key_path','TLS 私钥路径','']],
+  ],
+};
+
+function flattenSchema(svc){
+  // returns [{path, label, hint, widget}]
+  const out=[];
+  for(const item of SCHEMAS[svc]||[]){
+    if(Array.isArray(item[0])){ out.push(...item.map(x=>({path:x[0],label:x[1],hint:x[2]||'',widget:x[3]||'text'}))); }
+    else { out.push({path:item[0],label:item[1],hint:item[2]||'',widget:item[3]||'text'}); }
+  }
+  return out;
+}
+function getPath(o, path){ return path.split('.').reduce((a,k)=>a?.[k], o) }
+function setPath(o, path, v){ const ks=path.split('.'); const last=ks.pop(); ks.reduce((a,k)=>a[k]??=(a[k]={}),o)[last]=v }
+
+function openConfig(svc){
+  editService=svc;
+  document.getElementById('modal-title').textContent='配置 — '+TITLES[svc];
+  const cfg=configs[svc]||{};
+  const fields=flattenSchema(svc).map(f=>{
+    if(f.widget==='hidden') return '';
+    const v=getPath(cfg,f.path);
+    if(f.widget==='checkbox')
+      return `<div class="fg"><label class="switch" style="margin:0"><input type="checkbox" data-path="${f.path}" ${v?'checked':''}> ${f.label}</label></div>`;
+    if(f.widget==='textarea')
+      return `<div class="fg"><label>${f.label}</label><textarea data-path="${f.path}" rows="4" style="width:100%;padding:9px;border:1px solid var(--border);border-radius:7px;background:var(--bg);color:var(--tx);font-size:12px;font-family:monospace">${v!==undefined&&v!==null?(Array.isArray(v)?v.join('\n'):v):''}</textarea>${f.hint?`<div class="hint">${f.hint}</div>`:''}</div>`;
+    return `<div class="fg"><label>${f.label}</label><input data-path="${f.path}" value="${v!==undefined&&v!==null?String(v).replace(/"/g,'&quot;'):''}">${f.hint?`<div class="hint">${f.hint}</div>`:''}</div>`;
+  }).join('');
+  document.getElementById('modal-body').innerHTML=fields;
+  document.getElementById('modal').classList.remove('hidden');
+}
+function closeModal(){document.getElementById('modal').classList.add('hidden')}
+async function saveModal(){
+  if(!editService) return;
+  const cfg=JSON.parse(JSON.stringify(configs[editService]||{}));
+  document.querySelectorAll('#modal-body [data-path]').forEach(el=>{
+    let v;
+    if(el.type==='checkbox') v=el.checked;
+    else if(el.tagName==='TEXTAREA'){
+      v=el.value;
+      // listeners / users are string arrays
+      if(['listeners','users'].includes(el.dataset.path)) v=el.value.split('\n').map(x=>x.trim()).filter(Boolean);
+    }
+    else v=el.type==='number'?Number(el.value):el.value;
+    setPath(cfg, el.dataset.path, v);
+  });
+  try{
+    await api('/api/config/'+editService,'PUT',cfg);
+    toast('配置已保存并应用');closeModal();await refreshAll();
+  }catch(e){toast(e.message,false)}
+}
+
+/* ---------- certs ---------- */
+async function genCert(svc){
+  const domain=prompt('证书域名 (CN/SAN):', location.hostname||'remgr.local');
+  if(!domain) return;
+  try{
+    const r=await api('/api/system/certs/generate','POST',{service:svc,domain});
+    toast('证书已生成: '+r.cert_path);
+    await refreshAll();
+  }catch(e){toast(e.message,false)}
+}
+
+/* ---------- logs ---------- */
+async function tickLogs(){
+  if(curTab!=='system') return;
+  try{
+    const d=await api('/api/logs?n=400');
+    const el=document.getElementById('logs');
+    if(el.dataset.count===String(d.lines.length)) return;
+    el.textContent=d.lines.join('\n');
+    el.dataset.count=String(d.lines.length);
+    scrollLogs();
+  }catch(e){}
+}
+function scrollLogs(){const el=document.getElementById('logs'); if(document.getElementById('log-follow')?.checked) el.scrollTop=el.scrollHeight}
+function connectWS(){
+  try{
+    const proto=location.protocol==='https:'?'wss':'ws';
+    ws=new WebSocket(`${proto}://${location.host}/api/ws/logs`);
+    ws.onopen=()=>{document.getElementById('conn').classList.add('ok');document.getElementById('conn-tx').textContent='已连接'};
+    ws.onmessage=ev=>{
+      if(curTab!=='system')return;
+      const el=document.getElementById('logs');
+      el.textContent+='\n'+ev.data;
+      while(el.textContent.length>200000) el.textContent=el.textContent.slice(el.textContent.indexOf('\n')+1);
+      scrollLogs();
+    };
+    ws.onclose=()=>{document.getElementById('conn').classList.remove('ok');document.getElementById('conn-tx').textContent='断开';setTimeout(connectWS,4000)};
+    ws.onerror=()=>{try{ws.close()}catch(e){}};
+  }catch(e){}
+}
+
+/* status poll */
+setInterval(()=>{ if(status && !document.getElementById('app').classList.contains('hidden')) refreshAll(); }, 10000);
+document.getElementById('modal').addEventListener('click', e=>{ if(e.target.id==='modal') closeModal() });
+</script>
+</body>
+</html>

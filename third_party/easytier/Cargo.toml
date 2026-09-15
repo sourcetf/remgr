@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "easytier-core",
+    "easytier-proto",
+    "easytier",
+    "easytier-web",
+]
+default-members = ["easytier", "easytier-web"]
+exclude = [
+    "easytier-contrib",
+]
+
+[workspace.package]
+rust-version = "1.85"
+edition = "2024"
+
+[profile.dev]
+debug = 2
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = true
+
+# easytier-cli needs panic = unwind so catch_unwind() can intercept
+# BrokenPipe panics from | head etc. without producing core dumps.
+[profile.release.package.easytier]
+
+
+[profile.mini]
+inherits = "release"
+opt-level = "z"
+strip = "symbols"
+
+# --- OpenBSD support patches (see patches/) ---
+[patch.crates-io]
+guarden = { path = "patches/guarden" }
+boringtun-easytier = { path = "patches/boringtun-easytier" }
+
+[patch."https://github.com/EasyTier/rust-tun"]
+tun-easytier = { path = "patches/rust-tun" }

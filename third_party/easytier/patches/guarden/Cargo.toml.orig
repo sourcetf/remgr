@@ -1,0 +1,26 @@
+[package]
+name = "guarden"
+repository.workspace = true
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Zero-cost abstractions for scoped guards, deferred execution, and async task detachment"
+readme = "README.md"
+
+[lib]
+
+[features]
+default = ["tokio"]
+tokio = ["dep:tokio"]
+
+[dependencies]
+guarden-macros = { workspace = true }
+futures-core = { version = "0.3", default-features = false }
+tokio = { version = "1.52", features = ["rt"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1.52", features = ["full"] }
+tokio-test = "0.4"
