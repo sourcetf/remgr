@@ -24,6 +24,9 @@ struct RunHandle {
     token: CancellationToken,
     /// strong ref: dropping the manager stops its background drivers
     _manager: Arc<easytier::instance::factory::NativeInstanceManager>,
+    /// keeps the embedded easytier-web config server (udp) and REST api
+    /// alive — dropping this handle aborts them (AbortOnDrop semantics)
+    _web: easytier_web::start::RunningEasyTierWeb,
 }
 
 impl EasyTierModule {
@@ -137,7 +140,57 @@ impl super::ServiceModule for EasyTierModule {
         .with_context(|| format!("easytier-web start (db={})", cfg.db_path))?;
 
         let token = CancellationToken::new();
-        let web_token = web.token.clone();
+
+        // bootstrap the dashboard login: ensure an "admin" user exists. On
+        // first boot a random password is generated, logged once and written
+        // to a root-only file (same pattern as the console initial password).
+        {
+            let db = web.db.clone();
+            match db.get_user_id("admin").await {
+                Ok(Some(_)) => {}
+                _ => {
+                    let password: String = {
+                        use rand::Rng;
+                        const ALPH: &[u8] = b"abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789";
+                        let mut rng = rand::thread_rng();
+                        (0..14)
+                            .map(|_| ALPH[rng.gen_range(0..ALPH.len())] as char)
+                            .collect()
+                    };
+                    match tokio::task::spawn_blocking({
+                        let pw = password.clone();
+                        move || password_auth::generate_hash(&pw)
+                    })
+                    .await
+                    {
+                        Ok(hash) => {
+                            match db.create_user_and_join_users_group("admin", hash).await {
+                                Ok(_) => {
+                                    let _ = std::fs::write(
+                                        "/var/run/remgr/easytier_dashboard_password",
+                                        format!("{password}\n"),
+                                    );
+                                    #[cfg(unix)]
+                                    {
+                                        use std::os::unix::fs::PermissionsExt;
+                                        let _ = std::fs::set_permissions(
+                                            "/var/run/remgr/easytier_dashboard_password",
+                                            std::fs::Permissions::from_mode(0o600),
+                                        );
+                                    }
+                                    tracing::warn!(
+                                        "easytier dashboard initial password: {password}  \
+                                         (user admin, also in /var/run/remgr/easytier_dashboard_password)"
+                                    );
+                                }
+                                Err(e) => tracing::warn!("easytier: dashboard user bootstrap failed: {e}"),
+                            }
+                        }
+                        Err(e) => tracing::warn!("easytier: password hash task failed: {e}"),
+                    }
+                }
+            }
+        }
 
         // 2) local node instance manager
         let manager = Arc::new(easytier::instance::factory::native_cli_instance_manager());
@@ -147,6 +200,7 @@ impl super::ServiceModule for EasyTierModule {
         //    easytier-web dashboard can manage it (in-process)
         let wc_token = token.clone();
         let wc_mgr = manager.clone();
+        let config_server_port = web.config_server_port;
         let node_name = if cfg.node_name.is_empty() { "remgr-node".to_string() } else { cfg.node_name.clone() };
         // stable machine id: persisted once, reused across restarts (the
         // platform state-dir lookup is unsupported on openbsd)
@@ -161,7 +215,7 @@ impl super::ServiceModule for EasyTierModule {
         };
         tokio::spawn(async move {
             match easytier::web_client::run_web_client(
-                &format!("udp://127.0.0.1:{}/{}", web.config_server_port, machine_id),
+                &format!("udp://127.0.0.1:{config_server_port}/{machine_id}"),
                 easytier::common::MachineIdOptions {
                     explicit_machine_id: Some(machine_id),
                     state_dir: None,
@@ -196,7 +250,9 @@ impl super::ServiceModule for EasyTierModule {
             }
         }
 
-        *run = Some(RunHandle { token, _manager: manager });
+        // NOTE: `web` must live in the handle — dropping it aborts the
+        // config-server and REST api tasks (AbortOnDropHandle semantics).
+        *run = Some(RunHandle { token, _manager: manager, _web: web });
         let _ = instance_ids;
         Ok(())
     }

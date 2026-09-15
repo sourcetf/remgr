@@ -1,3 +1,16 @@
 /target
 Cargo.lock.bak
 *.toml.tmp
+
+# frontend build inputs (node_modules + codegen output are rebuildable)
+third_party/easytier/easytier-web/node_modules/
+third_party/easytier/easytier-web/frontend/node_modules/
+third_party/easytier/easytier-web/frontend-lib/node_modules/
+third_party/easytier/easytier-web/frontend-lib/src/generated/
+
+# protoc scratch used to build the dashboard
+.protoc-bin/
+
+# editor/agent state dirs
+.mimosa/
+**/.mimosa/

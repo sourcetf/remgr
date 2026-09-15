@@ -522,6 +522,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "axum-embed"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "077959a7f8cf438676af90b483304528eb7e16eadadb7f44e9ada4f9dceb9e62"
+dependencies = [
+ "axum-core 0.4.5",
+ "chrono",
+ "http 1.5.0",
+ "mime_guess",
+ "rust-embed",
+ "tower-service",
+]
+
+[[package]]
 name = "axum-login"
 version = "0.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2125,6 +2139,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "axum 0.7.9",
+ "axum-embed",
  "axum-login",
  "axum-messages",
  "base64 0.22.1",
@@ -6174,6 +6189,7 @@ dependencies = [
  "hbbs",
  "libc",
  "log",
+ "password-auth",
  "password-hash",
  "rand 0.8.8",
  "rcgen 0.13.2",

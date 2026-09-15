@@ -50,7 +50,8 @@ url = "2"
 
 # ---- integrated services (in-process libraries, no subprocesses, no IPC) ----
 easytier = { path = "../third_party/easytier/easytier", default-features = false, features = ["full", "management", "management-rpc"] }
-easytier-web = { path = "../third_party/easytier/easytier-web", default-features = false }
+easytier-web = { path = "../third_party/easytier/easytier-web", default-features = false, features = ["embed"] }
+password-auth = "1.0.0"
 # RustDesk hbbs/hbbr as a library (vendored rustdesk-server 1.1.17)
 hbbs = { path = "../third_party/rustdesk-server" }
 # TURN relay (pure Rust, RFC 5766)
