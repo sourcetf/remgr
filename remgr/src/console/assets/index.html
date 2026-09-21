@@ -297,43 +297,42 @@ function F(label, path, hint='', type='text'){
 }
 const SCHEMAS = {
   easytier: [
-    [['enabled','启用模块','',['checkbox']]],
-    [['config_server_port','配置服务器端口 (UDP)','实例注册端口',['number']]],
-    [['api_addr','REST API 绑定地址','']],
-    [['api_port','REST API 端口','easytier-web 管理/API 端口',['number']]],
-    [['db_path','数据库路径','']],
-    [['node_enabled','启用本地节点','',['checkbox']]],
-    [['node_name','节点名称','']],
-    [['network_name','网络名称 (Network Name)','']],
-    [['network_secret','网络密钥 (Network Secret)','']],
-    [['virtual_ipv4','虚拟 IPv4 (留空=DHCP)','例如 10.126.126.1']],
-    [['listeners','监听器 (每行一个 URL)','tcp://0.0.0.0:11010 等','textarea']],
+    ['开关', [['enabled','启用模块','',['checkbox']]],
+    ['easytier-web', [
+      ['enabled','(同上)','','hidden'],
+      ['config_server_port','配置服务器端口 (UDP)','实例注册端口'],
+      ['api_addr','REST API 绑定地址',''],
+      ['api_port','REST API 端口','控制台会代理到 /et'],
+      ['db_path','数据库路径','']],
+    ['本地中心节点', [
+      ['node_enabled','启用本地节点','',['checkbox']],
+      ['node_name','节点名称',''],
+      ['network_name','网络名称 (Network Name)',''],
+      ['network_secret','网络密钥 (Network Secret)',''],
+      ['virtual_ipv4','虚拟 IPv4 (留空=DHCP)','例如 10.126.126.1'],
+      ['listeners','监听器 (每行一个 URL)','tcp://0.0.0.0:11010 等','textarea']],
   ],
   stun_turn: [
     [['enabled','启用模块','',['checkbox']]],
-    [['bind_addr','绑定地址',''],['stun_port','STUN/TURN 端口','',['number']]],
+    [['bind_addr','绑定地址',''],['stun_port','STUN/TURN 端口','']],
     [['turn_enabled','启用 TURN 中继 (coturn 内核)','',['checkbox']]],
     [['domain','域名',''],['external_ip','外部 IP (留空自动)','']],
-    [['tls_port','TURN over TLS 端口','',['number']]],
-    [['realm','Realm','']],
-    [['relay_min_port','中继最小端口','',['number']]],
-    [['relay_max_port','中继最大端口','',['number']]],
+    [['tls_port','TURN over TLS 端口',''],['realm','Realm','']],
+    [['relay_min_port','中继最小端口',''],['relay_max_port','中继最大端口','']],
     [['users','用户凭证 (每行 user:pass)','TURN 长期凭证','textarea']],
     [['cert_path','TLS 证书路径',''],['key_path','TLS 私钥路径','']],
   ],
   rustdesk: [
     [['enabled','启用模块','',['checkbox']]],
-    [['relay_port','中继端口 (hbbr)','默认 21117',['number']]],
-    [['hbbs_port','ID 端口 (hbbs)','默认 21116',['number']]],
+    [['relay_port','中继端口 (hbbr)','默认 21117'],['hbbs_port','ID 端口 (hbbs)','默认 21116']],
     [['key','服务器 Key','留空自动生成；客户端 ID/中继服务器需填同域 Key','textarea']],
   ],
   frps: [
     [['enabled','启用模块','',['checkbox']]],
-    [['bind_addr','绑定地址',''],['server_port','服务端口 (frpc 连接)','',['number']]],
+    [['bind_addr','绑定地址',''],['server_port','服务端口 (frpc 连接)','']],
     [['token','认证 Token','frpc 的 auth.token 必须一致']],
     [['tcp_mux','启用 yamux 多路复用 (frpc 默认开启)','',['checkbox']]],
-    [['max_pool_count','最大连接池','',['number']]],
-    [['heartbeat_timeout','心跳超时 (秒)','',['number']]],
+    [['max_pool_count','最大连接池',''],['heartbeat_timeout','心跳超时 (秒)','']],
     [['allow_ports','允许的远程端口范围','如 6000-6100,7000；留空不限']],
     [['tls_cert_path','TLS 证书路径','留空=自动生成自签证书'],['tls_key_path','TLS 私钥路径','']],
   ],
@@ -362,8 +361,7 @@ function openConfig(svc){
       return `<div class="fg"><label class="switch" style="margin:0"><input type="checkbox" data-path="${f.path}" ${v?'checked':''}> ${f.label}</label></div>`;
     if(f.widget==='textarea')
       return `<div class="fg"><label>${f.label}</label><textarea data-path="${f.path}" rows="4" style="width:100%;padding:9px;border:1px solid var(--border);border-radius:7px;background:var(--bg);color:var(--tx);font-size:12px;font-family:monospace">${v!==undefined&&v!==null?(Array.isArray(v)?v.join('\n'):v):''}</textarea>${f.hint?`<div class="hint">${f.hint}</div>`:''}</div>`;
-    const type = f.widget==='number' ? 'number' : 'text';
-    return `<div class="fg"><label>${f.label}</label><input type="${type}" data-path="${f.path}" value="${v!==undefined&&v!==null?String(v).replace(/"/g,'&quot;'):''}">${f.hint?`<div class="hint">${f.hint}</div>`:''}</div>`;
+    return `<div class="fg"><label>${f.label}</label><input data-path="${f.path}" value="${v!==undefined&&v!==null?String(v).replace(/"/g,'&quot;'):''}">${f.hint?`<div class="hint">${f.hint}</div>`:''}</div>`;
   }).join('');
   document.getElementById('modal-body').innerHTML=fields;
   document.getElementById('modal').classList.remove('hidden');
@@ -380,12 +378,7 @@ async function saveModal(){
       // listeners / users are string arrays
       if(['listeners','users'].includes(el.dataset.path)) v=el.value.split('\n').map(x=>x.trim()).filter(Boolean);
     }
-    else if(el.type==='number'){
-      // empty numeric inputs keep the existing value rather than becoming 0
-      if(el.value.trim()==='') return;
-      v=Number(el.value);
-    }
-    else v=el.value;
+    else v=el.type==='number'?Number(el.value):el.value;
     setPath(cfg, el.dataset.path, v);
   });
   try{

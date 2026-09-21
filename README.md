@@ -17,8 +17,10 @@ Web 控制台（axum + 内嵌 SPA）：每个服务的全部可配置项、启�
 
 二进制自带 `pledge(2)` / `unveil(2)`：
 
-- pledge：`stdio rpath wpath cpath fattr flock inet unix dns getpw route psig` —— **无 `exec`**，架构上杜绝子进程。
-- unveil：`/etc/remgr`、`/var/lib/remgr`、`/var/db/remgr`、`/var/log/remgr`、`/var/run/remgr`（rwc）、`/etc/ssl` 等（r）、`/dev/tun0-7`（rw，EasyTier TUN）、`/dev/*random`（r）。
+- pledge：`stdio rpath wpath cpath fattr flock inet unix dns getpw` —— **无 `exec`**，架构上杜绝子进程。
+- unveil：`/etc/remgr`、`/var/lib/remgr`、`/var/db/remgr`、`/var/log/remgr`、
+`/var/run/remgr`（rwc）、`/etc/ssl`、`/etc/resolv.conf`、`/etc/hosts`、
+`/etc/services`（r）、`/dev/tun0-7`（rw，EasyTier TUN）、`/dev/urandom`（r）。
 
 ## 目录约定（OpenBSD）
 

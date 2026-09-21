@@ -21,22 +21,7 @@ struct ApiMetaResponse {
     api_host: String,
 }
 
-async fn handle_api_meta(State(api_host): State<Option<url::Url>>) -> impl IntoResponse {
-    // When an explicit api_host is configured, emit it. Otherwise emit JS that
-    // resolves to the *current* origin at runtime — this is the embedded case
-    // where the dashboard and REST API share one origin (e.g. ReMgr), so the
-    // SPA must call back to wherever it was loaded from, NOT the stale public
-    // default baked into the checked-in frontend/dist/api_meta.js.
-    let body = match api_host {
-        Some(u) => format!(
-            "window.apiMeta = {}",
-            serde_json::to_string(&ApiMetaResponse {
-                api_host: u.to_string()
-            })
-            .unwrap(),
-        ),
-        None => "window.apiMeta = {api_host: window.location.origin}".to_string(),
-    };
+async fn handle_api_meta(State(api_host): State<url::Url>) -> impl IntoResponse {
     Response::builder()
         .header(
             header::CONTENT_TYPE,
@@ -45,7 +30,13 @@ async fn handle_api_meta(State(api_host): State<Option<url::Url>>) -> impl IntoR
         .header(header::CACHE_CONTROL, "no-cache, no-store, must-revalidate")
         .header(header::PRAGMA, "no-cache")
         .header(header::EXPIRES, "0")
-        .body(body)
+        .body(format!(
+            "window.apiMeta = {}",
+            serde_json::to_string(&ApiMetaResponse {
+                api_host: api_host.to_string()
+            })
+            .unwrap(),
+        ))
         .unwrap()
 }
 
@@ -53,13 +44,14 @@ pub fn build_router(api_host: Option<url::Url>) -> Router {
     let service = ServeEmbed::<Assets>::new();
     let router = Router::new();
 
-    // Always override /api_meta.js so the embedded frontend never falls back
-    // to the public default host shipped inside frontend/dist.
-    let router = router
-        .route(
-            "/api_meta.js",
-            routing::get(handle_api_meta).with_state(api_host),
-        );
+    let router = if let Some(api_host) = api_host {
+        let sub_router = Router::new()
+            .route("/api_meta.js", routing::get(handle_api_meta))
+            .with_state(api_host);
+        router.merge(sub_router)
+    } else {
+        router
+    };
 
     router.fallback_service(service)
 }
