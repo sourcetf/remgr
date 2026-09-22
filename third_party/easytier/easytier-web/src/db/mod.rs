@@ -6,8 +6,8 @@ use easytier::common::config::{ConfigSource, NetworkConfig};
 use easytier_core::management::remote_client::{ListNetworkProps, Storage};
 use entity::user_running_network_configs;
 use sea_orm::{
-    ColumnTrait as _, DatabaseConnection, DbErr, EntityTrait, QueryFilter as _, Set,
-    SqlxSqliteConnector, TransactionTrait as _, sea_query::OnConflict,
+    ColumnTrait as _, DatabaseConnection, DbErr, EntityTrait, IntoActiveModel as _,
+    QueryFilter as _, Set, SqlxSqliteConnector, TransactionTrait as _, sea_query::OnConflict,
 };
 use sea_orm_migration::MigratorTrait as _;
 use sqlx::{Sqlite, SqlitePool, migrate::MigrateDatabase as _, types::chrono};
@@ -335,6 +335,33 @@ impl Db {
                 .map_err(|e| DbErr::Custom(format!("Failed to hash password: {}", e)))?;
         self.create_user_and_join_users_group(username, hashed_password)
             .await
+    }
+
+    /// Overwrite an existing user's password hash.
+    ///
+    /// Returns `false` when no such user exists, so the caller can fall back to
+    /// creating it. Host applications use this to install a usable dashboard
+    /// credential: the migration only seeds a fixed, unpublished hash.
+    pub async fn set_user_password<T: ToString>(
+        &self,
+        user_name: T,
+        password_hash: String,
+    ) -> Result<bool, DbErr> {
+        use entity::users;
+
+        let existing = users::Entity::find()
+            .filter(users::Column::Username.eq(user_name.to_string()))
+            .one(self.orm_db())
+            .await?;
+
+        let Some(user) = existing else {
+            return Ok(false);
+        };
+
+        let mut active: users::ActiveModel = user.into_active_model();
+        active.password = Set(password_hash);
+        users::Entity::update(active).exec(self.orm_db()).await?;
+        Ok(true)
     }
 
     // TODO: currently we don't have a token system, so we just use the user name as token

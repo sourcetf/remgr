@@ -169,53 +169,66 @@ impl super::ServiceModule for EasyTierModule {
 
         let token = CancellationToken::new();
 
-        // bootstrap the dashboard login: ensure an "admin" user exists. On
-        // first boot a random password is generated, logged once and written
-        // to a root-only file (same pattern as the console initial password).
+        // Dashboard credential bootstrap.
+        //
+        // The easytier-web migration seeds an `admin` user with a fixed hash
+        // whose plaintext is not published, so the embedded dashboard has no
+        // usable login until the password is replaced. On first boot — no
+        // password file yet — a fresh random password is hashed into that
+        // account and written root-only; once the file exists the operator has
+        // been given a working credential and may have changed it from the
+        // dashboard, so it is left alone.
         {
             let db = web.db.clone();
-            match db.get_user_id("admin").await {
-                Ok(Some(_)) => {}
-                _ => {
-                    let password: String = {
-                        use rand::Rng;
-                        const ALPH: &[u8] = b"abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789";
-                        let mut rng = rand::thread_rng();
-                        (0..14)
-                            .map(|_| ALPH[rng.gen_range(0..ALPH.len())] as char)
-                            .collect()
-                    };
-                    match tokio::task::spawn_blocking({
-                        let pw = password.clone();
-                        move || password_auth::generate_hash(&pw)
-                    })
-                    .await
-                    {
-                        Ok(hash) => {
-                            match db.create_user_and_join_users_group("admin", hash).await {
-                                Ok(_) => {
-                                    let _ = std::fs::write(
-                                        "/var/run/remgr/easytier_dashboard_password",
-                                        format!("{password}\n"),
-                                    );
-                                    #[cfg(unix)]
-                                    {
-                                        use std::os::unix::fs::PermissionsExt;
-                                        let _ = std::fs::set_permissions(
-                                            "/var/run/remgr/easytier_dashboard_password",
-                                            std::fs::Permissions::from_mode(0o600),
-                                        );
-                                    }
-                                    tracing::warn!(
-                                        "easytier dashboard initial password: {password}  \
-                                         (user admin, also in /var/run/remgr/easytier_dashboard_password)"
+            const PW_FILE: &str = "/var/run/remgr/easytier_dashboard_password";
+            if !std::path::Path::new(PW_FILE).exists() {
+                let password: String = {
+                    use rand::Rng;
+                    const ALPH: &[u8] = b"abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789";
+                    let mut rng = rand::thread_rng();
+                    (0..14)
+                        .map(|_| ALPH[rng.gen_range(0..ALPH.len())] as char)
+                        .collect()
+                };
+                match tokio::task::spawn_blocking({
+                    let pw = password.clone();
+                    move || password_auth::generate_hash(&pw)
+                })
+                .await
+                {
+                    Ok(hash) => {
+                        let spare = hash.clone();
+                        // Replace the seeded credential; only create the account
+                        // if a previous run removed it.
+                        let installed = match db.set_user_password("admin", hash).await {
+                            Ok(true) => Ok(()),
+                            _ => db
+                                .create_user_and_join_users_group("admin", spare)
+                                .await
+                                .map(|_| ()),
+                        };
+                        match installed {
+                            Ok(()) => {
+                                let _ = std::fs::write(PW_FILE, format!("{password}\n"));
+                                #[cfg(unix)]
+                                {
+                                    use std::os::unix::fs::PermissionsExt;
+                                    let _ = std::fs::set_permissions(
+                                        PW_FILE,
+                                        std::fs::Permissions::from_mode(0o600),
                                     );
                                 }
-                                Err(e) => tracing::warn!("easytier: dashboard user bootstrap failed: {e}"),
+                                tracing::warn!(
+                                    "easytier dashboard initial password: {password}  \
+                                     (user admin, also in {PW_FILE})"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!("easytier: dashboard credential bootstrap failed: {e}")
                             }
                         }
-                        Err(e) => tracing::warn!("easytier: password hash task failed: {e}"),
                     }
+                    Err(e) => tracing::warn!("easytier: password hash task failed: {e}"),
                 }
             }
         }
@@ -243,7 +256,14 @@ impl super::ServiceModule for EasyTierModule {
         };
         tokio::spawn(async move {
             match easytier::web_client::run_web_client(
-                &format!("udp://127.0.0.1:{config_server_port}/{machine_id}"),
+                // The embedded config server identifies a node by the token in
+                // the URL — and this easytier-web build resolves that token as
+                // *the user name* (`get_user_id_by_token`), auto-creating an
+                // account when unknown. Registering with the machine id made the
+                // centre node a separate device that the `admin` dashboard never
+                // listed; registering as `admin` binds it to that account so the
+                // console's EasyTier dashboard can manage it.
+                &format!("udp://127.0.0.1:{config_server_port}/admin"),
                 easytier::common::MachineIdOptions {
                     explicit_machine_id: Some(machine_id),
                     state_dir: None,

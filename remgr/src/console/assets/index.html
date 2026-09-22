@@ -246,7 +246,11 @@ function renderServiceTabs(){
       ['配置服务器端口 (UDP)', s.easytier?.config_server_port],['REST API', s.easytier?.api_addr+':'+s.easytier?.api_port],
       ['本地节点', s.easytier?.node_enabled?'启用':'关闭'],['数据库', s.easytier?.db_path],
       ['监听器', (s.easytier?.listeners||[]).length+' 个'],['网络名', s.easytier?.network_name||'—'],
-    ], `<a class="btn sm" href="/et/" target="_blank" rel="noopener">🖧 EasyTier 控制台</a>`);
+    ], `<a class="btn sm" href="/et/" target="_blank" rel="noopener">🖧 EasyTier 控制台</a>`)
+    + `<div class="card"><h3>🖧 EasyTier 仪表盘（easytier-web）</h3>
+      <p style="color:var(--tx2);font-size:12px">同源提供于 <a href="/et/" target="_blank" rel="noopener">/et/</a>，登陆用户 <b>admin</b>；
+      首次启动的随机口令见 <code>/var/run/remgr/easytier_dashboard_password</code>（可在仪表盘内自行修改）。
+      本地中心节点以此账户注册，会作为一台设备出现在仪表盘中。</p></div>`;
   document.getElementById('tab-stun_turn').innerHTML =
     svcCard('stun_turn', s.stun_turn?.running, s.stun_turn?.enabled, [
       ['STUN/TURN 端口', s.stun_turn?.stun_port],

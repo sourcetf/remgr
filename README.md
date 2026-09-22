@@ -67,6 +67,14 @@ rcctl start remgr
 
 控制台默认 `http://<host>:9443`；首次启动生成随机管理口令，写入 syslog 与 `/var/run/remgr/initial_password`（0600）。
 
+## EasyTier 仪表盘（easytier-web）
+
+嵌入式 easytier-web 的完整仪表盘由 REST API 同源提供，控制台以 `/et/` 反代，从控制台 EasyTier 页即可打开：**`http://<host>:9443/et/`**。
+
+- 登录账户为 `admin`。easytier-web 的迁移只预置一个未公开的哈希，ReMgr 在首次启动时把它替换为随机口令，写入 syslog 与 `/var/run/remgr/easytier_dashboard_password`（0600）；此后不再改动，可在仪表盘内自行修改。
+- 本地中心节点以 `admin` 账户注册到内置配置服务器，因此会作为一台设备出现在仪表盘中，可直接在其中管理网络实例——与在控制台里改 `[easytier]` 是同一个进程、同一个 `NativeInstanceManager`。
+- 仪表盘只监听 `api_addr:api_port`（默认 `127.0.0.1:11211`），对外仅通过控制台的 `/et/` 暴露；不要把 11211 直接暴露到公网。
+
 ## frp 客户端兼容性说明
 
 - 与 fatedier/frp 客户端（V1 线协议 + yamux/tcp_mux + TLS 首字节）兼容。
