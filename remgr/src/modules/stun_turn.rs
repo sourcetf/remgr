@@ -169,7 +169,22 @@ impl super::ServiceModule for StunTurnModule {
                 .upgrade()
                 .map(|s| s.cert_dir())
                 .unwrap_or_else(|| PathBuf::from("."));
-            let (turn, joins) = spawn_turn_relay(token.clone(), cfg.clone(), cert_dir).await?;
+            let mut attempt = 0u32;
+            let (turn, joins) = loop {
+                match spawn_turn_relay(token.clone(), cfg.clone(), cert_dir.clone()).await {
+                    Ok(v) => break v,
+                    Err(e) if attempt < 12 => {
+                        // A prior incarnation releases its UDP/TLS sockets from
+                        // an aborted task, not synchronously, so a quick restart
+                        // can see EADDRINUSE. Retry briefly instead of failing
+                        // the module (and leaving the service dead).
+                        tracing::debug!("stun_turn bind retry after: {e:#}");
+                        attempt += 1;
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
             (Some(turn), joins)
         } else {
             (None, vec![self.spawn_stun(token.clone(), cfg.clone()).await?])

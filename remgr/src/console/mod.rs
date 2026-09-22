@@ -33,6 +33,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/console/password", post(change_password))
         // the embedded easytier-web REST API, same-origin under /et
         .route("/et", any(easytier_web_proxy))
+        .route("/et/", any(easytier_web_proxy))
         .route("/et/*path", any(easytier_web_proxy))
         .layer(middleware::from_fn_with_state(state.clone(), auth_mw))
         .with_state(state)

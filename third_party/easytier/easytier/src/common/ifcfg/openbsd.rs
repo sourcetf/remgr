@@ -325,11 +325,30 @@ impl IfConfiguerTrait for OpenBsdIfConfiger {
     }
 
     async fn remove_ip(&self, name: &str, ip: Option<Ipv4Inet>) -> Result<(), Error> {
-        // A zeroed address removes every IPv4 address on the interface.
-        let addr = ip.map(|i| i.address()).unwrap_or(Ipv4Addr::UNSPECIFIED);
-        let mut req = ifaliasreq(name, addr, addr, Ipv4Addr::UNSPECIFIED);
-        ignore_missing(ioctl_raw(SIOCDIFADDR, &mut req))?;
-        Ok(())
+        // A zeroed SIOCDIFADDR does NOT delete any address on OpenBSD tun(4):
+        // with no address present it answers EADDRNOTAVAIL, and with one present
+        // it succeeds without removing it. The only reliable delete is a
+        // specific address, so `None` (delete-all) loops: query the first
+        // address, delete it, repeat until none remain. Delete matches on the
+        // address alone, so `dst = addr` is fine even on point-to-point links.
+        if let Some(ip) = ip {
+            let mut req = ifaliasreq(name, ip.address(), ip.address(), Ipv4Addr::UNSPECIFIED);
+            ignore_missing(ioctl_raw(SIOCDIFADDR, &mut req))?;
+            return Ok(());
+        }
+        loop {
+            let first = match iface_ipv4(name) {
+                Ok(a) => a,
+                Err(e) if e.raw_os_error() == Some(libc::EADDRNOTAVAIL) => return Ok(()),
+                Err(e) => return Err(e.into()),
+            };
+            let mut req = ifaliasreq(name, first, first, Ipv4Addr::UNSPECIFIED);
+            match ioctl_raw(SIOCDIFADDR, &mut req) {
+                Ok(()) => {}
+                Err(e) if e.raw_os_error() == Some(libc::EADDRNOTAVAIL) => return Ok(()),
+                Err(e) => return Err(e.into()),
+            }
+        }
     }
 
     async fn add_ipv6_ip(
@@ -344,6 +363,9 @@ impl IfConfiguerTrait for OpenBsdIfConfiger {
     }
 
     async fn remove_ipv6(&self, name: &str, ip: Option<Ipv6Inet>) -> Result<(), Error> {
+        // Same OpenBSD tun(4) caveat as remove_ip: a zeroed SIOCDIFADDR_IN6 does
+        // not delete a specific address, and "nothing to remove" must not be
+        // fatal (upstream treats any error as instance death).
         let addr = ip.map(|i| i.address()).unwrap_or(Ipv6Addr::UNSPECIFIED);
         let mut req = in6_aliasreq(name, addr, [0u8; 16]);
         ignore_missing(ioctl_raw(SIOCDIFADDR_IN6, &mut req))?;
