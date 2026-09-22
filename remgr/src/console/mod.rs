@@ -9,7 +9,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use axum::{Json, Router};
 use serde_json::json;
 
@@ -31,6 +31,9 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/api/system/certs/generate", post(certs_generate))
         .route("/api/system/certs/upload", post(certs_upload))
         .route("/api/console/password", post(change_password))
+        // the embedded easytier-web REST API, same-origin under /et
+        .route("/et", any(easytier_web_proxy))
+        .route("/et/*path", any(easytier_web_proxy))
         .layer(middleware::from_fn_with_state(state.clone(), auth_mw))
         .with_state(state)
 }
@@ -45,6 +48,119 @@ async fn index() -> Response {
         INDEX_HTML,
     )
         .into_response()
+}
+
+// ---------------------------------------------------------------- /et proxy
+
+/// Reverse-proxy `/et/*` to the embedded easytier-web REST API, so the
+/// EasyTier dashboard is reachable same-origin from the console.
+///
+/// The API binds to `api_addr:api_port` (loopback by default) and authenticates
+/// with its own session cookie, which is scoped to `/et` on the way back.
+async fn easytier_web_proxy(
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+) -> Response {
+    let cfg = state.config_blocking().easytier;
+    let upstream = format!("http://{}:{}/", cfg.api_addr, cfg.api_port);
+
+    // strip the /et prefix; the upstream router serves /api/v1/... at its root
+    let path = req.uri().path().strip_prefix("/et").unwrap_or("");
+    let query = req
+        .uri()
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    let url = format!("{upstream}{}{query}", path.trim_start_matches('/'));
+
+    let method = reqwest::Method::from_bytes(req.method().as_str().as_bytes())
+        .unwrap_or(reqwest::Method::GET);
+
+    let mut outbound = state.et_http.request(method, &url);
+
+    // forward the client's headers, dropping hop-by-hop and Host (reqwest
+    // sets its own from the URL)
+    for (name, value) in req.headers() {
+        let n = name.as_str();
+        if n.eq_ignore_ascii_case("host")
+            || n.eq_ignore_ascii_case("connection")
+            || n.eq_ignore_ascii_case("content-length")
+            || n.eq_ignore_ascii_case("accept-encoding")
+        {
+            continue;
+        }
+        outbound = outbound.header(name, value);
+    }
+
+    let body = match axum::body::to_bytes(req.into_body(), 8 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            return api_error(StatusCode::BAD_REQUEST, &format!("read request body: {e}"));
+        }
+    };
+    if !body.is_empty() {
+        outbound = outbound.body(body);
+    }
+
+    let resp = match outbound.send().await {
+        Ok(r) => r,
+        Err(e) => {
+            return api_error(
+                StatusCode::BAD_GATEWAY,
+                &format!("easytier-web API unreachable at {upstream}: {e}"),
+            );
+        }
+    };
+
+    let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let mut headers = HeaderMap::new();
+    for (name, value) in resp.headers() {
+        let n = name.as_str();
+        if n.eq_ignore_ascii_case("connection")
+            || n.eq_ignore_ascii_case("transfer-encoding")
+            || n.eq_ignore_ascii_case("content-encoding")
+            || n.eq_ignore_ascii_case("content-length")
+        {
+            continue;
+        }
+        if n.eq_ignore_ascii_case("set-cookie") {
+            // scope the upstream session cookie to the /et prefix
+            if let Ok(v) = value.to_str() {
+                let scoped = scope_cookie_to_et(v);
+                if let Ok(hv) = HeaderValue::from_str(&scoped) {
+                    headers.append(header::SET_COOKIE, hv);
+                }
+            }
+            continue;
+        }
+        headers.append(name.clone(), value.clone());
+    }
+
+    let bytes = match resp.bytes().await {
+        Ok(b) => b,
+        Err(e) => {
+            return api_error(
+                StatusCode::BAD_GATEWAY,
+                &format!("read upstream response: {e}"),
+            );
+        }
+    };
+
+    (status, headers, bytes).into_response()
+}
+
+/// Rewrite a `Set-Cookie` so the upstream session only travels under `/et`.
+fn scope_cookie_to_et(raw: &str) -> String {
+    let mut parts: Vec<String> = raw
+        .split(';')
+        .map(|p| p.trim().to_string())
+        .filter(|p| {
+            let lower = p.to_ascii_lowercase();
+            !lower.starts_with("domain=") && !lower.starts_with("path=")
+        })
+        .collect();
+    parts.push("Path=/et".to_string());
+    parts.join("; ")
 }
 
 // ---------------------------------------------------------------- auth
@@ -104,8 +220,12 @@ async fn auth_mw(
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "unauthorized"}))).into_response();
     }
     // CSRF: mutating requests must carry a custom header (cannot be sent
-    // cross-origin without CORS, which this server never offers).
-    if matches!(*req.method(), axum::http::Method::POST | axum::http::Method::PUT | axum::http::Method::DELETE) {
+    // cross-origin without CORS, which this server never offers). The /et
+    // proxy is exempt: it forwards to the easytier-web API, which enforces
+    // its own session cookie on every call.
+    if !path.starts_with("/et")
+        && matches!(*req.method(), axum::http::Method::POST | axum::http::Method::PUT | axum::http::Method::DELETE)
+    {
         if req.headers().get("x-remgr-csrf").is_none() {
             return (StatusCode::FORBIDDEN, Json(json!({"error": "missing csrf header"}))).into_response();
         }

@@ -11,8 +11,6 @@ path = "src/main.rs"
 
 [features]
 default = []
-# embed the coturn core via C FFI for TURN relay allocations (OpenBSD builds)
-coturn = []
 
 [dependencies]
 remgr-frps = { path = "../remgr-frps" }
@@ -34,6 +32,8 @@ rand.workspace = true
 axum = { version = "0.7", features = ["ws", "macros"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors"] }
+# loopback client for the /et reverse proxy to the embedded easytier-web API
+reqwest = { version = "0.12", default-features = false }
 
 uuid = { version = "1", features = ["v4"] }
 argon2 = { version = "0.5", features = ["std"] }
@@ -50,9 +50,10 @@ url = "2"
 
 # ---- integrated services (in-process libraries, no subprocesses, no IPC) ----
 easytier = { path = "../third_party/easytier/easytier", default-features = false, features = ["full", "management", "management-rpc"] }
-easytier-web = { path = "../third_party/easytier/easytier-web", default-features = false }
+easytier-web = { path = "../third_party/easytier/easytier-web", default-features = false, features = ["embed"] }
+password-auth = "1.0.0"
 # RustDesk hbbs/hbbr as a library (vendored rustdesk-server 1.1.17)
 hbbs = { path = "../third_party/rustdesk-server" }
-# TURN relay (pure Rust, RFC 5766)
-turn = "0.17"
+# TURN relay (pure Rust, RFC 5766); `metrics` exposes per-allocation byte counters
+turn = { version = "0.17", features = ["metrics"] }
 util = { package = "webrtc-util", version = "0.17", default-features = false, features = ["conn", "vnet"] }

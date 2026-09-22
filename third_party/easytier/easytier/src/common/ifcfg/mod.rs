@@ -6,9 +6,10 @@
 #[cfg(any(
     all(target_os = "macos", not(feature = "macos-ne")),
     target_os = "freebsd",
-    target_os = "openbsd"
 ))]
 mod darwin;
+#[cfg(target_os = "openbsd")]
+mod openbsd;
 #[cfg(all(target_os = "linux", feature = "linux-netlink"))]
 mod netlink;
 #[cfg(all(target_os = "linux", feature = "linux-netlink"))]
@@ -25,11 +26,19 @@ use cidr::{Ipv4Inet, Ipv6Inet};
 #[cfg(any(
     all(target_os = "macos", not(feature = "macos-ne")),
     target_os = "freebsd",
-    target_os = "openbsd"
 ))]
 use tokio::process::Command;
 
 use super::error::Error;
+
+/// Prepare platform resources that must exist before the sandbox is applied.
+///
+/// On OpenBSD the routing socket has to be opened while `socket(2)` is still
+/// unrestricted, because pledge(2) denies `socket(AF_ROUTE)` outright.
+pub fn init_platform() {
+    #[cfg(target_os = "openbsd")]
+    openbsd::preopen_route_socket();
+}
 
 #[async_trait]
 pub trait IfConfiguerTrait: Send + Sync {
@@ -103,7 +112,6 @@ pub trait IfConfiguerTrait: Send + Sync {
 #[cfg(any(
     all(target_os = "macos", not(feature = "macos-ne")),
     target_os = "freebsd",
-    target_os = "openbsd"
 ))]
 fn cidr_to_subnet_mask(prefix_length: u8) -> Ipv4Addr {
     if prefix_length > 32 {
@@ -124,7 +132,6 @@ fn cidr_to_subnet_mask(prefix_length: u8) -> Ipv4Addr {
 #[cfg(any(
     all(target_os = "macos", not(feature = "macos-ne")),
     target_os = "freebsd",
-    target_os = "openbsd"
 ))]
 async fn run_shell_cmd(cmd: &str) -> Result<(), Error> {
     let cmd_out: std::process::Output;
@@ -173,9 +180,10 @@ pub type IfConfiger = DummyIfConfiger;
 #[cfg(any(
     all(target_os = "macos", not(feature = "macos-ne")),
     target_os = "freebsd",
-    target_os = "openbsd"
 ))]
 pub type IfConfiger = darwin::MacIfConfiger;
+#[cfg(target_os = "openbsd")]
+pub type IfConfiger = openbsd::OpenBsdIfConfiger;
 
 #[cfg(target_os = "windows")]
 pub type IfConfiger = windows::WindowsIfConfiger;

@@ -8,6 +8,7 @@
 //!   "default network" instance with the listeners from the config
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -21,9 +22,14 @@ pub struct EasyTierModule {
 }
 
 struct RunHandle {
+    /// cancels the web-client registration task
     token: CancellationToken,
     /// strong ref: dropping the manager stops its background drivers
     _manager: Arc<easytier::instance::factory::NativeInstanceManager>,
+    /// keeps the embedded easytier-web config server (udp) and REST api
+    /// alive — dropping this handle aborts them (AbortOnDrop semantics),
+    /// which is what releases udp:22020 / tcp:11211 on restart
+    _web: easytier_web::start::RunningEasyTierWeb,
 }
 
 impl EasyTierModule {
@@ -54,10 +60,13 @@ impl EasyTierModule {
         } else {
             cfg.network_secret.clone()
         };
+        // The EasyTier TOML key is `ipv4`, not `virtual_ipv4`: unknown keys are
+        // dropped silently, so the node fell back to DHCP and — with no peer to
+        // lease from — never created its TUN device at all.
         let ip_part = if cfg.virtual_ipv4.is_empty() {
             "dhcp = true".to_string()
         } else {
-            format!("virtual_ipv4 = \"{}\"\ndhcp = false", cfg.virtual_ipv4)
+            format!("ipv4 = \"{}\"\ndhcp = false", cfg.virtual_ipv4)
         };
         Ok(format!(
             "listeners = [\n{listeners}]\n\
@@ -68,7 +77,7 @@ impl EasyTierModule {
              network_secret = \"{secret}\"\n\
              [flags]\n\
              default_protocol = \"tcp\"\n\
-             enable_latency_first = true\n",
+             latency_first = true\n",
             host = cfg.node_name,
             name = cfg.network_name,
             secret = network_secret,
@@ -118,9 +127,12 @@ impl super::ServiceModule for EasyTierModule {
         std::fs::create_dir_all(&db_dir)
             .with_context(|| format!("create easytier db dir {}", db_dir.display()))?;
 
-        // 1) embedded easytier-web: db + config server + REST api
-        let web = easytier_web::start::start_web(easytier_web::start::WebConfig {
-            // auto-create the dashboard user for the local machine's token
+        // 1) embedded easytier-web: db + config server + REST api.
+        //
+        // A previous incarnation releases its sockets from an aborted task, not
+        // synchronously, so a restart can lose the race and see EADDRINUSE.
+        // Retry briefly rather than failing the whole module.
+        let web_cfg = easytier_web::start::WebConfig {
             db_path: cfg.db_path.clone(),
             config_server_protocol: "udp".into(),
             config_server_port: cfg.config_server_port,
@@ -132,12 +144,81 @@ impl super::ServiceModule for EasyTierModule {
                 disable_registration: false,
                 allow_auto_create_user: true,
             }),
-        })
-        .await
-        .with_context(|| format!("easytier-web start (db={})", cfg.db_path))?;
+        };
+        let mut web = None;
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 0..24u32 {
+            match easytier_web::start::start_web(web_cfg.clone()).await {
+                Ok(w) => {
+                    web = Some(w);
+                    break;
+                }
+                Err(e) => {
+                    last_err = Some(e);
+                    if attempt < 23 {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                    }
+                }
+            }
+        }
+        let web = web.ok_or_else(|| {
+            last_err
+                .map(|e| e.context(format!("easytier-web start (db={})", cfg.db_path)))
+                .unwrap_or_else(|| anyhow::anyhow!("easytier-web start failed"))
+        })?;
 
         let token = CancellationToken::new();
-        let web_token = web.token.clone();
+
+        // bootstrap the dashboard login: ensure an "admin" user exists. On
+        // first boot a random password is generated, logged once and written
+        // to a root-only file (same pattern as the console initial password).
+        {
+            let db = web.db.clone();
+            match db.get_user_id("admin").await {
+                Ok(Some(_)) => {}
+                _ => {
+                    let password: String = {
+                        use rand::Rng;
+                        const ALPH: &[u8] = b"abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789";
+                        let mut rng = rand::thread_rng();
+                        (0..14)
+                            .map(|_| ALPH[rng.gen_range(0..ALPH.len())] as char)
+                            .collect()
+                    };
+                    match tokio::task::spawn_blocking({
+                        let pw = password.clone();
+                        move || password_auth::generate_hash(&pw)
+                    })
+                    .await
+                    {
+                        Ok(hash) => {
+                            match db.create_user_and_join_users_group("admin", hash).await {
+                                Ok(_) => {
+                                    let _ = std::fs::write(
+                                        "/var/run/remgr/easytier_dashboard_password",
+                                        format!("{password}\n"),
+                                    );
+                                    #[cfg(unix)]
+                                    {
+                                        use std::os::unix::fs::PermissionsExt;
+                                        let _ = std::fs::set_permissions(
+                                            "/var/run/remgr/easytier_dashboard_password",
+                                            std::fs::Permissions::from_mode(0o600),
+                                        );
+                                    }
+                                    tracing::warn!(
+                                        "easytier dashboard initial password: {password}  \
+                                         (user admin, also in /var/run/remgr/easytier_dashboard_password)"
+                                    );
+                                }
+                                Err(e) => tracing::warn!("easytier: dashboard user bootstrap failed: {e}"),
+                            }
+                        }
+                        Err(e) => tracing::warn!("easytier: password hash task failed: {e}"),
+                    }
+                }
+            }
+        }
 
         // 2) local node instance manager
         let manager = Arc::new(easytier::instance::factory::native_cli_instance_manager());
@@ -147,6 +228,7 @@ impl super::ServiceModule for EasyTierModule {
         //    easytier-web dashboard can manage it (in-process)
         let wc_token = token.clone();
         let wc_mgr = manager.clone();
+        let config_server_port = web.config_server_port;
         let node_name = if cfg.node_name.is_empty() { "remgr-node".to_string() } else { cfg.node_name.clone() };
         // stable machine id: persisted once, reused across restarts (the
         // platform state-dir lookup is unsupported on openbsd)
@@ -161,7 +243,7 @@ impl super::ServiceModule for EasyTierModule {
         };
         tokio::spawn(async move {
             match easytier::web_client::run_web_client(
-                &format!("udp://127.0.0.1:{}/{}", web.config_server_port, machine_id),
+                &format!("udp://127.0.0.1:{config_server_port}/{machine_id}"),
                 easytier::common::MachineIdOptions {
                     explicit_machine_id: Some(machine_id),
                     state_dir: None,
@@ -184,7 +266,7 @@ impl super::ServiceModule for EasyTierModule {
         });
 
         // 4) default network instance (the "center" node identity)
-        if !cfg.network_name.is_empty() {
+        if cfg.node_enabled && !cfg.network_name.is_empty() {
             let toml = Self::build_instance_toml(&cfg)?;
             let loader = easytier::common::config::TomlConfigLoader::new_from_str(&toml)?;
             match manager.run_network_instance(loader, easytier::common::config::ConfigFileControl::STATIC_CONFIG) {
@@ -196,15 +278,24 @@ impl super::ServiceModule for EasyTierModule {
             }
         }
 
-        *run = Some(RunHandle { token, _manager: manager });
+        // NOTE: `web` must live in the handle — dropping it aborts the
+        // config-server and REST api tasks (AbortOnDropHandle semantics), which
+        // is what frees udp:22020 / tcp:11211 for the next start.
+        *run = Some(RunHandle { token, _manager: manager, _web: web });
         let _ = instance_ids;
         Ok(())
     }
 
     async fn stop(&self) -> anyhow::Result<()> {
-        if let Some(handle) = self.run.lock().await.take() {
+        // Take the handle out under the lock, then release it before waiting:
+        // dropping `web` aborts the easytier-web tasks, and the abort is
+        // asynchronous, so the sockets need a moment to actually close before
+        // a caller rebinds the same ports.
+        let handle = self.run.lock().await.take();
+        if let Some(handle) = handle {
             handle.token.cancel();
-            // _manager drop + web token cancel tear the stack down
+            drop(handle);
+            tokio::time::sleep(Duration::from_millis(300)).await;
         }
         Ok(())
     }

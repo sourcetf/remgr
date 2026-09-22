@@ -102,9 +102,9 @@ pub struct StunTurnConfig {
     pub bind_addr: String,
     /// STUN + TURN listening port (UDP/TCP)
     pub stun_port: u16,
-    /// TURN relay allocations (embedded coturn core; OpenBSD builds)
+    /// TURN relay allocations (RFC 5766, in-process)
     pub turn_enabled: bool,
-    /// TURN over TLS port (requires cert/key)
+    /// TURN over TLS port (requires cert/key; 0 disables)
     pub tls_port: u16,
     pub domain: String,
     pub relay_min_port: u16,

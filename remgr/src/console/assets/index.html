@@ -224,7 +224,7 @@ function renderDashboard(){
     ['网络名', sv.easytier?.network_name||'—'],
   ]);
   html += svcCard('stun_turn', sv.stun_turn?.running, sv.stun_turn?.enabled, [
-    ['STUN/TURN 端口', sv.stun_turn?.stun_port],['TLS 端口', sv.stun_turn?.tls_port],
+    ['STUN/TURN 端口', sv.stun_turn?.stun_port],['TLS 端口', sv.stun_turn?.tls_port+(sv.stun_turn?.tls_active?' (已启用)':'')],
     ['域名', sv.stun_turn?.domain||'—'],['中继端口范围', sv.stun_turn?.relay_ports],
   ]);
   html += svcCard('rustdesk', sv.rustdesk?.running, sv.rustdesk?.enabled, [
@@ -246,19 +246,24 @@ function renderServiceTabs(){
       ['配置服务器端口 (UDP)', s.easytier?.config_server_port],['REST API', s.easytier?.api_addr+':'+s.easytier?.api_port],
       ['本地节点', s.easytier?.node_enabled?'启用':'关闭'],['数据库', s.easytier?.db_path],
       ['监听器', (s.easytier?.listeners||[]).length+' 个'],['网络名', s.easytier?.network_name||'—'],
-    ]);
+    ], `<a class="btn sm" href="/et/" target="_blank" rel="noopener">🖧 EasyTier 控制台</a>`);
   document.getElementById('tab-stun_turn').innerHTML =
     svcCard('stun_turn', s.stun_turn?.running, s.stun_turn?.enabled, [
-      ['STUN/TURN 端口', s.stun_turn?.stun_port],['TLS 端口', s.stun_turn?.tls_port],
+      ['STUN/TURN 端口', s.stun_turn?.stun_port],
+      ['TLS 端口', s.stun_turn?.tls_port+(s.stun_turn?.tls_active?' (监听中)':' (未启用)')],
       ['域名', s.stun_turn?.domain||'—'],['外部 IP', s.stun_turn?.external_ip||'自动'],
       ['中继端口范围', s.stun_turn?.relay_ports],['用户数', s.stun_turn?.users_count],
+      ['活跃分配', s.stun_turn?.turn_runtime?.allocations??0],
+      ['中继流量', fmtBytes(s.stun_turn?.turn_runtime?.bytes_relayed||0)],
     ]);
   document.getElementById('tab-rustdesk').innerHTML =
     svcCard('rustdesk', s.rustdesk?.running, s.rustdesk?.enabled, [
       ['中继端口 (hbbr)', s.rustdesk?.relay_port],['ID 端口 (hbbs)', s.rustdesk?.hbbs_port],
       ['NAT 测试端口', s.rustdesk?.nat_test_port],['WebSocket 端口', s.rustdesk?.websocket_port],
       ['Key', s.rustdesk?.key_set?'已设置':'未设置'],['', ''],
-    ]);
+    ]) + `<div class="card"><h3>🔑 服务器公钥</h3>
+      <p style="color:var(--tx2);font-size:12px;margin-bottom:8px">客户端「ID/中继服务器」配置中的 Key 填此值</p>
+      <input readonly value="${s.rustdesk?.public_key||'—'}" onclick="this.select()" style="font-family:monospace;font-size:12px"></div>`;
   let proxyRows='';
   if(fp.proxies && fp.proxies.length){
     proxyRows = `<table><tr><th>代理名</th><th>类型</th><th>远程端口</th><th>用户</th></tr>`+
@@ -300,9 +305,9 @@ const SCHEMAS = {
     ['开关', [['enabled','启用模块','',['checkbox']]],
     ['easytier-web', [
       ['enabled','(同上)','','hidden'],
-      ['config_server_port','配置服务器端口 (UDP)','实例注册端口'],
+      ['config_server_port','配置服务器端口 (UDP)','实例注册端口',['number']],
       ['api_addr','REST API 绑定地址',''],
-      ['api_port','REST API 端口','控制台会代理到 /et'],
+      ['api_port','REST API 端口','控制台会代理到 /et',['number']],
       ['db_path','数据库路径','']],
     ['本地中心节点', [
       ['node_enabled','启用本地节点','',['checkbox']],
@@ -314,25 +319,29 @@ const SCHEMAS = {
   ],
   stun_turn: [
     [['enabled','启用模块','',['checkbox']]],
-    [['bind_addr','绑定地址',''],['stun_port','STUN/TURN 端口','']],
-    [['turn_enabled','启用 TURN 中继 (coturn 内核)','',['checkbox']]],
+    [['bind_addr','绑定地址',''],['stun_port','STUN/TURN 端口','',['number']]],
+    [['turn_enabled','启用 TURN 中继 (RFC 5766)','',['checkbox']]],
     [['domain','域名',''],['external_ip','外部 IP (留空自动)','']],
-    [['tls_port','TURN over TLS 端口',''],['realm','Realm','']],
-    [['relay_min_port','中继最小端口',''],['relay_max_port','中继最大端口','']],
+    [['tls_port','TURN over TLS 端口 (0=关闭)','',['number']]],
+    [['realm','Realm','']],
+    [['relay_min_port','中继最小端口','',['number']]],
+    [['relay_max_port','中继最大端口','',['number']]],
     [['users','用户凭证 (每行 user:pass)','TURN 长期凭证','textarea']],
     [['cert_path','TLS 证书路径',''],['key_path','TLS 私钥路径','']],
   ],
   rustdesk: [
     [['enabled','启用模块','',['checkbox']]],
-    [['relay_port','中继端口 (hbbr)','默认 21117'],['hbbs_port','ID 端口 (hbbs)','默认 21116']],
+    [['relay_port','中继端口 (hbbr)','默认 21117',['number']]],
+    [['hbbs_port','ID 端口 (hbbs)','默认 21116',['number']]],
     [['key','服务器 Key','留空自动生成；客户端 ID/中继服务器需填同域 Key','textarea']],
   ],
   frps: [
     [['enabled','启用模块','',['checkbox']]],
-    [['bind_addr','绑定地址',''],['server_port','服务端口 (frpc 连接)','']],
+    [['bind_addr','绑定地址',''],['server_port','服务端口 (frpc 连接)','',['number']]],
     [['token','认证 Token','frpc 的 auth.token 必须一致']],
     [['tcp_mux','启用 yamux 多路复用 (frpc 默认开启)','',['checkbox']]],
-    [['max_pool_count','最大连接池',''],['heartbeat_timeout','心跳超时 (秒)','']],
+    [['max_pool_count','最大连接池','',['number']]],
+    [['heartbeat_timeout','心跳超时 (秒)','',['number']]],
     [['allow_ports','允许的远程端口范围','如 6000-6100,7000；留空不限']],
     [['tls_cert_path','TLS 证书路径','留空=自动生成自签证书'],['tls_key_path','TLS 私钥路径','']],
   ],
@@ -361,7 +370,8 @@ function openConfig(svc){
       return `<div class="fg"><label class="switch" style="margin:0"><input type="checkbox" data-path="${f.path}" ${v?'checked':''}> ${f.label}</label></div>`;
     if(f.widget==='textarea')
       return `<div class="fg"><label>${f.label}</label><textarea data-path="${f.path}" rows="4" style="width:100%;padding:9px;border:1px solid var(--border);border-radius:7px;background:var(--bg);color:var(--tx);font-size:12px;font-family:monospace">${v!==undefined&&v!==null?(Array.isArray(v)?v.join('\n'):v):''}</textarea>${f.hint?`<div class="hint">${f.hint}</div>`:''}</div>`;
-    return `<div class="fg"><label>${f.label}</label><input data-path="${f.path}" value="${v!==undefined&&v!==null?String(v).replace(/"/g,'&quot;'):''}">${f.hint?`<div class="hint">${f.hint}</div>`:''}</div>`;
+    const type = f.widget==='number' ? 'number' : 'text';
+    return `<div class="fg"><label>${f.label}</label><input type="${type}" data-path="${f.path}" value="${v!==undefined&&v!==null?String(v).replace(/"/g,'&quot;'):''}">${f.hint?`<div class="hint">${f.hint}</div>`:''}</div>`;
   }).join('');
   document.getElementById('modal-body').innerHTML=fields;
   document.getElementById('modal').classList.remove('hidden');
@@ -378,7 +388,12 @@ async function saveModal(){
       // listeners / users are string arrays
       if(['listeners','users'].includes(el.dataset.path)) v=el.value.split('\n').map(x=>x.trim()).filter(Boolean);
     }
-    else v=el.type==='number'?Number(el.value):el.value;
+    else if(el.type==='number'){
+      // empty numeric inputs keep the existing value rather than becoming 0
+      if(el.value.trim()==='') return;
+      v=Number(el.value);
+    }
+    else v=el.value;
     setPath(cfg, el.dataset.path, v);
   });
   try{

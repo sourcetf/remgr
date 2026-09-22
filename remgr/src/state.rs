@@ -21,12 +21,18 @@ pub struct AppState {
     pub stun_turn: StunTurnModule,
     pub rustdesk: RustDeskModule,
     pub frps: FrpsModule,
+    /// loopback client for the `/et` reverse proxy to the easytier-web API
+    pub et_http: reqwest::Client,
 }
 
 impl AppState {
     pub fn new(config: Config) -> Arc<Self> {
         let config_path = config.config_path.clone();
         let logs = LogHub::new();
+        let et_http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
         Arc::new_cyclic(|weak: &Weak<AppState>| Self {
             config: RwLock::new(config),
             config_path,
@@ -37,6 +43,7 @@ impl AppState {
             stun_turn: StunTurnModule::new(weak),
             rustdesk: RustDeskModule::new(weak),
             frps: FrpsModule::new(weak),
+            et_http,
         })
     }
 

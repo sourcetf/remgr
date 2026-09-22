@@ -12,9 +12,7 @@
 //
 //  0. You just DO WHAT THE FUCK YOU WANT TO.
 
-use libc::{
-    self, c_char, c_short, ifreq, AF_INET, IFF_RUNNING, IFF_UP, IFNAMSIZ, O_RDWR, SOCK_DGRAM,
-};
+use libc::{self, c_char, c_short, ifreq, AF_INET, IFNAMSIZ, O_RDWR, SOCK_DGRAM};
 use std::{
     // ffi::{CStr, CString},
     io::{self, Read, Write},
@@ -173,14 +171,13 @@ impl Device {
                 return Err(io::Error::from(err).into());
             }
 
-            let route = Route {
+            // SIOCAIFADDR already installs the interface route for the
+            // assigned subnet, so no separate route(8) call is needed.
+            self.route = Some(Route {
                 addr,
                 netmask: mask,
-                dest: dest,
-            };
-            if let Err(e) = self.set_route(route) {
-                log::warn!("{e:?}");
-            }
+                dest,
+            });
 
             Ok(())
         }
@@ -209,37 +206,10 @@ impl Device {
     }
 
     fn set_route(&mut self, route: Route) -> Result<()> {
-        // if let Some(v) = &self.route {
-        //     let prefix_len = ipnet::ip_mask_to_prefix(IpAddr::V4(v.netmask))
-        //         .map_err(|_| Error::InvalidConfig)?;
-        //     let network = ipnet::Ipv4Net::new(v.addr, prefix_len)
-        //         .map_err(|e| Error::InvalidConfig)?
-        //         .network();
-        //     // command: route -n delete -net 10.0.0.0/24 10.0.0.1
-        //     let args = [
-        //         "-n",
-        //         "delete",
-        //         "-net",
-        //         &format!("{}/{}", network, prefix_len),
-        //         &v.dest.to_string(),
-        //     ];
-        // 	println!("{args:?}");
-        //     run_command("route", &args);
-        //     log::info!("route {}", args.join(" "));
-        // }
-
-        // command: route -n add -net 10.0.0.9/24 10.0.0.1
-        let prefix_len = ipnet::ip_mask_to_prefix(IpAddr::V4(route.netmask))
-            .map_err(|_| Error::InvalidConfig)?;
-        let args = [
-            "-n",
-            "add",
-            "-net",
-            &format!("{}/{}", route.addr, prefix_len),
-            &route.dest.to_string(),
-        ];
-        run_command("route", &args)?;
-        log::info!("route {}", args.join(" "));
+        // Route installation is handled by SIOCAIFADDR in `set_alias`; this
+        // only records the state so `set_address`/`set_netmask` can rebuild
+        // the alias. Running route(8) is not an option here: the daemon this
+        // is linked into runs without the `exec` promise.
         self.route = Some(route);
         Ok(())
     }
@@ -290,24 +260,15 @@ impl AbstractDevice for Device {
 
 
     fn enabled(&mut self, value: bool) -> Result<()> {
-        unsafe {
-            let mut req = self.request();
-
-            if let Err(err) = siocgifflags(self.ctl.as_raw_fd(), &mut req) {
-                return Err(io::Error::from(err).into());
-            }
-
-            if value {
-                req.ifr_ifru.ifru_flags |= (IFF_UP | IFF_RUNNING) as c_short;
-            } else {
-                req.ifr_ifru.ifru_flags &= !(IFF_UP as c_short);
-            }
-
-            if let Err(err) = siocsifflags(self.ctl.as_raw_fd(), &req) {
-                return Err(io::Error::from(err).into());
-            }
-
+        // tun(4) sets IFF_UP | IFF_RUNNING itself in tunopen() and clears
+        // them in tunclose(), so there is nothing to do when enabling.
+        // SIOCSIFFLAGS is not granted by any pledge(2) promise, so the
+        // "down" case cannot be expressed as an ioctl either; closing the
+        // descriptor is what brings the interface down.
+        if value {
             Ok(())
+        } else {
+            Err(Error::InvalidConfig)
         }
     }
 
@@ -455,20 +416,4 @@ impl From<Layer> for c_short {
             Layer::L3 => 3,
         }
     }
-}
-
-/// Runs a command and returns an error if the command fails, just convenience for users.
-#[doc(hidden)]
-pub fn run_command(command: &str, args: &[&str]) -> std::io::Result<Vec<u8>> {
-    let out = std::process::Command::new(command).args(args).output()?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(if out.stderr.is_empty() {
-            &out.stdout
-        } else {
-            &out.stderr
-        });
-        let info = format!("{} failed with: \"{}\"", command, err);
-        return Err(std::io::Error::new(std::io::ErrorKind::Other, info));
-    }
-    Ok(out.stdout)
 }

@@ -111,9 +111,13 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
         }
     }
 
+    // Platform resources that need unrestricted syscalls must be acquired
+    // before the sandbox locks down. On OpenBSD this opens the routing
+    // socket, which pledge(2) would otherwise refuse to create.
+    easytier::common::ifcfg::init_platform();
+
     // pledge/unveil: everything above needed the filesystem we are about to lock.
     secure::apply()?;
-
     let state = AppState::new(cfg);
     if let Some(pw) = &initial_password {
         tracing::warn!("initial console password: {pw}  (also written to /var/run/remgr/initial_password)");

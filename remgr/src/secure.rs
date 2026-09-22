@@ -3,10 +3,15 @@
 //! All paths are unveiled up front, the visibility set is locked, then the
 //! process pledges a fixed promise set. No `exec` promise: the binary can
 //! never spawn subprocesses, by construction.
+//!
+//! `route` / `wroute` cover the interface and route ioctls the EasyTier node
+//! needs (`SIOCGIFADDR`, `SIOCAIFADDR`, `SIOCDIFADDR`, `SIOCSIFMTU`). Route
+//! table updates go through a routing socket that `main` opens before this
+//! runs, since pledge(2) refuses to create `AF_ROUTE` sockets.
 
 use anyhow::{Context, Result};
 
-pub const PROMISES: &str = "stdio rpath wpath cpath fattr flock inet unix dns getpw";
+pub const PROMISES: &str = "stdio rpath wpath cpath fattr flock inet unix dns getpw route wroute";
 
 /// (path, permissions) pairs unveiled before pledging.
 #[cfg(target_os = "openbsd")]
@@ -36,15 +41,19 @@ fn unveil_paths() -> Vec<(String, &'static str)> {
 pub fn apply() -> Result<()> {
     use std::ffi::CString;
 
+    // unveil(2) narrows the namespace from the moment it is called, not when
+    // the set is locked. Probing for a path first (exists()) therefore fails
+    // for everything after the first entry, so the calls must be
+    // unconditional; a missing path simply reports ENOENT and is skipped.
     for (path, perms) in unveil_paths() {
-        if !std::path::Path::new(&path).exists() {
-            continue;
-        }
         let c = CString::new(path.as_str())?;
         let p = CString::new(perms)?;
         let rc = unsafe { libc::unveil(c.as_ptr(), p.as_ptr()) };
         if rc != 0 {
-            tracing::warn!("unveil({path}, {perms}) failed: {}", std::io::Error::last_os_error());
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::ENOENT) {
+                tracing::warn!("unveil({path}, {perms}) failed: {e}");
+            }
         }
     }
     // lock the visibility set
