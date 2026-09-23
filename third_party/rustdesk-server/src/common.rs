@@ -210,9 +210,12 @@ pub fn gen_sk(wait: u64) -> (String, Option<sign::SecretKey>) {
                 log::info!("Private key comes from {}", sk_file);
                 return (pk, Some(sign::SecretKey(tmp)));
             } else {
-                // don't use log here, since it is async
-                println!("Fatal error: malformed private key in {sk_file}.");
-                std::process::exit(1);
+                // A corrupt key file must not end the host process: send back an
+                // empty key so the caller reports the failure (ReMgr's rustdesk
+                // module refuses to start with an empty key) instead of the whole
+                // relay manager dying.
+                log::error!("malformed private key in {sk_file}: expected a {}-byte base64 secret key", sign::SECRETKEYBYTES);
+                return (String::new(), None);
             }
         }
     } else {

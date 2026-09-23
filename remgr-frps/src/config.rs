@@ -18,9 +18,11 @@ pub struct FrpsConfig {
     #[serde(default = "d_true")]
     pub tcp_mux: bool,
     /// TLS cert/key (PEM) enabling frpc `transport.tls` connections.
-    #[serde(default)]
+    /// Empty or unreadable paths fall back to an ephemeral self-signed pair,
+    /// exactly like frp itself does when no certificate is configured.
+    #[serde(default = "d_tls_cert")]
     pub tls_cert_path: Option<String>,
-    #[serde(default)]
+    #[serde(default = "d_tls_key")]
     pub tls_key_path: Option<String>,
     /// Cap on work connections pre-issued per control (client `poolCount`).
     #[serde(default = "d_max_pool")]
@@ -31,6 +33,12 @@ pub struct FrpsConfig {
     /// Optional allowed remote port range for tcp/udp proxies, e.g. "6000-6100,7000".
     #[serde(default)]
     pub allow_ports: Option<String>,
+    /// PBKDF2 salt for the post-login control-channel cipher. frp has used
+    /// "frp" since v0.44.0 (it overrides golib's own "crypto" in
+    /// `client/service.go` and `cmd/frps/main.go`); only older clients need the
+    /// golib default, so this exists purely as an escape hatch for them.
+    #[serde(default = "d_crypto_salt")]
+    pub crypto_salt: String,
 }
 
 fn d_enabled() -> bool { true }
@@ -40,6 +48,12 @@ fn d_token() -> String { String::new() }
 fn d_true() -> bool { true }
 fn d_max_pool() -> u32 { 50 }
 fn d_heartbeat() -> u64 { 90 }
+/// Default certificate/key locations, so a certificate generated (or uploaded)
+/// for the `frps` service in the console is picked up without further editing.
+/// The module tolerates their absence by falling back to an ephemeral pair.
+fn d_tls_cert() -> Option<String> { Some("/etc/remgr/ssl/frps_cert.pem".into()) }
+fn d_tls_key() -> Option<String> { Some("/etc/remgr/ssl/frps_key.pem".into()) }
+fn d_crypto_salt() -> String { crate::crypto::DEFAULT_SALT.to_string() }
 
 impl Default for FrpsConfig {
     fn default() -> Self {
@@ -49,11 +63,12 @@ impl Default for FrpsConfig {
             server_port: d_server_port(),
             token: String::new(),
             tcp_mux: true,
-            tls_cert_path: None,
-            tls_key_path: None,
+            tls_cert_path: d_tls_cert(),
+            tls_key_path: d_tls_key(),
             max_pool_count: 50,
             heartbeat_timeout: 90,
             allow_ports: None,
+            crypto_salt: d_crypto_salt(),
         }
     }
 }

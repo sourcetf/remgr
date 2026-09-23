@@ -19,7 +19,9 @@ use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use turn::auth::{generate_auth_key, AuthHandler};
+use turn::relay::relay_range::RelayAddressGeneratorRanges;
 use turn::relay::relay_static::RelayAddressGeneratorStatic;
+use turn::relay::RelayAddressGenerator;
 use turn::server::config::{ConnConfig, ServerConfig};
 use turn::server::Server;
 use util::Conn;
@@ -30,7 +32,10 @@ use crate::state::AppState;
 const MAGIC_COOKIE: u32 = 0x2112_A442;
 const BINDING_REQUEST: u16 = 0x0001;
 const BINDING_SUCCESS: u16 = 0x0101;
+const ATTR_CHANGE_REQUEST: u16 = 0x0003;
 const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
+/// RFC 5780 RESPONSE-PORT; an alternative source port we cannot serve.
+const ATTR_RESPONSE_PORT: u16 = 0x0027;
 const ATTR_SOFTWARE: u16 = 0x8022;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -123,13 +128,13 @@ impl super::ServiceModule for StunTurnModule {
         let cfg = self.cfg();
         let mut run = self.run.lock().await;
         let running = run.is_some();
-        let (allocations, bytes_relayed, tls_active) = match run.as_mut() {
+        let (allocations, bytes_relayed, tls_active, turn_available) = match run.as_mut() {
             Some(handle) => {
                 let tls_active = handle.turn.as_ref().map(|t| t.tls_listening).unwrap_or(false);
                 let info = self.turn_runtime(handle).await;
-                (info.allocations, info.bytes_relayed, tls_active)
+                (info.allocations, info.bytes_relayed, tls_active, handle.turn.is_some())
             }
-            None => (0, 0, false),
+            None => (0, 0, false, false),
         };
         serde_json::json!({
             "enabled": cfg.enabled,
@@ -137,7 +142,9 @@ impl super::ServiceModule for StunTurnModule {
             "bind_addr": cfg.bind_addr,
             "stun_port": cfg.stun_port,
             "turn_enabled": cfg.turn_enabled,
-            "turn_available": true,
+            // true only while a TURN relay is actually serving: with
+            // turn_enabled set but the module stopped there are no allocations.
+            "turn_available": turn_available,
             "turn_runtime": TurnRuntimeInfo { allocations, bytes_relayed },
             "tls_port": cfg.tls_port,
             "tls_active": tls_active,
@@ -237,15 +244,50 @@ fn xor_mapped_address(src: SocketAddr) -> Vec<u8> {
     val
 }
 
+/// RFC 5780 CHANGE-REQUEST / RESPONSE-PORT ask the server to answer from a
+/// different address or port. A single-socket responder cannot honour that, and
+/// answering anyway would report a mapped address the client would then treat as
+/// authoritative, so such requests are dropped instead.
+fn asks_for_alternate_address(packet: &[u8]) -> bool {
+    let mut pos = 20usize;
+    while pos + 4 <= packet.len() {
+        let atype = u16::from_be_bytes([packet[pos], packet[pos + 1]]);
+        let alen = u16::from_be_bytes([packet[pos + 2], packet[pos + 3]]) as usize;
+        let end = (pos + 4 + alen).min(packet.len());
+        let body = &packet[pos + 4..end];
+        if matches!(atype, ATTR_CHANGE_REQUEST | ATTR_RESPONSE_PORT)
+            && body.iter().any(|b| *b != 0)
+        {
+            return true;
+        }
+        pos = end + ((4 - alen % 4) % 4);
+    }
+    false
+}
+
 fn process_stun_packet(packet: &[u8], src: SocketAddr, socket: &UdpSocket) -> anyhow::Result<()> {
     if packet.len() < 20 {
         return Ok(());
     }
     let msg_type = u16::from_be_bytes([packet[0], packet[1]]);
+    // A reply is only a reply to *this* request (RFC 5389 §7.3): without the
+    // magic cookie the datagram is not a STUN message, and without a complete
+    // body it is malformed — answering either invites a reflector/amplifier.
+    if u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]) != MAGIC_COOKIE {
+        return Ok(());
+    }
+    let body_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+    if body_len + 20 > packet.len() {
+        return Ok(());
+    }
     let tid = &packet[8..20];
 
     if msg_type != BINDING_REQUEST {
         return Ok(()); // ignore indicators / other classes silently
+    }
+    if asks_for_alternate_address(packet) {
+        tracing::debug!("STUN: ignoring request for an alternate address/port (unsupported)");
+        return Ok(());
     }
 
     let xor_val = xor_mapped_address(src);
@@ -312,6 +354,44 @@ struct TurnHandles {
     tls_listening: bool,
 }
 
+/// Relay socket generator for TURN allocations.
+///
+/// Allocations must land inside the configured `relay_min_port`..`relay_max_port`
+/// range: an operator opens exactly that range on the firewall, so a relay on
+/// any other port would be silently unreachable for the client. An unset or
+/// invalid range keeps the old behaviour of ephemeral ports, with a warning.
+fn relay_generator(
+    relay_ip: IpAddr,
+    bind_addr: String,
+    min_port: u16,
+    max_port: u16,
+) -> Box<dyn RelayAddressGenerator + Send + Sync> {
+    let net = Arc::new(util::vnet::net::Net::new(None));
+    if min_port != 0 && max_port >= min_port {
+        tracing::debug!("TURN relay ports restricted to {min_port}-{max_port}");
+        Box::new(RelayAddressGeneratorRanges {
+            relay_address: relay_ip,
+            min_port,
+            max_port,
+            max_retries: 0,
+            address: bind_addr,
+            net,
+        })
+    } else {
+        if min_port != 0 || max_port != 0 {
+            tracing::warn!(
+                "TURN: invalid relay port range {min_port}-{max_port} (need 0 < min <= max); \
+                 allocations will use ephemeral ports"
+            );
+        }
+        Box::new(RelayAddressGeneratorStatic {
+            relay_address: relay_ip,
+            address: bind_addr,
+            net,
+        })
+    }
+}
+
 /// TURN relay allocations via the pure-Rust webrtc-rs `turn` server
 /// (RFC 5766: allocations, permissions, channel binds, long-term credentials).
 /// Serves UDP on `stun_port` and, when a certificate is configured, TLS on
@@ -329,10 +409,30 @@ async fn spawn_turn_relay(
     }
     let auth: Arc<dyn AuthHandler + Send + Sync> = Arc::new(Handler { creds });
 
-    let relay_ip: IpAddr = if cfg.external_ip.is_empty() {
-        local_ip().await.unwrap_or(IpAddr::from([127, 0, 0, 1]))
-    } else {
+    let relay_ip: IpAddr = if !cfg.external_ip.is_empty() {
         cfg.external_ip.parse()?
+    } else {
+        match local_ip().await {
+            Some(ip) => ip,
+            None => match cfg.bind_addr.parse::<IpAddr>() {
+                // No default route to probe: a concrete bind address is the
+                // best guess at how clients reach this host.
+                Ok(ip) if !ip.is_unspecified() => {
+                    tracing::warn!(
+                        "TURN: could not probe a route to the internet; advertising relay address {ip} (the bind address)"
+                    );
+                    ip
+                }
+                _ => {
+                    tracing::warn!(
+                        "TURN: no external_ip configured, no route to probe and bind_addr is a \
+                         wildcard — relay candidates will be 127.0.0.1 and clients behind NAT \
+                         will not receive media. Set 「外部 IP」 in the console."
+                    );
+                    IpAddr::from([127, 0, 0, 1])
+                }
+            },
+        }
     };
 
     // ---- UDP listener (TURN allocations + STUN Binding on one socket)
@@ -341,11 +441,12 @@ async fn spawn_turn_relay(
         Server::new(ServerConfig {
             conn_configs: vec![ConnConfig {
                 conn: Arc::new(UdpSocket::bind(bind_addr).await?),
-                relay_addr_generator: Box::new(RelayAddressGeneratorStatic {
-                    relay_address: relay_ip,
-                    address: cfg.bind_addr.clone(),
-                    net: Arc::new(util::vnet::net::Net::new(None)),
-                }),
+                relay_addr_generator: relay_generator(
+                    relay_ip,
+                    cfg.bind_addr.clone(),
+                    cfg.relay_min_port,
+                    cfg.relay_max_port,
+                ),
             }],
             realm: cfg.realm.clone(),
             auth_handler: auth.clone(),
@@ -377,13 +478,25 @@ async fn spawn_turn_relay(
         {
             Ok(acceptor) => {
                 let tls_addr: SocketAddr = format!("{}:{}", cfg.bind_addr, cfg.tls_port).parse()?;
-                let listener = TcpListener::bind(tls_addr).await?;
+                let listener = match TcpListener::bind(tls_addr).await {
+                    Ok(l) => l,
+                    Err(e) => {
+                        // The caller retries the whole bind sequence; leaving the
+                        // UDP server alive would keep its port bound and make every
+                        // retry fail, so release it before reporting the error.
+                        let _ = udp_server.close().await;
+                        return Err(anyhow::anyhow!(
+                            "TURN over TLS bind {tls_addr} failed: {e}"
+                        ));
+                    }
+                };
                 tls_listening = true;
                 tracing::info!("TURN over TLS active on tls://{tls_addr} (external {relay_ip})");
 
                 let map = tls.clone();
                 let realm = cfg.realm.clone();
                 let bind = cfg.bind_addr.clone();
+                let relay_range = (cfg.relay_min_port, cfg.relay_max_port);
                 joins.push(tokio::spawn(async move {
                     let mut next_id: u64 = 0;
                     loop {
@@ -406,7 +519,8 @@ async fn spawn_turn_relay(
                         let map = map.clone();
                         let conn_token = token.clone();
                         tokio::spawn(serve_tls_turn_conn(
-                            acceptor, stream, peer, auth, realm, bind, relay_ip, map, id, conn_token,
+                            acceptor, stream, peer, auth, realm, bind, relay_range, relay_ip, map,
+                            id, conn_token,
                         ));
                     }
                     for (_, s) in map.lock().await.drain() {
@@ -431,6 +545,7 @@ async fn serve_tls_turn_conn(
     auth: Arc<dyn AuthHandler + Send + Sync>,
     realm: String,
     bind_addr: String,
+    relay_range: (u16, u16),
     relay_ip: IpAddr,
     map: Arc<Mutex<HashMap<u64, Arc<Server>>>>,
     id: u64,
@@ -452,11 +567,12 @@ async fn serve_tls_turn_conn(
     let server = match Server::new(ServerConfig {
         conn_configs: vec![ConnConfig {
             conn: turn_conn,
-            relay_addr_generator: Box::new(RelayAddressGeneratorStatic {
-                relay_address: relay_ip,
-                address: bind_addr,
-                net: Arc::new(util::vnet::net::Net::new(None)),
-            }),
+            relay_addr_generator: relay_generator(
+                relay_ip,
+                bind_addr,
+                relay_range.0,
+                relay_range.1,
+            ),
         }],
         realm,
         auth_handler: auth,
@@ -677,8 +793,20 @@ impl Conn for TlsTurnConn {
 }
 
 /// local ip helper (avoid extra crate): best-effort via a UDP connect
-async fn local_ip() -> anyhow::Result<IpAddr> {
-    let s = UdpSocket::bind("0.0.0.0:0").await?;
-    s.connect("8.8.8.8:80").await?;
-    Ok(s.local_addr()?.ip())
+async fn local_ip() -> Option<IpAddr> {
+    // A UDP "connect" sends nothing — it only asks the kernel which source
+    // address the route would use. Several targets, because a single unreachable
+    // one (blocked, or no route to that net) says nothing about the others.
+    for target in ["8.8.8.8:80", "1.1.1.1:80", "9.9.9.9:53"] {
+        if let Ok(s) = UdpSocket::bind("0.0.0.0:0").await {
+            if s.connect(target).await.is_ok() {
+                if let Ok(addr) = s.local_addr() {
+                    if !addr.ip().is_unspecified() && !addr.ip().is_loopback() {
+                        return Some(addr.ip());
+                    }
+                }
+            }
+        }
+    }
+    None
 }

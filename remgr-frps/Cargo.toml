@@ -6,6 +6,7 @@ version.workspace = true
 license.workspace = true
 
 [dependencies]
+socket2 = "0.5"
 tokio = { workspace = true, features = ["rt-multi-thread", "net", "io-util", "sync", "time", "macros"] }
 serde.workspace = true
 serde_json.workspace = true
@@ -28,3 +29,7 @@ rcgen = "0.13"
 aes = "0.8"
 pbkdf2 = { version = "0.12", features = ["hmac"] }
 sha1 = "0.10"
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter", "tracing-log"] }
+

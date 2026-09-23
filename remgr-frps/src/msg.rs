@@ -177,13 +177,19 @@ pub struct Pong {
 }
 
 /// `net.UDPAddr` JSON shape used by Go: `{"IP":"1.2.3.4","Port":53,"Zone":""}`.
+///
+/// serde matches field names case-sensitively (Go's decoder does not), so the
+/// capitalised spelling has to be reproduced exactly: with lower-case keys every
+/// datagram from the client lost its `r` field, and the server dropped it for
+/// having no destination. Note `rename_all = "PascalCase"` is *not* enough here —
+/// it spells the `ip` field "Ip", which still does not match Go's "IP".
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct UdpAddrJson {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "IP", alias = "ip", skip_serializing_if = "Option::is_none")]
     pub ip: Option<String>,
-    #[serde(skip_serializing_if = "is_zero_u16")]
+    #[serde(rename = "Port", alias = "port", skip_serializing_if = "is_zero_u16")]
     pub port: u16,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(rename = "Zone", alias = "zone", skip_serializing_if = "String::is_empty")]
     pub zone: String,
 }
 

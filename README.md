@@ -77,9 +77,29 @@ rcctl start remgr
 
 ## frp 客户端兼容性说明
 
-- 与 fatedier/frp 客户端（V1 线协议 + yamux/tcp_mux + TLS 首字节）兼容。
-- frpc 建议：`transport.wireProtocol` 保持默认 `v1`；`transport.tls.enable` 默认值即可（服务端自动生成自签证书）。
-- 支持 `tcp` / `udp` 代理；`http/https/stcp/xtcp/tcpmux` 类型会返回协议错误（后续版本补充）。
+- 与 fatedier/frp 客户端（V1 线协议 + yamux/tcp_mux + TLS 首字节 + golib 控制通道加密）兼容。
+  已用 **frpc 0.71.0（openbsd/amd64 官方 release）** 实测：登录、注册 tcp/udp 代理、
+  经隧道 GET 控制台首页（200，31 KB）、持续 4 分钟无重连；`tcp` 与 `udp` 代理均验证通过。
+- frpc 建议：`transport.wireProtocol` 保持默认 `"v1"`（0.52+ 的默认值，也是本服务端实现的协议）；
+  `transport.tls.enable` 用默认值即可（服务端自动生成自签证书，客户端默认不校验）。
+- 控制通道加密：登录之后的所有控制消息用 AES-128-CFB 加密，密钥为 `PBKDF2-HMAC-SHA1(token, salt, 64, 16)`。
+  frp 自 **0.44.0** 起在 `client/service.go` 与 `cmd/frps/main.go` 里把 golib 的默认盐覆盖为 `"frp"`，
+  因此默认值 `crypto_salt = "frp"`；只有 0.44 之前的客户端才需要改成 golib 的默认值 `"crypto"`（可在控制台 frps 配置里改）。
+- 心跳差异（已在服务端分别适配）：frp ≤ 0.51 的客户端每 30 秒发一次控制通道 Ping；
+  **0.52 起心跳被移除**，链路存活改由传输层负责（yamux 自身的 30 秒 keepalive，服务端看不到应用层消息）。
+  因此服务端的「空闲控制连接回收」只对 ≤ 0.51 的客户端生效，对其余客户端依赖 TCP keepalive 回收半死连接。
+- 支持 `tcp` / `udp` 代理（udp 走工作连接帧，与 frp 的 base64 `UDPPacket` 一致）；`http/https/stcp/xtcp/tcpmux` 类型会返回协议错误（后续版本补充）。
+- 未实现 frp 的 `use_encryption` / `use_compression`（客户端开启时该代理会收到明确错误，不会静默失败）。
+
+## 控制台可配置项（控制台自身）
+
+系统页可直接修改控制台端口、TLS 开关与证书路径、会话有效期，并支持：
+改控制台密码、生成/上传控制台与各服务证书、下载日志（优先取 `/var/log/remgr/remgr.log`，含重启前历史）。
+
+- 保存后点「应用」才重新绑定监听（`POST /api/console/apply`）：新监听先绑定成功并加载好证书，才关闭旧监听，
+  端口被占用或证书不可读时旧控制台继续服务并返回错误，不会把自己锁死。
+- 证书生成/上传后，路径会自动写入对应服务配置（`stun_turn.cert_path`、`frps.tls_cert_path`、`console.tls_cert`），
+  并重启该服务使其生效。
 
 ## License
 

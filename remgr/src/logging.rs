@@ -1,17 +1,80 @@
-//! In-memory log hub: ring buffer for the console + broadcast for live WS tail.
+//! In-memory log hub: ring buffer for the console + broadcast for live WS tail,
+//! plus an append-only file so history survives a restart.
 
 use std::collections::VecDeque;
+use std::fs::OpenOptions;
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::broadcast;
 
 const RING_SIZE: usize = 1000;
+const LOG_FILE: &str = "/var/log/remgr/remgr.log";
+/// Rotate to `<file>.1` once the file passes this size (one generation kept).
+const LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+/// The on-disk half of the log hub. `/var/log/remgr` is unveiled for it; a
+/// filesystem that refuses the write (read-only, full, absent directory) must
+/// never break logging, so the file is best-effort and opened lazily.
+struct FileSink {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+    written: u64,
+    complained: bool,
+}
+
+impl FileSink {
+    fn new(path: &str) -> Self {
+        Self { path: PathBuf::from(path), file: None, written: 0, complained: false }
+    }
+
+    fn open(&mut self) {
+        match OpenOptions::new().create(true).append(true).open(&self.path) {
+            Ok(f) => {
+                self.written = f.metadata().map(|m| m.len()).unwrap_or(0);
+                self.file = Some(f);
+            }
+            Err(e) => {
+                if !self.complained {
+                    self.complained = true;
+                    eprintln!("remgr: file logging disabled ({}: {e})", self.path.display());
+                }
+            }
+        }
+    }
+
+    fn write_line(&mut self, line: &str) {
+        if self.file.is_none() {
+            self.open();
+        }
+        if self.written >= LOG_MAX_BYTES {
+            self.rotate();
+        }
+        if let Some(f) = self.file.as_mut() {
+            if writeln!(f, "{line}").is_ok() {
+                self.written += line.len() as u64 + 1;
+            }
+        }
+    }
+
+    fn rotate(&mut self) {
+        if let Some(f) = self.file.as_mut() {
+            let _ = f.flush();
+        }
+        self.file = None;
+        let rolled = self.path.with_file_name("remgr.log.1");
+        let _ = std::fs::rename(&self.path, rolled);
+        self.written = 0;
+        self.open();
+    }
+}
 
 pub struct LogHub {
     entries: Mutex<VecDeque<String>>,
     partial: Mutex<String>,
     tx: broadcast::Sender<String>,
+    file: Mutex<FileSink>,
 }
 
 impl LogHub {
@@ -21,6 +84,7 @@ impl LogHub {
             entries: Mutex::new(VecDeque::with_capacity(RING_SIZE)),
             partial: Mutex::new(String::new()),
             tx,
+            file: Mutex::new(FileSink::new(LOG_FILE)),
         })
     }
 
@@ -31,6 +95,10 @@ impl LogHub {
         }
         entries.push_back(line.to_string());
         drop(entries);
+        self.file
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .write_line(line);
         let _ = self.tx.send(line.to_string());
     }
 

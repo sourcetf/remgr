@@ -1,15 +1,20 @@
 //! frp control-channel crypto (post-login), mirroring
 //! github.com/fatedier/golib `crypto.NewWriter/NewReader`:
 //!
-//! - key = PBKDF2-HMAC-SHA1(token, salt="frp", iterations=64, len=16)
-//!   (verified against the official frps/frpc 0.61.2 release binaries; the
-//!   salt in newer golib sources reads "crypto", the released binaries
-//!   derive with "frp")
+//! - key = PBKDF2-HMAC-SHA1(token, salt, iterations=64, len=16), where the salt
+//!   is frp's, not golib's: since v0.44.0 every frp build sets
+//!   `crypto.DefaultSalt = "frp"` in `client/service.go` and `cmd/frps/main.go`
+//!   (checked in the v0.44.0 … v0.71.0 sources), overriding golib's own
+//!   `"crypto"`. Only clients older than 0.44 derive with golib's default, which
+//!   is what `crypto_salt` in the frps config is for.
 //! - each direction: 16-byte random IV prefix, then AES-128-CFB (full-block
 //!   feedback) applied as one continuous byte stream over all subsequent data.
 //!
 //! The `Login` message and `LoginResp` travel in plaintext; every control
 //! message after that is encrypted. Work connections are never encrypted.
+//!
+//! Verified against a real frpc 0.71.0 (openbsd/amd64) talking to this server:
+//! login, proxy registration and a tcp tunnel all complete with salt "frp".
 
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -19,10 +24,12 @@ use aes::Aes128;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 const IV_LEN: usize = 16;
+/// frp's `crypto.DefaultSalt`; see `FrpsConfig::crypto_salt`.
+pub const DEFAULT_SALT: &str = "frp";
 
-fn derive_key(token: &[u8]) -> [u8; IV_LEN] {
+fn derive_key(token: &[u8], salt: &[u8]) -> [u8; IV_LEN] {
     let mut out = [0u8; IV_LEN];
-    pbkdf2::pbkdf2_hmac::<sha1::Sha1>(token, b"frp", 64, &mut out);
+    pbkdf2::pbkdf2_hmac::<sha1::Sha1>(token, salt, 64, &mut out);
     out
 }
 
@@ -98,13 +105,18 @@ impl<S> CryptoStream<S> {
     }
 
     pub fn with_write_key(inner: S, read_pass: &[u8], write_pass: Option<&[u8]>) -> Self {
+        Self::with_salt(inner, read_pass, write_pass, DEFAULT_SALT.as_bytes())
+    }
+
+    /// Same, with an explicit PBKDF2 salt (see `FrpsConfig::crypto_salt`).
+    pub fn with_salt(inner: S, read_pass: &[u8], write_pass: Option<&[u8]>, salt: &[u8]) -> Self {
         let mut iv = [0u8; IV_LEN];
         use rand::RngCore;
         rand::thread_rng().fill_bytes(&mut iv);
         Self {
             inner,
-            key: derive_key(read_pass),
-            write_key: write_pass.map(derive_key),
+            key: derive_key(read_pass, salt),
+            write_key: write_pass.map(|p| derive_key(p, salt)),
             iv_read: 0,
             iv_buf: [0u8; IV_LEN],
             dec: None,

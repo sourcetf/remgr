@@ -15,6 +15,7 @@ mod state;
 
 use anyhow::Result;
 use std::sync::Arc;
+#[cfg(not(unix))]
 use std::time::Duration;
 
 use state::AppState;
@@ -145,10 +146,6 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
         }
     }
 
-    let console_addr = format!("0.0.0.0:{}", state.config_blocking().console.port).parse()?;
-    let app = console::router(state.clone());
-    let use_tls = state.config_blocking().console.tls;
-
     // graceful shutdown on SIGTERM/SIGINT (rc.d sends SIGTERM)
     let stop_state = state.clone();
     tokio::spawn(async move {
@@ -164,26 +161,10 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
         std::process::exit(0);
     });
 
-    tracing::info!("console listening on {}{} (web port {})", 
-        if use_tls { "https://" } else { "http://" },
-        console_addr,
-        state.config_blocking().console.port);
-
-    if use_tls {
-        let ccfg = state.config_blocking().console;
-        let rustls_cfg = axum_server::tls_rustls::RustlsConfig::from_pem_file(
-            &ccfg.tls_cert,
-            &ccfg.tls_key,
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("load console TLS cert: {e}"))?;
-        axum_server::bind_rustls(console_addr, rustls_cfg)
-            .serve(app.into_make_service())
-            .await?;
-    } else {
-        let listener = tokio::net::TcpListener::bind(console_addr).await?;
-        axum::serve(listener, app).await?;
-    }
+    // Serves until the process exits. Console settings (port, TLS, certificate
+    // paths, session lifetime) are applied by rebinding the listener through
+    // POST /api/console/apply, which never leaves the console unreachable.
+    console::serve_console(state.clone()).await?;
     Ok(())
 }
 

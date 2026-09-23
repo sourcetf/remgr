@@ -186,17 +186,20 @@ impl RendezvousServer {
                 test_addr.parse()?
             };
             tokio::spawn(async move {
+                // A failed self-test must not end the host process: ReMgr links
+                // this server in-process, so `process::exit` here takes the whole
+                // relay manager down (and a start that is cancelled before the
+                // test finishes makes the test fail every time). Report it and
+                // keep serving — the console shows hbbs' listener state.
                 if let Err(err) = test_hbbs(test_addr).await {
                     if test_addr.is_ipv6() && test_addr.ip().is_unspecified() {
                         let mut test_addr = test_addr;
                         test_addr.set_ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
                         if let Err(err) = test_hbbs(test_addr).await {
                             log::error!("Failed to run hbbs test with {test_addr}: {err}");
-                            std::process::exit(1);
                         }
                     } else {
                         log::error!("Failed to run hbbs test with {test_addr}: {err}");
-                        std::process::exit(1);
                     }
                 }
             });

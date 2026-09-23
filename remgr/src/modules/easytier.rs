@@ -94,6 +94,9 @@ impl super::ServiceModule for EasyTierModule {
     async fn status(&self) -> serde_json::Value {
         let cfg = self.cfg();
         let running = self.run.lock().await.is_some();
+        // The center node is an EasyTier *instance*, and an instance only exists
+        // once it has a network to join: `node_enabled` alone starts nothing.
+        let node_running = cfg.node_enabled && !cfg.network_name.is_empty();
         serde_json::json!({
             "enabled": cfg.enabled,
             "running": running,
@@ -101,6 +104,12 @@ impl super::ServiceModule for EasyTierModule {
             "api_addr": cfg.api_addr,
             "api_port": cfg.api_port,
             "node_enabled": cfg.node_enabled,
+            "node_running": node_running,
+            "node_note": if cfg.node_enabled && cfg.network_name.is_empty() {
+                "已启用本地节点，但「网络名称」为空，节点实例不会启动"
+            } else {
+                ""
+            },
             "node_name": cfg.node_name,
             "network_name": cfg.network_name,
             "virtual_ipv4": cfg.virtual_ipv4,

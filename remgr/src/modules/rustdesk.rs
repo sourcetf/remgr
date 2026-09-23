@@ -5,17 +5,18 @@
 //! NAT-test on -1, websocket on +2); hbbr listens on `relay_port` (21117,
 //! websocket +2).
 //!
-//! Server key: hbbs generates one on first boot (persisted to `id_ed25519` /
-//! `id_ed25519.pub` in the working dir, which `main` pins to `/var/lib/remgr`).
-//! When the config's `key` is empty this module lets hbbs generate the pair,
-//! then writes the public key back into `config.toml` and restarts both
-//! servers pinned to it — so the console shows the real key and hbbr agrees
-//! with hbbs.
+//! Server key: the pair lives in `id_ed25519` / `id_ed25519.pub` in the data
+//! dir (the working directory, pinned to `/var/lib/remgr` by `main`). When the
+//! config's `key` is empty both servers are started with `"_"`, which makes them
+//! load that file — hbbs keeps the secret half, which it needs to sign peer
+//! keys. Pinning a bare public key into the config instead (as `-k <pubkey>`
+//! does) leaves the server without a signing key, so that is only done when the
+//! operator sets one deliberately.
 //!
 //! Stop: `start_with_bind` holds all its listeners as locals, so aborting the
 //! spawned task drops the sockets and releases the ports.
 
-use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
@@ -47,13 +48,18 @@ impl RustDeskModule {
 
     /// spawn hbbs + hbbr pinned to `key`, wired to `token` for cancellation
     fn spawn_servers(&self, key: String, port: i32, relay_port: String, token: &CancellationToken) -> (tokio::task::JoinHandle<()>, tokio::task::JoinHandle<()>) {
+        // Bind IPv4 explicitly. With no bind address the servers ask for a
+        // dual-stack socket (`new_v6` + `set_only_v6(false)`), which OpenBSD
+        // refuses — the socket stays IPv6-only, so IPv4 clients (i.e. almost all
+        // of them) can neither connect nor let hbbs' own self-test pass.
+        let bind = Some(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED));
         let t_hbbs = token.clone();
         let hbbs_task = {
             let key = key.clone();
             tokio::spawn(async move {
-                tracing::info!("rustdesk hbbs starting on port {port}");
+                tracing::info!("rustdesk hbbs starting on port {port} (ipv4)");
                 let res = tokio::select! {
-                    r = hbbs::RendezvousServer::start_with_bind(None, port, 0, &key, 0) => r,
+                    r = hbbs::RendezvousServer::start_with_bind(bind, port, 0, &key, 0) => r,
                     _ = t_hbbs.cancelled() => Ok(()),
                 };
                 if let Err(e) = res {
@@ -63,9 +69,9 @@ impl RustDeskModule {
         };
         let t_hbbr = token.clone();
         let hbbr_task = tokio::spawn(async move {
-            tracing::info!("rustdesk hbbr starting on port {relay_port}");
+            tracing::info!("rustdesk hbbr starting on port {relay_port} (ipv4)");
             let res = tokio::select! {
-                r = hbbs::start_with_bind(None, &relay_port, &key) => r,
+                r = hbbs::start_with_bind(bind, &relay_port, &key) => r,
                 _ = t_hbbr.cancelled() => Ok(()),
             };
             if let Err(e) = res {
@@ -73,21 +79,6 @@ impl RustDeskModule {
             }
         });
         (hbbs_task, hbbr_task)
-    }
-
-    /// persist the generated key into the console config (best effort) so the
-    /// UI and subsequent restarts see the real key
-    async fn pin_key(&self, key: &str) {
-        let Some(state) = self.state.upgrade() else { return };
-        {
-            let mut cfg = state.config.write().await;
-            cfg.rustdesk.key = key.to_string();
-            if let Err(e) = cfg.save() {
-                tracing::warn!("rustdesk: could not persist server key: {e:#}");
-            } else {
-                tracing::info!("rustdesk: generated server key pinned into config");
-            }
-        }
     }
 }
 
@@ -99,7 +90,16 @@ impl super::ServiceModule for RustDeskModule {
 
     async fn status(&self) -> serde_json::Value {
         let cfg = self.cfg();
-        let running = self.run.lock().await.is_some();
+        // A task that died (bind failure, runtime error) must not be reported as
+        // a running relay: both halves are required for clients to connect.
+        let alive = |j: &Option<tokio::task::JoinHandle<()>>| matches!(j, Some(h) if !h.is_finished());
+        let running = self
+            .run
+            .lock()
+            .await
+            .as_ref()
+            .map(|h| alive(&h.hbbs) && alive(&h.hbbr))
+            .unwrap_or(false);
         // The public key is what a client needs; when no explicit key is set it
         // is read back from the file hbbs wrote on first boot.
         let public_key = if cfg.key.is_empty() {
@@ -119,7 +119,7 @@ impl super::ServiceModule for RustDeskModule {
             "relay_websocket_port": cfg.relay_port.saturating_add(2),
             "key": cfg.key,
             "public_key": public_key,
-            "key_set": !cfg.key.is_empty(),
+            "key_set": !public_key.is_empty(),
         })
     }
 
@@ -134,23 +134,65 @@ impl super::ServiceModule for RustDeskModule {
         }
         let token = CancellationToken::new();
 
-        let key = if cfg.key.is_empty() {
-            // No configured key: generate (and persist) an ed25519 keypair the
-            // same way the stock hbbs does on first boot (id_ed25519 /
-            // id_ed25519.pub in the working dir), then pin the public key for
-            // both servers so hbbr agrees with hbbs.
+        let disk_key = std::fs::read_to_string("id_ed25519.pub")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        let key = if cfg.key.is_empty() || cfg.key == disk_key {
+            // Both halves read `id_ed25519`; make sure it exists before either
+            // starts, otherwise they race on first boot and generate different
+            // keys. gen_sk returns the existing pair when the file is present.
             let (pk, _sk) = hbbs::common::gen_sk(0);
             if pk.is_empty() {
-                anyhow::bail!("rustdesk: server key generation failed");
+                anyhow::bail!(
+                    "rustdesk: no usable server key — id_ed25519 is missing or corrupt \
+                     (fix or remove it and try again)"
+                );
             }
-            self.pin_key(&pk).await;
-            pk
+            // "_" = "use the key on disk": hbbs then keeps the secret half too.
+            // A bare public key (including the value an older build pinned into
+            // the config, which is just this file's public half) would leave the
+            // server unable to sign peer keys.
+            if !cfg.key.is_empty() {
+                tracing::info!("rustdesk: configured key matches id_ed25519.pub, using the on-disk pair");
+            }
+            "_".to_string()
         } else {
             cfg.key.clone()
         };
 
         let (hbbs_task, hbbr_task) =
             self.spawn_servers(key, cfg.hbbs_port as i32, cfg.relay_port.to_string(), &token);
+
+        // Never report a running relay before it is actually listening: a failed
+        // bind happens inside the spawned task, where it would only be logged.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+        loop {
+            if port_listening(cfg.hbbs_port).await && port_listening(cfg.relay_port).await {
+                break;
+            }
+            if hbbs_task.is_finished() || hbbr_task.is_finished() {
+                token.cancel();
+                anyhow::bail!(
+                    "rustdesk: a server task exited during startup (check the log for the bind error)"
+                );
+            }
+            if tokio::time::Instant::now() >= deadline {
+                token.cancel();
+                anyhow::bail!(
+                    "rustdesk: hbbs/hbbr are not listening on {} / {} after 6s \
+                     (another process may hold the ports)",
+                    cfg.hbbs_port,
+                    cfg.relay_port
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        tracing::info!(
+            "rustdesk: hbbs listening on {} (tcp+udp), hbbr listening on {}",
+            cfg.hbbs_port,
+            cfg.relay_port
+        );
+
         *run = Some(RunHandle { token, hbbs: Some(hbbs_task), hbbr: Some(hbbr_task) });
         Ok(())
     }
@@ -172,4 +214,25 @@ impl super::ServiceModule for RustDeskModule {
     async fn apply_config(&self) -> anyhow::Result<()> {
         super::restart_if_running(self).await
     }
+}
+
+/// Is something accepting TCP connections on `port` yet? Both loopback
+/// families are probed: the servers bind one of them depending on the address
+/// they were given (OpenBSD cannot dual-stack), and a probe on the other family
+/// would report a healthy listener as missing.
+async fn port_listening(port: u16) -> bool {
+    for host in ["127.0.0.1", "::1"] {
+        let ok = matches!(
+            tokio::time::timeout(
+                Duration::from_millis(300),
+                tokio::net::TcpStream::connect((host, port)),
+            )
+            .await,
+            Ok(Ok(_))
+        );
+        if ok {
+            return true;
+        }
+    }
+    false
 }

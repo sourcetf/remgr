@@ -96,9 +96,30 @@ th{color:var(--tx2);font-weight:500}
   <div id="tab-frps" class="hidden"></div>
   <div id="tab-system" class="hidden">
     <div class="card">
+      <h3>🔧 控制台设置</h3>
+      <div class="grid" id="console-form"></div>
+      <div class="row">
+        <button class="btn primary" onclick="saveConsole()">保存</button>
+        <button class="btn warn" onclick="applyConsole()">立即应用（重新绑定）</button>
+        <button class="btn" onclick="genCert('console')">🔐 生成控制台证书</button>
+        <button class="btn" onclick="uploadCert('console')">📥 上传控制台证书</button>
+      </div>
+      <div class="hint">端口/TLS 的改动需点「立即应用」重新绑定控制台；证书路径默认指向 <code>/etc/remgr/ssl</code>。
+        若启用了 HTTPS 但证书不可读，控制台会退回 HTTP 以免失联。</div>
+    </div>
+    <div class="card">
+      <h3>🔑 修改控制台密码</h3>
+      <div class="row">
+        <input id="pw-old" type="password" placeholder="当前密码" style="max-width:200px">
+        <input id="pw-new" type="password" placeholder="新密码（至少 8 位）" style="max-width:240px">
+        <button class="btn primary" onclick="changePassword()">修改</button>
+      </div>
+    </div>
+    <div class="card">
       <h3>📜 日志</h3>
       <div id="logs"></div>
-      <div class="row"><label class="switch"><input type="checkbox" id="log-follow" checked> 实时跟随</label></div>
+      <div class="row"><label class="switch"><input type="checkbox" id="log-follow" checked> 实时跟随</label>
+        <button class="btn sm" onclick="downloadLogs()">⬇ 下载日志</button></div>
     </div>
   </div>
 </main>
@@ -156,6 +177,7 @@ function showLogin(){document.getElementById('login').classList.remove('hidden')
 async function boot(){
   buildNav(); switchTab('dashboard');
   await refreshAll();
+  await refreshConsoleCfg();
   connectWS();
   logTimer = setInterval(tickLogs, 4000);
 }
@@ -176,7 +198,7 @@ function switchTab(t){
   document.querySelectorAll('#nav button').forEach(b=>b.classList.toggle('active',b.dataset.t===t));
   for(const id of ['dashboard','easytier','stun_turn','rustdesk','frps','system'])
     document.getElementById('tab-'+id).classList.toggle('hidden', id!==t);
-  if(t==='system'){tickLogs(); scrollLogs()}
+  if(t==='system'){tickLogs(); scrollLogs(); refreshConsoleCfg()}
   render();
 }
 
@@ -220,12 +242,13 @@ function renderDashboard(){
   const sv=s.services;
   html += svcCard('easytier', sv.easytier?.running, sv.easytier?.enabled, [
     ['配置服务器端口', sv.easytier?.config_server_port],['API 端口', sv.easytier?.api_port],
-    ['本地节点', sv.easytier?.node_enabled?(sv.easytier?.node_name||'—'):'关闭'],
+    ['本地节点', sv.easytier?.node_running?(sv.easytier?.node_name||'—'):(sv.easytier?.node_enabled?'未启动（缺少网络名称）':'关闭')],
     ['网络名', sv.easytier?.network_name||'—'],
   ]);
   html += svcCard('stun_turn', sv.stun_turn?.running, sv.stun_turn?.enabled, [
     ['STUN/TURN 端口', sv.stun_turn?.stun_port],['TLS 端口', sv.stun_turn?.tls_port+(sv.stun_turn?.tls_active?' (已启用)':'')],
     ['域名', sv.stun_turn?.domain||'—'],['中继端口范围', sv.stun_turn?.relay_ports],
+    ['TURN 中继', sv.stun_turn?.turn_available===false?'未就绪':'可用'],
   ]);
   html += svcCard('rustdesk', sv.rustdesk?.running, sv.rustdesk?.enabled, [
     ['中继端口 (hbbr)', sv.rustdesk?.relay_port],['ID 端口 (hbbs)', sv.rustdesk?.hbbs_port],
@@ -234,6 +257,8 @@ function renderDashboard(){
   const fp=sv.frps||{};
   html += svcCard('frps', fp.running, fp.enabled, [
     ['监听', fp.bind],['在线客户端', fp.clients_online],
+    ['认证 Token', fp.token_set?'已设置':'未设置（任何客户端可登录）'],
+    ['TLS 证书', fp.tls?'已配置':'使用临时自签证书'],
     ['入站流量', fmtBytes(fp.bytes_in||0)],['出站流量', fmtBytes(fp.bytes_out||0)],
   ]);
   el.innerHTML=html;
@@ -244,9 +269,10 @@ function renderServiceTabs(){
   document.getElementById('tab-easytier').innerHTML =
     svcCard('easytier', s.easytier?.running, s.easytier?.enabled, [
       ['配置服务器端口 (UDP)', s.easytier?.config_server_port],['REST API', s.easytier?.api_addr+':'+s.easytier?.api_port],
-      ['本地节点', s.easytier?.node_enabled?'启用':'关闭'],['数据库', s.easytier?.db_path],
+      ['本地节点', s.easytier?.node_running?'运行中':'未启动'],['数据库', s.easytier?.db_path],
       ['监听器', (s.easytier?.listeners||[]).length+' 个'],['网络名', s.easytier?.network_name||'—'],
     ], `<a class="btn sm" href="/et/" target="_blank" rel="noopener">🖧 EasyTier 控制台</a>`)
+    + (s.easytier?.node_note?`<div class="card"><h3>⚠ 本地节点未启动</h3><p style="color:var(--tx2);font-size:12px">${s.easytier.node_note}</p></div>`:'')
     + `<div class="card"><h3>🖧 EasyTier 仪表盘（easytier-web）</h3>
       <p style="color:var(--tx2);font-size:12px">同源提供于 <a href="/et/" target="_blank" rel="noopener">/et/</a>，登陆用户 <b>admin</b>；
       首次启动的随机口令见 <code>/var/run/remgr/easytier_dashboard_password</code>（可在仪表盘内自行修改）。
@@ -278,7 +304,14 @@ function renderServiceTabs(){
       ['监听', fp.bind],['tcp_mux', String(fp.tcp_mux)],
       ['入站', fmtBytes(fp.bytes_in||0)],['出站', fmtBytes(fp.bytes_out||0)],
       ['累计登录', fp.total_logins],['用户连接', fp.total_user_conns],
-    ]) + `<div class="card"><h3>📋 活跃代理</h3>${proxyRows||'<p style="color:var(--tx2);font-size:13px">暂无</p>'}</div>`;
+      ['认证 Token', fp.token_set?'已设置':'未设置（任何客户端可登录）'],
+      ['TLS 证书', fp.tls?'已配置':'临时自签证书'],
+    ]) + `<div class="card"><h3>📋 活跃代理</h3>${proxyRows||'<p style="color:var(--tx2);font-size:13px">暂无</p>'}</div>
+    <div class="card"><h3>ℹ frpc 兼容性</h3><p style="color:var(--tx2);font-size:12px">
+      本服务端实现 frp V1 线协议（<code>transport.wireProtocol = "v1"</code>，现代 frpc 的默认值，已用 frpc 0.71 实测）。
+      客户端配置：<code>serverAddr</code> = 本机地址，<code>serverPort</code> = ${fp.bind?.split(':').pop()||7000}，
+      <code>auth.token</code> 与上方一致；TLS / tcp_mux 保持默认即可。
+      支持 <code>tcp</code> / <code>udp</code> 代理；http/https/stcp/xtcp 类型返回协议错误。</p></div>`;
 }
 
 /* ---------- actions ---------- */
@@ -344,6 +377,7 @@ const SCHEMAS = {
     [['max_pool_count','最大连接池','',['number']]],
     [['heartbeat_timeout','心跳超时 (秒)','',['number']]],
     [['allow_ports','允许的远程端口范围','如 6000-6100,7000；留空不限']],
+    [['crypto_salt','控制通道加密盐 (高级)','默认 frp（frp ≥ 0.44）；仅 frp < 0.44 的旧客户端需改为 crypto']],
     [['tls_cert_path','TLS 证书路径','留空=自动生成自签证书'],['tls_key_path','TLS 私钥路径','']],
   ],
 };
@@ -378,12 +412,14 @@ function openConfig(svc){
     const type = f.widget==='number' ? 'number' : 'text';
     return `<div class="fg"><label>${f.label}</label><input type="${type}" data-path="${f.path}" value="${v!==undefined&&v!==null?String(v).replace(/"/g,'&quot;'):''}">${f.hint?`<div class="hint">${f.hint}</div>`:''}</div>`;
   }).join('');
-  // A certificate is what TURN-over-TLS needs; offer to mint one for the
-  // domain entered above, or to install an existing pair (e.g. a real CA cert).
-  const certRow = svc==='stun_turn'
-    ? `<div class="row" style="margin-top:12px"><button class="btn" onclick="genCert('turn')">🔐 生成自签证书</button>
-       <button class="btn" onclick="uploadCert('turn')">📥 上传证书</button>
-       <span class="hint" style="margin-left:8px">生成按上方「域名」，或粘贴已有 PEM，写入 cert_path / key_path</span></div>`
+  // A certificate is what TURN-over-TLS and frpc's transport.tls need; offer to
+  // mint one for the domain entered above, or to install an existing pair (e.g.
+  // a real CA cert). Either way the paths below are filled in automatically.
+  const certSvc = {stun_turn:'turn', frps:'frps'}[svc];
+  const certRow = certSvc
+    ? `<div class="row" style="margin-top:12px"><button class="btn" onclick="genCert('${certSvc}')">🔐 生成自签证书</button>
+       <button class="btn" onclick="uploadCert('${certSvc}')">📥 上传证书</button>
+       <span class="hint" style="margin-left:8px">生成按上方「域名」，或粘贴已有 PEM；证书路径会自动写入本页配置</span></div>`
     : '';
   document.getElementById('modal-body').innerHTML=fields+certRow;
   document.getElementById('modal').classList.remove('hidden');
@@ -424,8 +460,9 @@ async function genCert(svc){
   if(!domain) return;
   try{
     const r=await api('/api/system/certs/generate','POST',{service:svc,domain});
-    toast('证书已生成: '+r.cert_path);
+    toast('证书已生成: '+r.cert_path+(r.configured?.length?`（已写入 ${r.configured.join(', ')}）`:''));
     await refreshAll();
+    if(!document.getElementById('modal').classList.contains('hidden')) openConfig(editService);
   }catch(e){toast(e.message,false)}
 }
 
@@ -436,8 +473,60 @@ async function uploadCert(svc){
   if(!key) return;
   try{
     const r=await api('/api/system/certs/upload','POST',{service:svc,cert_pem:cert,key_pem:key});
-    toast('证书已写入: '+r.cert_path);
+    toast('证书已写入: '+r.cert_path+(r.configured?.length?`（已写入 ${r.configured.join(', ')}）`:''));
     await refreshAll();
+    if(!document.getElementById('modal').classList.contains('hidden')) openConfig(editService);
+  }catch(e){toast(e.message,false)}
+}
+
+/* ---------- console settings ---------- */
+let consoleCfg=null;
+async function refreshConsoleCfg(){
+  try{ consoleCfg=await api('/api/config/console'); }catch(e){ consoleCfg=null }
+  renderConsoleForm();
+}
+function renderConsoleForm(){
+  const el=document.getElementById('console-form'); if(!el) return;
+  const c=consoleCfg||{};
+  const rows=[
+    ['port','控制台端口',c.port??9443],
+    ['tls_cert','TLS 证书路径',c.tls_cert??''],
+    ['tls_key','TLS 私钥路径',c.tls_key??''],
+    ['session_ttl','会话有效期（秒）',c.session_ttl??604800],
+  ].map(([p,l,v])=>`<div class="fg"><label>${l}</label><input data-cpath="${p}" value="${String(v).replace(/"/g,'&quot;')}"></div>`).join('');
+  el.innerHTML=rows+`<div class="fg"><label class="switch" style="margin:0"><input type="checkbox" data-cpath="tls" ${c.tls?'checked':''}> 启用 HTTPS（需证书；未启用则 HTTP）</label></div>`;
+}
+function collectConsoleCfg(){
+  const c=JSON.parse(JSON.stringify(consoleCfg||{}));
+  document.querySelectorAll('#console-form [data-cpath]').forEach(el=>{
+    const p=el.dataset.cpath;
+    if(el.type==='checkbox') c[p]=el.checked;
+    else if(p==='port'||p==='session_ttl'){ if(el.value.trim()!=='') c[p]=Number(el.value); }
+    else c[p]=el.value;
+  });
+  return c;
+}
+async function saveConsole(){
+  try{
+    const r=await api('/api/config/console','PUT',collectConsoleCfg());
+    toast(r.note||'控制台设置已保存');
+    await refreshConsoleCfg();
+  }catch(e){toast(e.message,false)}
+}
+async function applyConsole(){
+  try{
+    const r=await api('/api/console/apply','POST',{});
+    toast(r.note||'控制台正在重新绑定…');
+    setTimeout(()=>location.reload(),1800);
+  }catch(e){toast(e.message,false)}
+}
+async function changePassword(){
+  const old=document.getElementById('pw-old').value, nw=document.getElementById('pw-new').value;
+  if(!old||!nw) return toast('请填写当前密码与新密码',false);
+  try{
+    await api('/api/console/password','POST',{old,new:nw});
+    document.getElementById('pw-old').value=''; document.getElementById('pw-new').value='';
+    toast('密码已修改');
   }catch(e){toast(e.message,false)}
 }
 
@@ -454,6 +543,18 @@ async function tickLogs(){
   }catch(e){}
 }
 function scrollLogs(){const el=document.getElementById('logs'); if(document.getElementById('log-follow')?.checked) el.scrollTop=el.scrollHeight}
+function downloadLogs(){
+  // Prefer the file log: unlike the in-memory ring buffer it survives restarts.
+  api('/api/logs?n=20000&file=1').catch(()=>api('/api/logs?n=1000')).then(d=>{
+    const stamp=new Date().toISOString().slice(0,19).replace(/[:T]/g,'');
+    const blob=new Blob([(d.lines||[]).join('\n')],{type:'text/plain;charset=utf-8'});
+    const a=document.createElement('a');
+    a.href=URL.createObjectURL(blob);
+    a.download=`remgr-log-${stamp}.txt`;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(()=>URL.revokeObjectURL(a.href),10000);
+  }).catch(e=>toast(e.message,false));
+}
 function connectWS(){
   try{
     const proto=location.protocol==='https:'?'wss':'ws';

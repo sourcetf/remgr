@@ -17,13 +17,16 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Result};
 use serde::Serialize;
+// yamux streams speak the futures-io traits; the anonymous import brings
+// `poll_write` into scope without clashing with tokio's `AsyncWrite`.
+use futures_util::AsyncWrite as _;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::mpsc;
 use tokio::sync::{Mutex as AsyncMutex, RwLock};
@@ -107,6 +110,10 @@ impl ServerShared {
         }
     }
 
+    fn token_is_empty(&self) -> bool {
+        self.server_token().is_empty()
+    }
+
     fn auth_ok(&self, timestamp: i64, key: &str) -> bool {
         let expect = msg::auth_key(&self.server_token(), timestamp);
         if expect.len() != key.len() {
@@ -152,8 +159,11 @@ struct Prefixed {
 impl AsyncRead for Prefixed {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         let this = self.get_mut();
-        if let Some(b) = this.prefix.take() {
-            if buf.remaining() > 0 {
+        // Only consume the replayed byte once there is somewhere to put it:
+        // taking it with no room would silently drop the first byte of the
+        // stream (a caller may legitimately poll with an empty buffer).
+        if buf.remaining() > 0 {
+            if let Some(b) = this.prefix.take() {
                 buf.put_slice(&[b]);
                 return Poll::Ready(Ok(()));
             }
@@ -183,7 +193,13 @@ struct ControlState {
     work_tx: mpsc::Sender<BoxDuplex>,
     work_rx: AsyncMutex<mpsc::Receiver<BoxDuplex>>,
     last_active: AtomicU64,
+    /// Whether this client sends control-connection heartbeats (see
+    /// [`client_sends_heartbeats`]). Clients that do not must not be judged by
+    /// the idle monitor, or every session ends after the timeout.
+    enforce_idle: bool,
     token: CancellationToken,
+    /// Cleared by the first teardown, so the online counter moves exactly once.
+    online: AtomicBool,
     stats: Arc<Stats>,
     proxies: Mutex<HashMap<String, CancellationToken>>,
     shared: Arc<ServerShared>,
@@ -233,13 +249,50 @@ impl ControlState {
         for n in names {
             self.close_proxy(&n);
         }
-        self.shared.controls.lock().unwrap().remove(&self.run_id);
-        self.stats.clients_online.fetch_sub(1, Ordering::Relaxed);
+        // Drop the map entry only if it still points at this control: a client
+        // that re-logs in with the same run_id has already replaced it, and
+        // removing the replacement would orphan the live session.
+        let me = self as *const ControlState;
+        let still_mine = {
+            let controls = self.shared.controls.lock().unwrap();
+            match controls.get(&self.run_id) {
+                Some(cur) => std::ptr::eq(Arc::as_ptr(cur), me),
+                None => false,
+            }
+        };
+        if still_mine {
+            self.shared.controls.lock().unwrap().remove(&self.run_id);
+        }
+        // teardown() runs both from the reader loop and from the heartbeat
+        // monitor / stop(), so the online counter must be decremented once.
+        if self.online.swap(false, Ordering::Relaxed) {
+            self.stats.clients_online.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
 fn now_secs() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
+}
+
+/// Does this client keep the control connection alive with frp-level heartbeats?
+///
+/// frp <= 0.51 sends a Ping every `heartbeatInterval` (30s) and expects a Pong;
+/// from 0.52 on the heartbeat was removed and liveness is left to the transport
+/// (yamux's own 30s keepalive, which the server never sees as a message). So an
+/// idle-control monitor applies to the old clients only — enforcing it for the
+/// new ones closes every session after the timeout and makes frpc reconnect
+/// forever. An unknown or missing version is treated as "no heartbeats", i.e.
+/// permissive, matching frp's own server behaviour.
+fn client_sends_heartbeats(version: &str) -> bool {
+    let mut it = version.trim().split(['.', '-', '+']);
+    let (Some(major), Some(minor)) = (
+        it.next().and_then(|s| s.parse::<u32>().ok()),
+        it.next().and_then(|s| s.parse::<u32>().ok()),
+    ) else {
+        return false;
+    };
+    major == 0 && minor < 52
 }
 
 // ---------------------------------------------------------------- server
@@ -372,7 +425,7 @@ impl FrpsServer {
                             .cloned()
                             .collect();
                         for st in entries {
-                            if st.idle_secs() > timeout {
+                            if st.idle_secs() > timeout && st.enforce_idle {
                                 tracing::info!("frps control {} idle {}s, closing", st.run_id, st.idle_secs());
                                 st.teardown();
                             }
@@ -404,18 +457,45 @@ impl FrpsServer {
     }
 }
 
+/// Self-signed pair used when no usable certificate is configured, matching
+/// what frp itself does in that case.
+fn ephemeral_self_signed() -> Result<(String, String)> {
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
+    Ok((cert.cert.pem(), cert.key_pair.serialize_pem()))
+}
+
 async fn build_tls_acceptor(cfg: &FrpsConfig) -> Result<tokio_rustls::TlsAcceptor> {
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let (cert_pem, key_pem) = match (&cfg.tls_cert_path, &cfg.tls_key_path) {
-        (Some(c), Some(k)) if !c.is_empty() && !k.is_empty() => {
-            (std::fs::read_to_string(c)?, std::fs::read_to_string(k)?)
+    // A configured-but-unreadable certificate must not stop the server: the
+    // console can generate or upload one, so until then frps keeps serving on
+    // an ephemeral self-signed pair rather than failing to start.
+    let configured = match (&cfg.tls_cert_path, &cfg.tls_key_path) {
+        (Some(c), Some(k)) if !c.is_empty() && !k.is_empty() => Some((c.as_str(), k.as_str())),
+        _ => None,
+    };
+    let (cert_pem, key_pem) = match configured {
+        Some((cert_path, key_path)) => {
+            match (
+                std::fs::read_to_string(cert_path),
+                std::fs::read_to_string(key_path),
+            ) {
+                (Ok(cert), Ok(key)) => (cert, key),
+                (cert_res, key_res) => {
+                    if let Err(e) = cert_res {
+                        tracing::warn!("frps: cannot read TLS certificate {cert_path}: {e}");
+                    }
+                    if let Err(e) = key_res {
+                        tracing::warn!("frps: cannot read TLS key {key_path}: {e}");
+                    }
+                    tracing::warn!("frps: using an ephemeral self-signed certificate instead");
+                    ephemeral_self_signed()?
+                }
+            }
         }
-        _ => {
-            // Match frp: generate an ephemeral self-signed pair.
+        None => {
             tracing::info!("frps: no TLS cert configured, generating ephemeral self-signed certificate");
-            let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])?;
-            (cert.cert.pem(), cert.key_pair.serialize_pem())
+            ephemeral_self_signed()?
         }
     };
 
@@ -440,6 +520,17 @@ async fn handle_accepted(
     tls: Arc<tokio_rustls::TlsAcceptor>,
 ) -> Result<()> {
     let cfg_mux = shared.cfg.try_read().map(|c| c.tcp_mux).unwrap_or(true);
+
+    // Clients from frp 0.52 on send no application-level heartbeat, so a half-dead
+    // peer (vanished host, dropped NAT mapping) would otherwise hold a control
+    // connection forever. TCP keepalive lets the kernel reap it; the timing is
+    // sysctl-driven on OpenBSD, so this only turns the probe on.
+    {
+        let sock = socket2::SockRef::from(&stream);
+        if let Err(e) = sock.set_keepalive(true) {
+            tracing::debug!("frps: could not enable tcp keepalive: {e}");
+        }
+    }
 
     // sniff first byte (frp custom TLS marker is 0x17; a standard TLS
     // ClientHello starts with 0x16 — both must upgrade to TLS)
@@ -497,7 +588,20 @@ async fn handle_accepted(
         // Remaining inbound streams are work conns.
         let work_shared = shared.clone();
         let stream_fwd = tokio::spawn(async move {
-            while let Some(s) = inbound_rx.recv().await {
+            while let Some(mut s) = inbound_rx.recv().await {
+                // rust-yamux acknowledges an inbound stream only when the
+                // application first *writes* to it. A pooled work connection
+                // carries no server→client bytes until a user connects, so
+                // without this nudge the peer's `openStream` never completes and
+                // hashicorp/yamux aborts the whole session ("aborted stream open:
+                // i/o deadline reached") — frpc then reconnects every ~75s.
+                // An empty write emits the zero-length ACK-flagged data frame
+                // that acknowledges the stream.
+                let _ = futures_util::future::poll_fn(|cx| {
+                    std::pin::Pin::new(&mut s).poll_write(cx, &[])
+                })
+                .await;
+
                 let shared = work_shared.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_work_io_tagged(shared, Box::new(s.compat())).await {
@@ -552,8 +656,18 @@ async fn handle_work_io_with_frame(
     let Some(state) = state else {
         bail!("work conn for unknown run_id {}", nwc.run_id);
     };
-    if !nwc.privilege_key.is_empty() && !shared.auth_ok(nwc.timestamp, &nwc.privilege_key) {
-        bail!("work conn privilege key invalid for run_id {}", nwc.run_id);
+    // frpc sends the same md5(token+ts) credential on work conns once a token is
+    // configured; a wrong one is rejected outright, and a missing one is at
+    // least surfaced (some client versions omit it, so it stays accepted).
+    if !nwc.privilege_key.is_empty() {
+        if !shared.auth_ok(nwc.timestamp, &nwc.privilege_key) {
+            bail!("work conn privilege key invalid for run_id {}", nwc.run_id);
+        }
+    } else if !shared.token_is_empty() {
+        tracing::debug!(
+            "frps: work conn for run_id {} arrived without a privilege key",
+            nwc.run_id
+        );
     }
     state.touch();
     let _ = state.work_tx.send(io).await;
@@ -578,13 +692,21 @@ async fn run_control_with_login(
         bail!("first control message is not Login (type {tb:#04x})");
     }
     let login: msg::Login = serde_json::from_slice(&body)?;
-    shared.stats.total_logins.fetch_add(1, Ordering::Relaxed);
 
     if !shared.auth_ok(login.timestamp, &login.privilege_key) {
         let resp = msg::LoginResp { error: "authentication failed".into(), ..Default::default() };
         let _ = msg::write_msg(&mut io, &resp, msg::TYPE_LOGIN_RESP).await;
+        // Make sure the reason reaches the client. Over a yamux session the
+        // frame is queued to the connection's driver, and returning here drops
+        // the session — frpc would report a bare EOF instead of the reason. So
+        // close the stream (which also ACKs it) and give the driver a moment.
+        let _ = tokio::time::timeout(Duration::from_secs(2), io.shutdown()).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
         bail!("frps login auth failed for user {:?}", login.user);
     }
+    // Counted only once the credential checked out, so a wrong token does not
+    // inflate the console's login total.
+    shared.stats.total_logins.fetch_add(1, Ordering::Relaxed);
 
     let run_id = if login.run_id.is_empty() { uuid::Uuid::new_v4().to_string() } else { login.run_id.clone() };
 
@@ -605,15 +727,24 @@ async fn run_control_with_login(
 
     shared.stats.clients_online.fetch_add(1, Ordering::Relaxed);
 
-    let reply_privkey = login.privilege_key.clone();
-    let reply = msg::LoginResp { version: "0.61.0".into(), run_id: run_id.clone(), error: String::new() };
+    // Advertise the protocol generation, not a release number: this server
+    // implements the classic V1 wire protocol that frpc still selects by
+    // default (`transport.wireProtocol = "v1"`), and clients up to 0.51.3 only
+    // speak that.
+    let reply = msg::LoginResp { version: "0.51.3".into(), run_id: run_id.clone(), error: String::new() };
     msg::write_msg(&mut io, &reply, msg::TYPE_LOGIN_RESP).await?;
     tracing::info!("frps client logged in: user={:?} run_id={run_id} pool={}", login.user, login.pool_count);
 
     // Everything after LoginResp travels through the golib-compatible CFB
-    // stream. Release frpc binaries derive the key from the login
-    // privilege key (md5(token+ts)), which we just validated.
-    let io = crypto::CryptoStream::new(io, cfg.token.as_bytes());
+    // stream, keyed by the server token — the same value frpc derives from
+    // (see crypto::derive_key; the salt is frp's, configurable for pre-0.44
+    // clients).
+    let io = crypto::CryptoStream::with_salt(
+        io,
+        cfg.token.as_bytes(),
+        None,
+        cfg.crypto_salt.as_bytes(),
+    );
 
     let state = Arc::new(ControlState {
         run_id: run_id.clone(),
@@ -622,7 +753,9 @@ async fn run_control_with_login(
         work_tx,
         work_rx: AsyncMutex::new(work_rx),
         last_active: AtomicU64::new(now_secs()),
+        enforce_idle: client_sends_heartbeats(&login.version),
         token: token.clone(),
+        online: AtomicBool::new(true),
         stats: shared.stats.clone(),
         proxies: Mutex::new(HashMap::new()),
         shared: shared.clone(),
@@ -828,11 +961,13 @@ async fn bridge_tcp_user(
     let (mut ur, mut uw) = tokio::io::split(user);
     let (mut wr, mut ww) = tokio::io::split(work);
 
-    let b_in = Arc::new(AtomicU64::new(0));
-    let b_out = Arc::new(AtomicU64::new(0));
+    // Feed the server-wide totals rather than throwaway counters, so the
+    // console's traffic figures cover tcp proxies (the common case), not only udp.
+    let c_in = state.stats.bytes_in.clone();
+    let c_out = state.stats.bytes_out.clone();
 
-    let t1 = tokio::spawn(async move { pump(&mut wr, &mut uw, b_in).await });
-    let t2 = tokio::spawn(async move { pump(&mut ur, &mut ww, b_out).await });
+    let t1 = tokio::spawn(async move { pump(&mut wr, &mut uw, c_in).await });
+    let t2 = tokio::spawn(async move { pump(&mut ur, &mut ww, c_out).await });
     let _ = t1.await;
     let _ = t2.await;
     Ok(())
@@ -894,6 +1029,8 @@ async fn start_udp_proxy(state: Arc<ControlState>, np: msg::NewProxy) {
 
     let ptk = state.token.child_token();
     state.proxies.lock().unwrap().insert(np.proxy_name.clone(), ptk.clone());
+    // the udp task needs the name for StartWorkConn (see below)
+    let proxy_name = np.proxy_name.clone();
     state.stats.set_proxy(ProxyInfo {
         proxy_name: np.proxy_name.clone(),
         proxy_type: "udp".into(),
@@ -910,6 +1047,20 @@ async fn start_udp_proxy(state: Arc<ControlState>, np: msg::NewProxy) {
                 Ok(w) => w,
                 Err(_) => { tokio::time::sleep(Duration::from_secs(2)).await; continue; }
             };
+            // frpc activates its udp proxy only when it reads StartWorkConn on a
+            // work connection (its `handleReqWorkConn` waits for that message and
+            // then hands the connection to the proxy's datagram loops), so unlike
+            // frp — which sends it from `GetWorkConnFromPool` for every proxy —
+            // this must precede the first UdpPacket or every datagram is dropped.
+            let swc = msg::StartWorkConn {
+                proxy_name: proxy_name.clone(),
+                ..Default::default()
+            };
+            if let Err(e) = msg::write_msg(&mut work, &swc, msg::TYPE_START_WORK_CONN).await {
+                tracing::debug!("frps udp proxy: start work conn failed: {e:#}");
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                continue;
+            }
             let (mut wr, mut ww) = tokio::io::split(work);
             let sock_a = socket.clone();
             let sock_b = socket.clone();
@@ -925,12 +1076,37 @@ async fn start_udp_proxy(state: Arc<ControlState>, np: msg::NewProxy) {
                         _ = ptk2.cancelled() => break,
                         frame = msg::read_frame(&mut wr) => {
                             let Ok((tb, body)) = frame else { break };
-                            if tb != msg::TYPE_UDP_PACKET { break; }
-                            let Ok(pkt) = serde_json::from_slice::<msg::UdpPacket>(&body) else { break };
-                            let Ok(content) = pkt.content() else { break };
-                            let Some(remote) = pkt.remote_socket_addr() else { continue };
+                            // frpc keeps a udp work conn alive with a Ping every
+                            // 30s (its udp proxy leaves the stream framed, unlike
+                            // the tcp path) — dropping the tunnel on one would
+                            // break every udp proxy three times a minute.
+                            if tb == msg::TYPE_PING { continue; }
+                            if tb != msg::TYPE_UDP_PACKET {
+                                tracing::debug!("frps udp work conn: unexpected frame type {tb:#04x}");
+                                break;
+                            }
+                            let Ok(pkt) = serde_json::from_slice::<msg::UdpPacket>(&body) else {
+                                tracing::debug!(
+                                    "frps udp work conn: unparsable packet: {}",
+                                    String::from_utf8_lossy(&body)
+                                );
+                                break;
+                            };
+                            let Ok(content) = pkt.content() else {
+                                tracing::debug!("frps udp work conn: bad base64 content");
+                                break;
+                            };
+                            let Some(remote) = pkt.remote_socket_addr() else {
+                                tracing::debug!(
+                                    "frps udp work conn: packet without a usable destination: {}",
+                                    String::from_utf8_lossy(&body)
+                                );
+                                continue;
+                            };
                             bytes_in.fetch_add(content.len() as u64, Ordering::Relaxed);
-                            let _ = sock_a.send_to(&content, remote).await;
+                            if let Err(e) = sock_a.send_to(&content, remote).await {
+                                tracing::debug!("frps udp proxy: send to {remote} failed: {e}");
+                            }
                         }
                     }
                 }

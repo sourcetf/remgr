@@ -6234,11 +6234,13 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1",
+ "socket2 0.5.10",
  "thiserror 2.0.20",
  "tokio",
  "tokio-rustls",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "yamux",
 ]
