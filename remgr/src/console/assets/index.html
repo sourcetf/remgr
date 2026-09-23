@@ -306,20 +306,17 @@ function F(label, path, hint='', type='text'){
 }
 const SCHEMAS = {
   easytier: [
-    ['开关', [['enabled','启用模块','',['checkbox']]],
-    ['easytier-web', [
-      ['enabled','(同上)','','hidden'],
-      ['config_server_port','配置服务器端口 (UDP)','实例注册端口',['number']],
-      ['api_addr','REST API 绑定地址',''],
-      ['api_port','REST API 端口','控制台会代理到 /et',['number']],
-      ['db_path','数据库路径','']],
-    ['本地中心节点', [
-      ['node_enabled','启用本地节点','',['checkbox']],
-      ['node_name','节点名称',''],
-      ['network_name','网络名称 (Network Name)',''],
-      ['network_secret','网络密钥 (Network Secret)',''],
-      ['virtual_ipv4','虚拟 IPv4 (留空=DHCP)','例如 10.126.126.1'],
-      ['listeners','监听器 (每行一个 URL)','tcp://0.0.0.0:11010 等','textarea']],
+    [['enabled','启用模块','',['checkbox']]],
+    [['config_server_port','配置服务器端口 (UDP)','实例注册端口',['number']]],
+    [['api_addr','REST API 绑定地址','']],
+    [['api_port','REST API 端口','控制台会代理到 /et',['number']]],
+    [['db_path','数据库路径','']],
+    [['node_enabled','启用本地节点','',['checkbox']]],
+    [['node_name','节点名称','']],
+    [['network_name','网络名称 (Network Name)','']],
+    [['network_secret','网络密钥 (Network Secret)','']],
+    [['virtual_ipv4','虚拟 IPv4 (留空=DHCP)','例如 10.126.126.1']],
+    [['listeners','监听器 (每行一个 URL)','tcp://0.0.0.0:11010 等','textarea']],
   ],
   stun_turn: [
     [['enabled','启用模块','',['checkbox']]],
@@ -353,10 +350,14 @@ const SCHEMAS = {
 
 function flattenSchema(svc){
   // returns [{path, label, hint, widget}]
+  // The schemas spell widgets as ['checkbox'] / ['number'] / ['textarea'];
+  // unwrap that so callers can compare against a plain string, otherwise every
+  // field falls back to a text input and booleans/numbers are sent as strings.
+  const norm=(w)=>Array.isArray(w)?(w[0]||"text"):(w||"text");
   const out=[];
   for(const item of SCHEMAS[svc]||[]){
-    if(Array.isArray(item[0])){ out.push(...item.map(x=>({path:x[0],label:x[1],hint:x[2]||'',widget:x[3]||'text'}))); }
-    else { out.push({path:item[0],label:item[1],hint:item[2]||'',widget:item[3]||'text'}); }
+    if(Array.isArray(item[0])){ out.push(...item.map(x=>({path:x[0],label:x[1],hint:x[2]||'',widget:norm(x[3])}))); }
+    else { out.push({path:item[0],label:item[1],hint:item[2]||'',widget:norm(item[3])}); }
   }
   return out;
 }
@@ -377,7 +378,14 @@ function openConfig(svc){
     const type = f.widget==='number' ? 'number' : 'text';
     return `<div class="fg"><label>${f.label}</label><input type="${type}" data-path="${f.path}" value="${v!==undefined&&v!==null?String(v).replace(/"/g,'&quot;'):''}">${f.hint?`<div class="hint">${f.hint}</div>`:''}</div>`;
   }).join('');
-  document.getElementById('modal-body').innerHTML=fields;
+  // A certificate is what TURN-over-TLS needs; offer to mint one for the
+  // domain entered above, or to install an existing pair (e.g. a real CA cert).
+  const certRow = svc==='stun_turn'
+    ? `<div class="row" style="margin-top:12px"><button class="btn" onclick="genCert('turn')">🔐 生成自签证书</button>
+       <button class="btn" onclick="uploadCert('turn')">📥 上传证书</button>
+       <span class="hint" style="margin-left:8px">生成按上方「域名」，或粘贴已有 PEM，写入 cert_path / key_path</span></div>`
+    : '';
+  document.getElementById('modal-body').innerHTML=fields+certRow;
   document.getElementById('modal').classList.remove('hidden');
 }
 function closeModal(){document.getElementById('modal').classList.add('hidden')}
@@ -408,11 +416,27 @@ async function saveModal(){
 
 /* ---------- certs ---------- */
 async function genCert(svc){
-  const domain=prompt('证书域名 (CN/SAN):', location.hostname||'remgr.local');
+  // Prefer the domain already typed in the open config modal, so generating a
+  // certificate uses exactly the name that will be saved.
+  const domField=document.querySelector('#modal-body [data-path="domain"]');
+  let domain=domField?domField.value.trim():'';
+  if(!domain) domain=prompt('证书域名 (CN/SAN):', location.hostname||'remgr.local');
   if(!domain) return;
   try{
     const r=await api('/api/system/certs/generate','POST',{service:svc,domain});
     toast('证书已生成: '+r.cert_path);
+    await refreshAll();
+  }catch(e){toast(e.message,false)}
+}
+
+async function uploadCert(svc){
+  const cert=prompt('粘贴证书 PEM（包含 BEGIN CERTIFICATE）:');
+  if(!cert) return;
+  const key=prompt('粘贴私钥 PEM（包含 PRIVATE KEY）:');
+  if(!key) return;
+  try{
+    const r=await api('/api/system/certs/upload','POST',{service:svc,cert_pem:cert,key_pem:key});
+    toast('证书已写入: '+r.cert_path);
     await refreshAll();
   }catch(e){toast(e.message,false)}
 }
