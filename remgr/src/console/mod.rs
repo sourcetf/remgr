@@ -348,6 +348,22 @@ async fn console_apply(State(state): State<Arc<AppState>>) -> Response {
             }))
             .into_response()
         }
+        Err(e) if is_addr_in_use(&e) && *state.console_serving_port.lock().unwrap() == Some(cfg.port) => {
+            // Switching the scheme on the port the console is already serving:
+            // the old listener holds it, so nothing can be bound up front. Ask the
+            // serve loop to stop; it re-prepares from the (already saved) config,
+            // so the same settings — with the new scheme — come back up. That also
+            // means a failure here cannot strand the console: the loop falls back
+            // to the settings that last worked.
+            if let Some(tx) = state.console_stop.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            Json(json!({
+                "ok": true,
+                "note": "same port: the console is briefly unavailable while it changes scheme; reload in a moment",
+            }))
+            .into_response()
+        }
         Err(e) => api_error(
             StatusCode::BAD_REQUEST,
             &format!("cannot apply console settings: {e:#}"),
@@ -358,7 +374,10 @@ async fn console_apply(State(state): State<Arc<AppState>>) -> Response {
 /// Bind the console listening socket and, when TLS is enabled, load its key pair.
 pub async fn prepare_console(cfg: &crate::config::ConsoleConfig) -> anyhow::Result<PreparedConsole> {
     let addr: std::net::SocketAddr = format!("0.0.0.0:{}", cfg.port).parse()?;
-    let listener = std::net::TcpListener::bind(addr).map_err(|e| anyhow::anyhow!("bind {addr}: {e}"))?;
+    // keep the io::Error intact (downcast_ref in the caller distinguishes "port
+    // taken" — possibly by our own listener — from anything else)
+    let listener = std::net::TcpListener::bind(addr)
+        .map_err(|e| anyhow::Error::new(e).context(format!("bind {addr}")))?;
     listener.set_nonblocking(true)?;
     if cfg.tls {
         let tls = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cfg.tls_cert, &cfg.tls_key)
@@ -375,6 +394,13 @@ pub async fn prepare_console(cfg: &crate::config::ConsoleConfig) -> anyhow::Resu
     Ok(PreparedConsole::Plain(listener))
 }
 
+/// Was this failure the kernel refusing our bind because the address is taken?
+fn is_addr_in_use(e: &anyhow::Error) -> bool {
+    e.chain()
+        .filter_map(|c| c.downcast_ref::<std::io::Error>())
+        .any(|io| io.kind() == std::io::ErrorKind::AddrInUse)
+}
+
 /// Serve the console until the process exits, rebinding whenever
 /// [`console_apply`] hands over a freshly prepared listener.
 ///
@@ -382,32 +408,67 @@ pub async fn prepare_console(cfg: &crate::config::ConsoleConfig) -> anyhow::Resu
 /// taken) must not take the service down — the console then serves plain HTTP
 /// on the configured port so the operator can still reach it and fix the cause.
 pub async fn serve_console(state: Arc<AppState>) -> anyhow::Result<()> {
+    // The settings that last bound successfully. They are the final fallback, so
+    // a configuration that cannot listen (port stolen, certificate broken) can
+    // never take the console away entirely.
+    let mut last_good: Option<crate::config::ConsoleConfig> = None;
     loop {
         let cfg = state.config_blocking().console;
         let prepared = match state.console_pending.lock().unwrap().take() {
-            Some(p) => p,
-            None => match prepare_console(&cfg).await {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::error!("console settings unusable: {e:#}");
-                    let mut fallback = cfg.clone();
-                    fallback.tls = false;
-                    match prepare_console(&fallback).await {
-                        Ok(p) => {
-                            tracing::warn!(
-                                "console serving plain HTTP on :{} — correct the settings, then apply again",
-                                cfg.port
-                            );
-                            p
-                        }
-                        Err(e2) => {
-                            tracing::error!("console cannot listen: {e2:#}; retrying in 5s");
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                            continue;
+            Some(p) => Some(p),
+            None => {
+                let mut chosen = None;
+                match prepare_console(&cfg).await {
+                    Ok(p) => {
+                        last_good = Some(cfg.clone());
+                        chosen = Some(p);
+                    }
+                    Err(e) => {
+                        tracing::error!("console settings unusable: {e:#}");
+                        // TLS material missing/corrupt: serve plain HTTP on the
+                        // requested port rather than not serving at all.
+                        let mut plain = cfg.clone();
+                        plain.tls = false;
+                        match prepare_console(&plain).await {
+                            Ok(p) => {
+                                tracing::warn!(
+                                    "console serving plain HTTP on :{} — correct the settings, then apply again",
+                                    cfg.port
+                                );
+                                chosen = Some(p);
+                            }
+                            Err(e2) => {
+                                tracing::error!("console cannot listen with the new settings: {e2:#}");
+                            }
                         }
                     }
                 }
-            },
+                if chosen.is_none() {
+                    // Last resort: whatever worked before this change.
+                    if let Some(good) = last_good.clone() {
+                        match prepare_console(&good).await {
+                            Ok(p) => {
+                                tracing::error!(
+                                    "console restored on :{} with the previous settings — \
+                                     the new ones could not be applied",
+                                    good.port
+                                );
+                                chosen = Some(p);
+                            }
+                            Err(e3) => {
+                                tracing::error!("previous settings no longer bind either: {e3:#}");
+                            }
+                        }
+                    }
+                }
+                chosen
+            }
+        };
+
+        let Some(prepared) = prepared else {
+            tracing::error!("console cannot listen at all; retrying in 5s");
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            continue;
         };
 
         let app = router(state.clone());
@@ -418,6 +479,7 @@ pub async fn serve_console(state: Arc<AppState>) -> anyhow::Result<()> {
             PreparedConsole::Plain(listener) => {
                 let listener = tokio::net::TcpListener::from_std(listener)?;
                 let local = listener.local_addr().map(|a| a.to_string()).unwrap_or_default();
+                *state.console_serving_port.lock().unwrap() = local.rsplit(':').next().and_then(|p| p.parse().ok());
                 tracing::info!("console listening on http://{local}");
                 if let Err(e) = axum::serve(listener, app)
                     .with_graceful_shutdown(async move {
@@ -437,6 +499,7 @@ pub async fn serve_console(state: Arc<AppState>) -> anyhow::Result<()> {
                     shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(3)));
                 });
                 let local = listener.local_addr().map(|a| a.to_string()).unwrap_or_default();
+                *state.console_serving_port.lock().unwrap() = local.rsplit(':').next().and_then(|p| p.parse().ok());
                 tracing::info!("console listening on https://{local}");
                 if let Err(e) = axum_server::from_tcp_rustls(listener, tls)
                     .handle(handle)

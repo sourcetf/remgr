@@ -14,11 +14,57 @@ mod secure;
 mod state;
 
 use anyhow::Result;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(not(unix))]
 use std::time::Duration;
 
 use state::AppState;
+
+/// Names the console certificate should cover: the host name plus the addresses
+/// this machine answers on (loopback and the interface the default route uses).
+fn console_cert_names() -> Vec<String> {
+    fn add(names: &mut Vec<String>, n: String) {
+        if !n.is_empty() && !names.contains(&n) {
+            names.push(n);
+        }
+    }
+
+    let mut names: Vec<String> = Vec::new();
+
+    // host name (gethostname(3); HOSTNAME is not exported by default on OpenBSD)
+    #[cfg(unix)]
+    {
+        let mut buf = [0u8; 256];
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
+        if rc == 0 {
+            let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
+            if let Ok(h) = std::str::from_utf8(&buf[..end]) {
+                let h = h.trim().trim_end_matches(".").to_string();
+                // a default "localhost" says nothing about how the box is reached
+                if h != "localhost" {
+                    add(&mut names, h);
+                }
+            }
+        }
+    }
+    add(&mut names, "localhost".to_string());
+    add(&mut names, "127.0.0.1".to_string());
+    add(&mut names, "::1".to_string());
+
+    // the address a default route would use — the usual way this box is reached
+    if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+        for target in ["8.8.8.8:80", "1.1.1.1:80"] {
+            if sock.connect(target).is_ok() {
+                if let Ok(addr) = sock.local_addr() {
+                    add(&mut names, addr.ip().to_string());
+                    break;
+                }
+            }
+        }
+    }
+    names
+}
 
 fn main() {
     let mut config_path = config::default_config_path();
@@ -112,6 +158,41 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
         }
     }
 
+    // console TLS bootstrap: a fresh install must not serve the admin console
+    // over plain HTTP. A P-384 self-signed certificate is minted on first start
+    // (the file's absence is the "first start" marker — once it exists, an
+    // operator who turns TLS off is taken at their word), pointing at the host
+    // name and the addresses this box answers on, and TLS is switched on.
+    if !cfg.console.tls && !Path::new(&cfg.console.tls_cert).exists() {
+        let names = console_cert_names();
+        let cn = names.first().cloned().unwrap_or_else(|| "remgr.local".into());
+        let dir = cfg
+            .console
+            .tls_cert
+            .rsplit_once('/')
+            .map(|(d, _)| PathBuf::from(d))
+            .unwrap_or_else(|| PathBuf::from("/etc/remgr/ssl"));
+        match certs::generate_service_cert_names(&dir, "console", &names, &cn, 825) {
+            Ok((cert_path, key_path)) => {
+                cfg.console.tls = true;
+                cfg.console.tls_cert = cert_path.display().to_string();
+                cfg.console.tls_key = key_path.display().to_string();
+                cfg.save()?;
+                tracing::info!(
+                    "console: generated a P-384 self-signed certificate (SANs: {}) at {} — \
+                     the browser will warn until a real certificate is installed, which the \
+                     系统/系统设置 page can upload",
+                    names.join(", "),
+                    cert_path.display()
+                );
+            }
+            Err(e) => tracing::error!(
+                "console: could not generate a TLS certificate ({e:#}); serving plain HTTP — \
+                 upload a certificate from the console and enable TLS there"
+            ),
+        }
+    }
+
     // Platform resources that need unrestricted syscalls must be acquired
     // before the sandbox locks down. On OpenBSD this opens the routing
     // socket, which pledge(2) would otherwise refuse to create.
@@ -119,7 +200,7 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
 
     // pledge/unveil: everything above needed the filesystem we are about to lock.
     secure::apply()?;
-    let state = AppState::new(cfg);
+    let state = AppState::new(cfg, hub.clone());
     if let Some(pw) = &initial_password {
         tracing::warn!("initial console password: {pw}  (also written to /var/run/remgr/initial_password)");
         println!("initial console password: {pw}");
@@ -168,8 +249,7 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
     Ok(())
 }
 
-async fn wait_for_shutdown_signal() {
-    #[cfg(unix)]
+async fn wait_for_shutdown_signal() {    #[cfg(unix)]
     {
         use tokio::signal::unix::{signal, SignalKind};
         let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");

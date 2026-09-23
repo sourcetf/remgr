@@ -39,7 +39,7 @@ Web 控制台（axum + 内嵌 SPA）：每个服务的全部可配置项、启�
 
 | 端口 | 服务 |
 |---|---|
-| 9443 | Web 控制台（`/et` 为 easytier-web REST API 的同源反代） |
+| 9443 | Web 控制台 **HTTPS**（首次启动自签 P-384 证书；`/et` 为 easytier-web REST API 的同源反代） |
 | 3478 | STUN / TURN（UDP） |
 | 5349 | TURN over TLS（需证书；`tls_port = 0` 关闭） |
 | 22020 | EasyTier 配置服务器（UDP） |
@@ -65,13 +65,15 @@ rcctl set remgr status on
 rcctl start remgr
 ```
 
-控制台默认 `http://<host>:9443`；首次启动生成随机管理口令，写入 syslog 与 `/var/run/remgr/initial_password`（0600）。
+控制台默认 **`https://<host>:9443`**：首次启动会自签一张 P-384 证书（SAN 含主机名、`localhost`、回环地址与本机出站 IP），并把 `[console] tls` 打开；自签名证书浏览器会提示不受信任，接受即可，或在控制台「系统」页上传正式证书（生成/上传后路径会自动写入配置）。首次启动同时生成随机管理口令，写入 syslog 与 `/var/run/remgr/initial_password`（0600）。
 
 ## EasyTier 仪表盘（easytier-web）
 
-嵌入式 easytier-web 的完整仪表盘由 REST API 同源提供，控制台以 `/et/` 反代，从控制台 EasyTier 页即可打开：**`http://<host>:9443/et/`**。
+嵌入式 easytier-web 的完整仪表盘由 REST API 同源提供，控制台以 `/et/` 反代，从控制台 EasyTier 页即可打开：**`https://<host>:9443/et/`**（控制台已是 HTTPS）。
 
-- 登录账户为 `admin`。easytier-web 的迁移只预置一个未公开的哈希，ReMgr 在首次启动时把它替换为随机口令，写入 syslog 与 `/var/run/remgr/easytier_dashboard_password`（0600）；此后不再改动，可在仪表盘内自行修改。
+- 登录账户为 `admin`，口令写入 syslog 与 `/var/run/remgr/easytier_dashboard_password`（0600），可在仪表盘内自行修改。
+- 注意：仪表盘前端会先对输入的密码做 **MD5** 再提交（`frontend/src/modules/api.ts` 的 `Md5.hashStr`），后端存的是该摘要的 argon2 哈希，所以用 API 直接登录时 `password` 字段要填 `md5(明文)` 而不是明文。ReMgr 的引导流程按同样约定安装凭据，并在每次启动时校验它是否仍然可用（数据库被重建、或旧版本装错了哈希时会自动重新生成）。
+- 上游迁移还预置了一个密码为 `user` 的 demo 账户；ReMgr 检测到它仍是默认口令时会轮换为随机口令，写入 `/var/run/remgr/easytier_dashboard_password_user`（0600）。
 - 本地中心节点以 `admin` 账户注册到内置配置服务器，因此会作为一台设备出现在仪表盘中，可直接在其中管理网络实例——与在控制台里改 `[easytier]` 是同一个进程、同一个 `NativeInstanceManager`。
 - 仪表盘只监听 `api_addr:api_port`（默认 `127.0.0.1:11211`），对外仅通过控制台的 `/et/` 暴露；不要把 11211 直接暴露到公网。
 

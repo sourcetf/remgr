@@ -52,6 +52,8 @@ url = "2"
 easytier = { path = "../third_party/easytier/easytier", default-features = false, features = ["full", "management", "management-rpc"] }
 easytier-web = { path = "../third_party/easytier/easytier-web", default-features = false, features = ["embed"] }
 password-auth = "1.0.0"
+# the dashboard API takes md5(password) as the credential (see frontend api.ts)
+md-5 = "0.10"
 # RustDesk hbbs/hbbr as a library (vendored rustdesk-server 1.1.17)
 hbbs = { path = "../third_party/rustdesk-server" }
 # TURN relay (pure Rust, RFC 5766); `metrics` exposes per-allocation byte counters

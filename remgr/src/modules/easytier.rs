@@ -182,15 +182,56 @@ impl super::ServiceModule for EasyTierModule {
         //
         // The easytier-web migration seeds an `admin` user with a fixed hash
         // whose plaintext is not published, so the embedded dashboard has no
-        // usable login until the password is replaced. On first boot — no
-        // password file yet — a fresh random password is hashed into that
-        // account and written root-only; once the file exists the operator has
-        // been given a working credential and may have changed it from the
-        // dashboard, so it is left alone.
+        // usable login until the password is replaced.
+        //
+        // The dashboard hashes what the operator types with MD5 before sending it
+        // (`frontend/src/modules/api.ts`: `Md5.hashStr(data.password)`), and the
+        // backend then stores/verifies the argon2 hash *of that digest* — so a
+        // credential is only usable when it is installed the same way. Hashing the
+        // plaintext here (which this used to do) produces an account nobody can
+        // log into.
+        //
+        // The file records whether a credential has been handed out, and its value
+        // is checked against the stored hash on every start: if it no longer
+        // authenticates — the database was recreated, or an older build installed
+        // the wrong hash — a fresh one is generated instead of leaving the
+        // dashboard permanently unreachable.
         {
             let db = web.db.clone();
             const PW_FILE: &str = "/var/run/remgr/easytier_dashboard_password";
-            if !std::path::Path::new(PW_FILE).exists() {
+
+            // md5 hex of the password, exactly what the dashboard frontend sends
+            fn dashboard_credential(password: &str) -> String {
+                use md5::{Digest, Md5};
+                let mut h = Md5::new();
+                h.update(password.as_bytes());
+                format!("{:x}", h.finalize())
+            }
+
+            let existing = std::fs::read_to_string(PW_FILE)
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            let mut usable = false;
+            if let Some(pw) = existing.clone() {
+                if let Ok(Some(hash)) = db.get_user_password_hash("admin").await {
+                    let digest = dashboard_credential(&pw);
+                    usable = tokio::task::spawn_blocking(move || {
+                        password_auth::verify_password(&digest, &hash).is_ok()
+                    })
+                    .await
+                    .unwrap_or(false);
+                    if !usable {
+                        tracing::warn!(
+                            "easytier: the stored dashboard password no longer matches the \
+                             database — generating a new one"
+                        );
+                    }
+                }
+            }
+
+            if !usable {
                 let password: String = {
                     use rand::Rng;
                     const ALPH: &[u8] = b"abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789";
@@ -199,9 +240,10 @@ impl super::ServiceModule for EasyTierModule {
                         .map(|_| ALPH[rng.gen_range(0..ALPH.len())] as char)
                         .collect()
                 };
+                let digest = dashboard_credential(&password);
                 match tokio::task::spawn_blocking({
-                    let pw = password.clone();
-                    move || password_auth::generate_hash(&pw)
+                    let d = digest.clone();
+                    move || password_auth::generate_hash(&d)
                 })
                 .await
                 {
@@ -228,8 +270,9 @@ impl super::ServiceModule for EasyTierModule {
                                     );
                                 }
                                 tracing::warn!(
-                                    "easytier dashboard initial password: {password}  \
-                                     (user admin, also in {PW_FILE})"
+                                    "easytier dashboard password: {password}  \
+                                     (user admin, also in {PW_FILE}; API clients must send \
+                                     md5(password) — the dashboard does this itself)"
                                 );
                             }
                             Err(e) => {
@@ -238,6 +281,57 @@ impl super::ServiceModule for EasyTierModule {
                         }
                     }
                     Err(e) => tracing::warn!("easytier: password hash task failed: {e}"),
+                }
+            }
+
+            // The migration also seeds a demo account whose password is literally
+            // "user", i.e. a working default credential on every fresh install.
+            // Rotate it as well, but only while it still carries that default —
+            // an operator who set something else keeps their choice.
+            const DEMO_FILE: &str = "/var/run/remgr/easytier_dashboard_password_user";
+            let demo_default = {
+                let digest = dashboard_credential("user");
+                match db.get_user_password_hash("user").await {
+                    Ok(Some(hash)) => tokio::task::spawn_blocking(move || {
+                        password_auth::verify_password(&digest, &hash).is_ok()
+                    })
+                    .await
+                    .unwrap_or(false),
+                    _ => false,
+                }
+            };
+            if demo_default {
+                let password: String = {
+                    use rand::Rng;
+                    const ALPH: &[u8] = b"abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789";
+                    let mut rng = rand::thread_rng();
+                    (0..14)
+                        .map(|_| ALPH[rng.gen_range(0..ALPH.len())] as char)
+                        .collect()
+                };
+                let digest = dashboard_credential(&password);
+                match tokio::task::spawn_blocking(move || password_auth::generate_hash(&digest)).await
+                {
+                    Ok(hash) => match db.set_user_password("user", hash).await {
+                        Ok(_) => {
+                            let _ = std::fs::write(DEMO_FILE, format!("{password}\n"));
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::fs::PermissionsExt;
+                                let _ = std::fs::set_permissions(
+                                    DEMO_FILE,
+                                    std::fs::Permissions::from_mode(0o600),
+                                );
+                            }
+                            tracing::warn!(
+                                "easytier: the seeded demo account \"user\" had the default \
+                                 password — replaced with a random one (user: {password}, also in \
+                                 {DEMO_FILE}); use the admin account for the dashboard"
+                            );
+                        }
+                        Err(e) => tracing::warn!("easytier: could not rotate the demo account: {e}"),
+                    },
+                    Err(e) => tracing::warn!("easytier: demo password hash task failed: {e}"),
                 }
             }
         }

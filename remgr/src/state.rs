@@ -39,12 +39,19 @@ pub struct AppState {
     pub console_stop: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     /// Listener handed to the next console serve loop iteration.
     pub console_pending: Mutex<Option<PreparedConsole>>,
+    /// Port the console is serving on right now, so `console_apply` can tell
+    /// "the port I want is held by me" (a scheme switch) from "held by someone
+    /// else" (an error the caller should see).
+    pub console_serving_port: Mutex<Option<u16>>,
 }
 
 impl AppState {
-    pub fn new(config: Config) -> Arc<Self> {
+    /// `logs` must be the hub `logging::init` was given: the console serves the
+    /// ring buffer and the live WebSocket from it. Creating a second hub here
+    /// (as this used to) left the log view and its stream permanently empty
+    /// while every line went to the other instance's ring and file.
+    pub fn new(config: Config, logs: Arc<LogHub>) -> Arc<Self> {
         let config_path = config.config_path.clone();
-        let logs = LogHub::new();
         let et_http = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
             .build()
@@ -63,6 +70,7 @@ impl AppState {
             et_http,
             console_stop: Mutex::new(None),
             console_pending: Mutex::new(None),
+            console_serving_port: Mutex::new(None),
         })
     }
 

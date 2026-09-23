@@ -364,6 +364,21 @@ impl Db {
         Ok(true)
     }
 
+    /// Read a user's stored password hash, so a host application can check that a
+    /// credential it handed out still works (and reinstall one if it does not).
+    pub async fn get_user_password_hash<T: ToString>(
+        &self,
+        user_name: T,
+    ) -> Result<Option<String>, DbErr> {
+        use entity::users;
+
+        Ok(users::Entity::find()
+            .filter(users::Column::Username.eq(user_name.to_string()))
+            .one(self.orm_db())
+            .await?
+            .map(|u| u.password))
+    }
+
     // TODO: currently we don't have a token system, so we just use the user name as token
     pub async fn get_user_id_by_token<T: ToString>(
         &self,

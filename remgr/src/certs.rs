@@ -14,19 +14,31 @@ pub fn cert_paths(dir: &Path, service: &str) -> (PathBuf, PathBuf) {
 }
 
 pub fn generate_service_cert(dir: &Path, service: &str, domain: &str, days: u32) -> Result<(PathBuf, PathBuf)> {
+    generate_service_cert_names(dir, service, &[domain.to_string(), "localhost".to_string()], domain, days)
+}
+
+/// Same, with an explicit SAN list. `common_name` is only a label; browsers match
+/// on the SANs, so the console certificate carries the host name and every
+/// address the box can be reached at.
+pub fn generate_service_cert_names(
+    dir: &Path,
+    service: &str,
+    names: &[String],
+    common_name: &str,
+    days: u32,
+) -> Result<(PathBuf, PathBuf)> {
     if service.is_empty() || !service.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         bail!("invalid service name");
     }
-    if domain.is_empty() {
-        bail!("domain is required");
+    if names.is_empty() {
+        bail!("at least one name is required");
     }
     let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P384_SHA384)?;
 
-    let mut params = rcgen::CertificateParams::new(vec![
-        domain.to_string(),
-        "localhost".to_string(),
-    ])?;
-    params.distinguished_name.push(rcgen::DnType::CommonName, domain);
+    let mut params = rcgen::CertificateParams::new(names.to_vec())?;
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, common_name);
     params.distinguished_name.push(rcgen::DnType::OrganizationName, "ReMgr");
     let now = time::OffsetDateTime::now_utc();
     params.not_before = now - time::Duration::new(3600, 0);

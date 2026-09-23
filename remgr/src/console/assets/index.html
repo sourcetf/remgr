@@ -494,7 +494,9 @@ function renderConsoleForm(){
     ['tls_key','TLS 私钥路径',c.tls_key??''],
     ['session_ttl','会话有效期（秒）',c.session_ttl??604800],
   ].map(([p,l,v])=>`<div class="fg"><label>${l}</label><input data-cpath="${p}" value="${String(v).replace(/"/g,'&quot;')}"></div>`).join('');
-  el.innerHTML=rows+`<div class="fg"><label class="switch" style="margin:0"><input type="checkbox" data-cpath="tls" ${c.tls?'checked':''}> 启用 HTTPS（需证书；未启用则 HTTP）</label></div>`;
+  el.innerHTML=rows+`<div class="fg"><label class="switch" style="margin:0"><input type="checkbox" data-cpath="tls" ${c.tls?'checked':''}> 启用 HTTPS（需证书；未启用则 HTTP）</label></div>`
+    +`<div class="hint">应用后地址：<code>${c.tls?'https':'http'}://${location.hostname}:${c.port??9443}/</code>
+       —— 自签名证书浏览器会提示不受信任，可在此上传正式证书。</div>`;
 }
 function collectConsoleCfg(){
   const c=JSON.parse(JSON.stringify(consoleCfg||{}));
@@ -514,10 +516,15 @@ async function saveConsole(){
   }catch(e){toast(e.message,false)}
 }
 async function applyConsole(){
+  const c=consoleCfg||{};
+  // Rebinding can change the scheme and the port, so navigate to where the
+  // console will actually be — reloading the current URL would land on a dead
+  // address (e.g. http://host:9443 after switching to HTTPS).
+  const target=`${c.tls?'https':'http'}://${location.hostname}:${c.port||location.port||9443}/`;
   try{
     const r=await api('/api/console/apply','POST',{});
-    toast(r.note||'控制台正在重新绑定…');
-    setTimeout(()=>location.reload(),1800);
+    toast((r.note||'控制台正在重新绑定…')+` → ${target}`);
+    setTimeout(()=>{ if(location.href.replace(/\/$/,'')!==target.replace(/\/$/,'')) location.replace(target); else location.reload(); },2000);
   }catch(e){toast(e.message,false)}
 }
 async function changePassword(){
