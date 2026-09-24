@@ -15,6 +15,15 @@ use crate::state::AppState;
 pub struct FrpcModule {
     state: std::sync::Weak<AppState>,
     client: Arc<remgr_frps::FrpcClient>,
+    /// Serializes `start`/`stop`/`apply_config`.
+    ///
+    /// A config save (`apply_config`) and a console button (`start`/`stop`) are
+    /// independent requests handled on different tasks, so a `stop` from the
+    /// operator can land between the stop and the start of a restart — which
+    /// would resurrect the module they just stopped. The client's own run lock
+    /// keeps the *sessions* from overlapping; this keeps the intended state of
+    /// the module itself in order.
+    ops: tokio::sync::Mutex<()>,
 }
 
 impl FrpcModule {
@@ -22,6 +31,7 @@ impl FrpcModule {
         Self {
             state: state.clone(),
             client: Arc::new(remgr_frps::FrpcClient::new(remgr_frps::FrpcConfig::default())),
+            ops: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -30,6 +40,21 @@ impl FrpcModule {
             .upgrade()
             .map(|s| s.config_blocking().frpc)
             .unwrap_or_default()
+    }
+
+    /// Body of `start`; the caller holds `ops`.
+    async fn start_locked(&self) -> anyhow::Result<()> {
+        let cfg = self.cfg();
+        // Adopt the saved configuration *before* the enabled check: the status
+        // view is built from the client's own per-proxy state, so a config that
+        // removed a proxy (or a PUT that disabled the module while it ran) must
+        // still reach the client — otherwise the console keeps listing proxies
+        // that no longer exist.
+        self.client.update_config(cfg.clone()).await;
+        if !cfg.enabled {
+            anyhow::bail!("frpc module is disabled");
+        }
+        self.client.start().await
     }
 }
 
@@ -65,27 +90,26 @@ impl super::ServiceModule for FrpcModule {
     }
 
     async fn start(&self) -> anyhow::Result<()> {
-        let cfg = self.cfg();
-        // Adopt the saved configuration *before* the enabled check: the status
-        // view is built from the client's own per-proxy state, so a config that
-        // removed a proxy (or a PUT that disabled the module while it ran) must
-        // still reach the client — otherwise the console keeps listing proxies
-        // that no longer exist.
-        self.client.update_config(cfg.clone()).await;
-        if !cfg.enabled {
-            anyhow::bail!("frpc module is disabled");
-        }
-        self.client.start().await
+        let _op = self.ops.lock().await;
+        self.start_locked().await
     }
 
     async fn stop(&self) -> anyhow::Result<()> {
+        let _op = self.ops.lock().await;
         self.client.stop().await
     }
 
     async fn apply_config(&self) -> anyhow::Result<()> {
-        // Same reason as `start`: adopt the edit even while stopped, then bounce
-        // the session only if one is running.
+        let _op = self.ops.lock().await;
+        // Same rule as `restart_if_running` — adopt the edit even while stopped,
+        // bounce the session only if one is running — but inlined: the helper
+        // would call back into `start`/`stop`, which wait for the `ops` lock
+        // held here.
         self.client.update_config(self.cfg()).await;
-        super::restart_if_running(self).await
+        if !self.client.is_running().await {
+            return Ok(());
+        }
+        self.client.stop().await?;
+        self.start_locked().await
     }
 }

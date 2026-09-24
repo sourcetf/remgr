@@ -94,6 +94,15 @@ async fn easytier_web_proxy(
         {
             continue;
         }
+        if n.eq_ignore_ascii_case("cookie") {
+            // The upstream needs its own session cookie, but the console's
+            // session token is Path=/ and would travel with it: never hand a
+            // full console session to whatever `api_addr` points at.
+            if let Some(scoped) = drop_console_cookie(value) {
+                outbound = outbound.header(header::COOKIE, scoped);
+            }
+            continue;
+        }
         outbound = outbound.header(name, value);
     }
 
@@ -109,7 +118,7 @@ async fn easytier_web_proxy(
 
     // A connect timeout alone is not enough: a wedged but connected upstream
     // would hold the browser request open indefinitely, so cap the whole exchange.
-    let resp = match tokio::time::timeout(std::time::Duration::from_secs(30), outbound.send()).await {
+    let mut resp = match tokio::time::timeout(std::time::Duration::from_secs(30), outbound.send()).await {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
             return api_error(
@@ -149,29 +158,73 @@ async fn easytier_web_proxy(
         headers.append(name.clone(), value.clone());
     }
 
-    let bytes = match resp.bytes().await {
+    let bytes = match read_capped(&mut resp, MAX_ET_RESPONSE).await {
         Ok(b) => b,
         Err(e) => {
-            return api_error(
-                StatusCode::BAD_GATEWAY,
-                &format!("read upstream response: {e}"),
-            );
+            return api_error(StatusCode::BAD_GATEWAY, &format!("read upstream response: {e}"));
         }
     };
 
     (status, headers, bytes).into_response()
 }
 
+/// Largest upstream body the proxy will buffer. The response used to be read
+/// with `resp.bytes()`, which holds whatever the upstream sends in memory: a
+/// large (or hostile) `api_addr` target could exhaust the process.
+const MAX_ET_RESPONSE: usize = 16 * 1024 * 1024;
+
+async fn read_capped(resp: &mut reqwest::Response, cap: usize) -> anyhow::Result<axum::body::Bytes> {
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        match resp.chunk().await {
+            Ok(Some(chunk)) => {
+                if out.len().saturating_add(chunk.len()) > cap {
+                    anyhow::bail!("upstream response exceeds {} bytes", cap);
+                }
+                out.extend_from_slice(&chunk);
+            }
+            Ok(None) => break,
+            Err(e) => anyhow::bail!("{e}"),
+        }
+    }
+    Ok(axum::body::Bytes::from(out))
+}
+
+/// Remove the console's own session from a forwarded `Cookie` header, keeping
+/// everything else (the upstream's session lives under `/et` and must pass).
+fn drop_console_cookie(raw: &HeaderValue) -> Option<HeaderValue> {
+    let text = raw.to_str().ok()?;
+    let kept: Vec<&str> = text
+        .split(';')
+        .map(|c| c.trim())
+        .filter(|c| !c.is_empty() && !c.starts_with(&format!("{COOKIE}=")))
+        .collect();
+    if kept.is_empty() {
+        return None;
+    }
+    HeaderValue::from_str(&kept.join("; ")).ok()
+}
+
 /// Rewrite a `Set-Cookie` so the upstream session only travels under `/et`.
+/// A missing SameSite is filled in as Lax: the proxy is cross-site reachable
+/// (it is exempt from the console's CSRF header rule), so the browser must not
+/// attach the upstream session to a request another site initiated.
 fn scope_cookie_to_et(raw: &str) -> String {
+    let mut same_site = false;
     let mut parts: Vec<String> = raw
         .split(';')
         .map(|p| p.trim().to_string())
         .filter(|p| {
             let lower = p.to_ascii_lowercase();
+            if lower.starts_with("samesite=") {
+                same_site = true;
+            }
             !lower.starts_with("domain=") && !lower.starts_with("path=")
         })
         .collect();
+    if !same_site {
+        parts.push("SameSite=Lax".to_string());
+    }
     parts.push("Path=/et".to_string());
     parts.join("; ")
 }
@@ -187,12 +240,53 @@ fn sessions_lock(
     state.sessions.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The same for the console-control mutexes: a poisoned lock must not be able to
+/// take the console's listener down.
+fn lock_or_recover<T>(m: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Read-modify-write the shared configuration and persist it, all while holding
+/// the write lock. Every handler used to clone a snapshot, mutate it, save and
+/// store it back, so two concurrent requests (a service PUT and a console PUT,
+/// or a module saving a generated key) silently overwrote each other's section
+/// in memory *and* on disk. `edit` works on a copy and only commits once both it
+/// and the save succeeded, so a failed save cannot leave the two disagreeing.
+async fn edit_config<F>(state: &AppState, edit: F) -> anyhow::Result<()>
+where
+    F: FnOnce(&mut crate::config::Config) -> anyhow::Result<()>,
+{
+    let mut guard = state.config.write().await;
+    let mut staged = guard.clone();
+    edit(&mut staged)?;
+    staged.save()?;
+    *guard = staged;
+    Ok(())
+}
+
+/// The scheme the console is actually serving, which is what the session cookie
+/// has to agree with (`Secure` over plain HTTP locks the operator out).
+fn serving_tls(state: &AppState) -> bool {
+    *lock_or_recover(&state.console_serving_tls)
+}
+
+/// Session cookie for the given token. `Secure` is only added when the listener
+/// really is TLS: if the console fell back to plain HTTP because the configured
+/// certificate is unreadable, a Secure cookie would never be stored and the
+/// console would be unreachable.
+fn session_cookie(state: &AppState, token: &str, max_age: u64) -> String {
+    let secure = if serving_tls(state) { "; Secure" } else { "" };
+    format!("{COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}{secure}")
+}
+
 fn new_session(state: &AppState) -> String {
     use rand::RngCore;
     let mut buf = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut buf);
     let token: String = buf.iter().map(|b| format!("{b:02x}")).collect();
-    let expiry = now_unix() + state.config_blocking().console.session_ttl;
+    // saturating: a session_ttl near u64::MAX would otherwise wrap and hand back
+    // a token that is already expired
+    let expiry = now_unix().saturating_add(state.config_blocking().console.session_ttl);
     let mut sessions = sessions_lock(state);
     // Drop the expired entries instead of letting the table grow with every
     // login for the lifetime of the process.
@@ -200,6 +294,20 @@ fn new_session(state: &AppState) -> String {
     sessions.retain(|_, exp| *exp > now);
     sessions.insert(token.clone(), expiry);
     token
+}
+
+/// The session token this request carries, if any.
+fn request_token(headers: &HeaderMap) -> Option<String> {
+    let cookie = headers
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    cookie
+        .split(';')
+        .filter_map(|c| c.trim().strip_prefix(&format!("{COOKIE}=")))
+        .next()
+        .filter(|t| !t.is_empty())
+        .map(|t| t.to_string())
 }
 
 fn now_unix() -> u64 {
@@ -210,23 +318,14 @@ fn now_unix() -> u64 {
 }
 
 fn session_ok(state: &AppState, headers: &HeaderMap) -> bool {
-    let cookie = headers
-        .get(header::COOKIE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    let token = cookie
-        .split(';')
-        .filter_map(|c| c.trim().strip_prefix(&format!("{COOKIE}=")))
-        .next()
-        .unwrap_or("");
-    if token.is_empty() {
+    let Some(token) = request_token(headers) else {
         return false;
-    }
+    };
     let mut sessions = sessions_lock(state);
-    match sessions.get(token) {
+    match sessions.get(&token) {
         Some(&expiry) if expiry > now_unix() => true,
         Some(_) => {
-            sessions.remove(token);
+            sessions.remove(&token);
             false
         }
         None => false,
@@ -265,16 +364,83 @@ struct LoginReq {
     password: String,
 }
 
+/// Failed logins allowed per window before further *wrong* passwords are refused.
+const LOGIN_MAX_FAILURES: u32 = 10;
+/// Length of that window, in seconds.
+const LOGIN_FAILURE_WINDOW: u64 = 300;
+
+/// Throttle failed console logins.
+///
+/// The console is meant to be reachable from the network and ships a short
+/// default password, so guesses have to cost something. The password is verified
+/// *before* this is consulted, and a correct one always succeeds (and clears the
+/// counter) — so this can never lock an operator out of their own console, it
+/// only refuses further wrong passwords once the window is saturated.
+///
+/// Counted globally rather than per source address: the TLS listener (the
+/// default) is served by axum-server, which does not pass the peer address into
+/// the request, so a per-IP table would silently degrade to this anyway. Say the
+/// word if you want per-IP throttling; it needs the peer address plumbed through
+/// the TLS serve path.
+fn login_throttled(state: &AppState) -> Option<Response> {
+    let now = now_unix();
+    let mut window = lock_or_recover(&state.login_failures);
+    // The window is a single (count, start) pair; drop it once it has expired so
+    // the count cannot accumulate across windows.
+    if now.saturating_sub(window.1) >= LOGIN_FAILURE_WINDOW {
+        *window = (0, now);
+    }
+    let (count, start) = *window;
+    if count < LOGIN_MAX_FAILURES {
+        return None;
+    }
+    let retry_after = LOGIN_FAILURE_WINDOW.saturating_sub(now.saturating_sub(start)).max(1);
+    tracing::warn!(
+        "console: {count} failed logins in this window — refusing further attempts for {retry_after}s"
+    );
+    Some(
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            [(header::RETRY_AFTER, HeaderValue::from_str(&retry_after.to_string()).unwrap())],
+            Json(json!({
+                "error": format!(
+                    "too many failed login attempts — wait {retry_after}s (the correct password is always accepted)"
+                )
+            })),
+        )
+            .into_response(),
+    )
+}
+
+fn note_login_failure(state: &AppState) {
+    let now = now_unix();
+    let mut window = lock_or_recover(&state.login_failures);
+    if now.saturating_sub(window.1) >= LOGIN_FAILURE_WINDOW {
+        *window = (1, now);
+    } else {
+        window.0 = window.0.saturating_add(1);
+    }
+}
+
+fn clear_login_failures(state: &AppState) {
+    *lock_or_recover(&state.login_failures) = (0, now_unix());
+}
+
 async fn login(State(state): State<Arc<AppState>>, Json(req): Json<LoginReq>) -> Response {
     let hash = state.config_blocking().console.password_hash;
     let ok = PasswordHash::new(&hash)
         .map(|parsed| Argon2::default().verify_password(req.password.as_bytes(), &parsed).is_ok())
         .unwrap_or(false);
     if !ok {
+        note_login_failure(&state);
+        if let Some(refused) = login_throttled(&state) {
+            return refused;
+        }
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "invalid password"}))).into_response();
     }
+    clear_login_failures(&state);
     let token = new_session(&state);
-    let cookie = format!("{COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}", state.config_blocking().console.session_ttl);
+    let cookie = session_cookie(&state, &token, state.config_blocking().console.session_ttl);
     (
         StatusCode::OK,
         [(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap())],
@@ -284,11 +450,10 @@ async fn login(State(state): State<Arc<AppState>>, Json(req): Json<LoginReq>) ->
 }
 
 async fn logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    let cookie = headers.get(header::COOKIE).and_then(|v| v.to_str().ok()).unwrap_or("");
-    if let Some(token) = cookie.split(';').filter_map(|c| c.trim().strip_prefix(&format!("{COOKIE}="))).next() {
-        sessions_lock(&state).remove(token);
+    if let Some(token) = request_token(&headers) {
+        sessions_lock(&state).remove(&token);
     }
-    let cookie = format!("{COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
+    let cookie = session_cookie(&state, "", 0);
     (
         StatusCode::OK,
         [(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap())],
@@ -303,7 +468,11 @@ struct PasswordChange {
     new: String,
 }
 
-async fn change_password(State(state): State<Arc<AppState>>, Json(req): Json<PasswordChange>) -> Response {
+async fn change_password(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(req): Json<PasswordChange>,
+) -> Response {
     let hash = state.config_blocking().console.password_hash;
     let ok = PasswordHash::new(&hash)
         .map(|parsed| Argon2::default().verify_password(req.old.as_bytes(), &parsed).is_ok())
@@ -323,14 +492,20 @@ async fn change_password(State(state): State<Arc<AppState>>, Json(req): Json<Pas
         Ok(h) => h.to_string(),
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     };
-    {
-        let mut cfg = state.config.write().await;
+    if let Err(e) = edit_config(&state, |cfg| {
         cfg.console.password_hash = new_hash;
-        if let Err(e) = cfg.save() {
-            return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
-        }
+        Ok(())
+    })
+    .await
+    {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response();
     }
-    Json(json!({"ok": true})).into_response()
+    // The password just changed: every other session was authenticated against
+    // the old one and must not outlive it. The caller keeps its own token so the
+    // change does not log the operator out of the page they are on.
+    let keep = request_token(&headers);
+    sessions_lock(&state).retain(|token, _| Some(token) == keep.as_ref());
+    Json(json!({"ok": true, "other_sessions_ended": true})).into_response()
 }
 
 // ---------------------------------------------------------------- console server
@@ -345,8 +520,8 @@ async fn console_apply(State(state): State<Arc<AppState>>) -> Response {
     let cfg = state.config_blocking().console;
     match prepare_console(&cfg).await {
         Ok(prepared) => {
-            *state.console_pending.lock().unwrap() = Some(prepared);
-            if let Some(tx) = state.console_stop.lock().unwrap().take() {
+            *lock_or_recover(&state.console_pending) = Some(prepared);
+            if let Some(tx) = lock_or_recover(&state.console_stop).take() {
                 let _ = tx.send(());
             }
             Json(json!({
@@ -355,14 +530,14 @@ async fn console_apply(State(state): State<Arc<AppState>>) -> Response {
             }))
             .into_response()
         }
-        Err(e) if is_addr_in_use(&e) && *state.console_serving_port.lock().unwrap() == Some(cfg.port) => {
+        Err(e) if is_addr_in_use(&e) && *lock_or_recover(&state.console_serving_port) == Some(cfg.port) => {
             // Switching the scheme on the port the console is already serving:
             // the old listener holds it, so nothing can be bound up front. Ask the
             // serve loop to stop; it re-prepares from the (already saved) config,
             // so the same settings — with the new scheme — come back up. That also
             // means a failure here cannot strand the console: the loop falls back
             // to the settings that last worked.
-            if let Some(tx) = state.console_stop.lock().unwrap().take() {
+            if let Some(tx) = lock_or_recover(&state.console_stop).take() {
                 let _ = tx.send(());
             }
             Json(json!({
@@ -421,7 +596,7 @@ pub async fn serve_console(state: Arc<AppState>) -> anyhow::Result<()> {
     let mut last_good: Option<crate::config::ConsoleConfig> = None;
     loop {
         let cfg = state.config_blocking().console;
-        let prepared = match state.console_pending.lock().unwrap().take() {
+        let prepared = match lock_or_recover(&state.console_pending).take() {
             Some(p) => Some(p),
             None => {
                 let mut chosen = None;
@@ -480,13 +655,17 @@ pub async fn serve_console(state: Arc<AppState>) -> anyhow::Result<()> {
 
         let app = router(state.clone());
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        *state.console_stop.lock().unwrap() = Some(tx);
+        *lock_or_recover(&state.console_stop) = Some(tx);
 
         match prepared {
             PreparedConsole::Plain(listener) => {
                 let listener = tokio::net::TcpListener::from_std(listener)?;
                 let local = listener.local_addr().map(|a| a.to_string()).unwrap_or_default();
-                *state.console_serving_port.lock().unwrap() = local.rsplit(':').next().and_then(|p| p.parse().ok());
+                let port = local.rsplit(':').next().and_then(|p| p.parse().ok());
+                let mut serving_port = lock_or_recover(&state.console_serving_port);
+                *serving_port = port;
+                drop(serving_port);
+                *lock_or_recover(&state.console_serving_tls) = false;
                 tracing::info!("console listening on http://{local}");
                 if let Err(e) = axum::serve(listener, app)
                     .with_graceful_shutdown(async move {
@@ -506,7 +685,11 @@ pub async fn serve_console(state: Arc<AppState>) -> anyhow::Result<()> {
                     shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(3)));
                 });
                 let local = listener.local_addr().map(|a| a.to_string()).unwrap_or_default();
-                *state.console_serving_port.lock().unwrap() = local.rsplit(':').next().and_then(|p| p.parse().ok());
+                let port = local.rsplit(':').next().and_then(|p| p.parse().ok());
+                let mut serving_port = lock_or_recover(&state.console_serving_port);
+                *serving_port = port;
+                drop(serving_port);
+                *lock_or_recover(&state.console_serving_tls) = true;
                 tracing::info!("console listening on https://{local}");
                 if let Err(e) = axum_server::from_tcp_rustls(listener, tls)
                     .handle(handle)
@@ -539,6 +722,11 @@ async fn status(State(state): State<Arc<AppState>>) -> Response {
         "console": {
             "port": cfg.console.port,
             "tls": cfg.console.tls,
+            // the scheme the listener actually came up with: a configured
+            // certificate that cannot be read makes the console fall back to
+            // plain HTTP, and that must be visible rather than a `tls: true`
+            // that only describes the file
+            "tls_active": serving_tls(&state),
             "password_set": !cfg.console.password_hash.is_empty(),
         },
         "services": services,
@@ -659,34 +847,61 @@ async fn put_config(
     Path(service): Path<String>,
     Json(value): Json<serde_json::Value>,
 ) -> Response {
+    // A PUT replaces the whole section: every field the body omits is filled in
+    // with its default (all the config structs are `#[serde(default)]`). An empty
+    // object therefore means "reset this section to defaults", which is never what
+    // a caller intends — a mistyped curl would silently wipe the token,
+    // credentials and paths. Refuse it; the console always sends the full section.
+    if matches!(&value, serde_json::Value::Object(m) if m.is_empty()) {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "empty body: PUT replaces the whole section, send the complete config",
+        );
+    }
     // The console's own settings are not a service module: they are persisted
     // here and only take effect when the listener is rebound, which the caller
     // triggers with POST /api/console/apply.
     if service == "console" {
-        let mut new_cfg = state.config_blocking();
-        let mut console: crate::config::ConsoleConfig = match serde_json::from_value(value) {
+        let console: crate::config::ConsoleConfig = match serde_json::from_value(value) {
             Ok(c) => c,
             Err(e) => return api_error(StatusCode::BAD_REQUEST, &e.to_string()),
         };
-        // The password has its own endpoint; never let it be cleared here.
-        console.password_hash = new_cfg.console.password_hash.clone();
         if console.port == 0 {
             return api_error(StatusCode::BAD_REQUEST, "console port must not be 0");
         }
         if console.session_ttl == 0 {
             return api_error(StatusCode::BAD_REQUEST, "session_ttl must not be 0");
         }
-        if console.tls && (console.tls_cert.is_empty() || console.tls_key.is_empty()) {
+        if console.tls && (console.tls_cert.trim().is_empty() || console.tls_key.trim().is_empty()) {
             return api_error(
                 StatusCode::BAD_REQUEST,
                 "TLS needs both a certificate and a key path",
             );
         }
-        new_cfg.console = console;
-        if let Err(e) = new_cfg.save() {
+        if console.tls {
+            // A certificate outside the sandbox's unveiled trees can only fail
+            // at bind time, and the serve loop then falls back to plain HTTP:
+            // reject it here, where the operator still sees why.
+            for (what, path) in [("tls_cert", &console.tls_cert), ("tls_key", &console.tls_key)] {
+                if !path.starts_with('/') || path.contains("..") {
+                    return api_error(
+                        StatusCode::BAD_REQUEST,
+                        &format!("{what} must be an absolute path"),
+                    );
+                }
+            }
+        }
+        let result = edit_config(&state, |cfg| {
+            let mut console = console;
+            // The password has its own endpoint; never let it be cleared here.
+            console.password_hash = cfg.console.password_hash.clone();
+            cfg.console = console;
+            Ok(())
+        })
+        .await;
+        if let Err(e) = result {
             return api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string());
         }
-        *state.config.write().await = new_cfg;
         return Json(json!({
             "ok": true,
             "restart_required": true,
@@ -700,24 +915,35 @@ async fn put_config(
         None => return api_error(StatusCode::NOT_FOUND, "unknown service"),
     };
 
-    let mut new_cfg = state.config_blocking();
-    let result: anyhow::Result<()> = (|| {
+    let result = edit_config(&state, move |cfg| {
         match service.as_str() {
-            "easytier" => new_cfg.easytier = serde_json::from_value(value)?,
-            "stun_turn" => new_cfg.stun_turn = serde_json::from_value(value)?,
-            "rustdesk" => new_cfg.rustdesk = serde_json::from_value(value)?,
-            "frps" => new_cfg.frps = serde_json::from_value(value)?,
-            "frpc" => new_cfg.frpc = serde_json::from_value(value)?,
+            "easytier" => {
+                let parsed: crate::config::EasyTierConfig = serde_json::from_value(value)?;
+                // every other section feeds a socket bind; this one is also the
+                // target the console's /et proxy connects to, so it has to be an
+                // IP literal — anything else is a value the module refuses to
+                // start with and the proxy would treat as another host
+                parsed.api_addr.parse::<std::net::IpAddr>().map_err(|_| {
+                    anyhow::anyhow!(
+                        "api_addr must be an IP address (the console proxies /et to it): {:?}",
+                        parsed.api_addr
+                    )
+                })?;
+                cfg.easytier = parsed;
+            }
+            "stun_turn" => cfg.stun_turn = serde_json::from_value(value)?,
+            "rustdesk" => cfg.rustdesk = serde_json::from_value(value)?,
+            "frps" => cfg.frps = serde_json::from_value(value)?,
+            "frpc" => cfg.frpc = serde_json::from_value(value)?,
             _ => anyhow::bail!("unknown service"),
         }
-        new_cfg.save()?;
         Ok(())
-    })();
+    })
+    .await;
 
     if let Err(e) = result {
         return api_error(StatusCode::BAD_REQUEST, &e.to_string());
     }
-    *state.config.write().await = new_cfg;
 
     match module.apply_config().await {
         Ok(()) => Json(json!({"ok": true})).into_response(),
@@ -737,12 +963,8 @@ async fn service_action(
     // module, otherwise the button would fail with "module is disabled" and a
     // stopped service could never be started again from the console.
     if action == "start" || action == "restart" {
-        let mut cfg = state.config_blocking();
-        if set_enabled_flag(&mut cfg, &service, true) {
-            if let Err(e) = cfg.save() {
-                tracing::warn!("could not persist the enabled flag for {service}: {e:#}");
-            }
-            *state.config.write().await = cfg;
+        if let Err(e) = set_enabled(&state, &service, true).await {
+            tracing::warn!("could not persist the enabled flag for {service}: {e:#}");
         }
     }
     let result = match action.as_str() {
@@ -760,18 +982,27 @@ async fn service_action(
             // same value back into memory, otherwise the file and what
             // /api/status reports disagree until the next restart.
             if action == "start" || action == "stop" {
-                let mut cfg = state.config_blocking();
-                if set_enabled_flag(&mut cfg, &service, action == "start") {
-                    if let Err(e) = cfg.save() {
-                        tracing::warn!("could not persist the enabled flag for {service}: {e:#}");
-                    }
-                    *state.config.write().await = cfg;
+                if let Err(e) = set_enabled(&state, &service, action == "start").await {
+                    tracing::warn!("could not persist the enabled flag for {service}: {e:#}");
                 }
             }
             Json(json!({"ok": true})).into_response()
         }
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
+}
+
+/// Persist a service's `enabled` flag (and keep memory and file in step).
+async fn set_enabled(state: &AppState, service: &str, enabled: bool) -> anyhow::Result<()> {
+    let known = {
+        // hold the write lock only for the flag itself, never across the save
+        let mut cfg = state.config.write().await;
+        set_enabled_flag(&mut *cfg, service, enabled)
+    };
+    if !known {
+        return Ok(()); // not a service this console knows about
+    }
+    state.save_config().await
 }
 
 /// Set a service's `enabled` flag in the given config snapshot.
@@ -800,6 +1031,20 @@ struct CertGenReq {
 fn default_days() -> u32 { 825 }
 
 async fn certs_generate(State(state): State<Arc<AppState>>, Json(req): Json<CertGenReq>) -> Response {
+    // reject bad input as bad input: the generator itself would only report a
+    // generic failure (and a silly `days` used to abort the request task)
+    if !crate::certs::valid_service_name(&req.service) {
+        return api_error(StatusCode::BAD_REQUEST, "invalid service name");
+    }
+    if req.domain.trim().is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "domain must not be empty");
+    }
+    if req.days == 0 || req.days > crate::certs::MAX_CERT_DAYS {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            &format!("days must be between 1 and {}", crate::certs::MAX_CERT_DAYS),
+        );
+    }
     let dir = state.cert_dir();
     match crate::certs::generate_service_cert(&dir, &req.service, &req.domain, req.days) {
         Ok((cert_path, key_path)) => {
@@ -828,34 +1073,39 @@ async fn point_service_at_cert(
     cert_path: &str,
     key_path: &str,
 ) -> Vec<&'static str> {
-    let mut cfg = state.config_blocking();
     let (module, updated): (&str, Vec<&'static str>) = match service {
-        "turn" | "stun_turn" => {
-            cfg.stun_turn.cert_path = cert_path.to_string();
-            cfg.stun_turn.key_path = key_path.to_string();
-            ("stun_turn", vec!["stun_turn.cert_path", "stun_turn.key_path"])
-        }
-        "frps" => {
-            cfg.frps.tls_cert_path = Some(cert_path.to_string());
-            cfg.frps.tls_key_path = Some(key_path.to_string());
-            ("frps", vec!["frps.tls_cert_path", "frps.tls_key_path"])
-        }
-        "console" => {
-            // Applied by POST /api/console/apply, not by a module restart.
-            cfg.console.tls_cert = cert_path.to_string();
-            cfg.console.tls_key = key_path.to_string();
-            ("", vec!["console.tls_cert", "console.tls_key"])
-        }
+        "turn" | "stun_turn" => ("stun_turn", vec!["stun_turn.cert_path", "stun_turn.key_path"]),
+        "frps" => ("frps", vec!["frps.tls_cert_path", "frps.tls_key_path"]),
+        // Applied by POST /api/console/apply, not by a module restart.
+        "console" => ("", vec!["console.tls_cert", "console.tls_key"]),
         _ => ("", Vec::new()),
     };
     if updated.is_empty() {
         return updated;
     }
-    if let Err(e) = cfg.save() {
+    if let Err(e) = edit_config(state, |cfg| {
+        match service {
+            "turn" | "stun_turn" => {
+                cfg.stun_turn.cert_path = cert_path.to_string();
+                cfg.stun_turn.key_path = key_path.to_string();
+            }
+            "frps" => {
+                cfg.frps.tls_cert_path = Some(cert_path.to_string());
+                cfg.frps.tls_key_path = Some(key_path.to_string());
+            }
+            "console" => {
+                cfg.console.tls_cert = cert_path.to_string();
+                cfg.console.tls_key = key_path.to_string();
+            }
+            _ => {}
+        }
+        Ok(())
+    })
+    .await
+    {
         tracing::warn!("certs: could not persist paths for {service}: {e:#}");
         return Vec::new();
     }
-    *state.config.write().await = cfg;
 
     if !module.is_empty() {
         if let Some(m) = state.module(module) {
@@ -875,6 +1125,15 @@ struct CertUploadReq {
 }
 
 async fn certs_upload(State(state): State<Arc<AppState>>, Json(req): Json<CertUploadReq>) -> Response {
+    if !crate::certs::valid_service_name(&req.service) {
+        return api_error(StatusCode::BAD_REQUEST, "invalid service name");
+    }
+    if !req.cert_pem.contains("BEGIN CERTIFICATE") || !req.key_pem.contains("PRIVATE KEY") {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "cert_pem and key_pem must be PEM-encoded certificate and private key blocks",
+        );
+    }
     let dir = state.cert_dir();
     match crate::certs::write_service_cert(&dir, &req.service, &req.cert_pem, &req.key_pem) {
         Ok((cert_path, key_path)) => {

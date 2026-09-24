@@ -28,6 +28,12 @@ pub trait ServiceModule: Send + Sync {
 pub async fn restart_if_running(module: &dyn ServiceModule) -> anyhow::Result<()> {
     // Only bounce the module when it is running; config changes while stopped
     // take effect at the next start.
+    //
+    // `status()["running"]` therefore has to mean "a supervisor task is alive
+    // right now", not "start was called at some point": a module whose task
+    // ended by itself (a configuration it could no longer use) must not be
+    // reported as running, or this would skip the restart it needs, and a
+    // module whose task is a stale handle must be able to start again.
     let was_running = module
         .status()
         .await

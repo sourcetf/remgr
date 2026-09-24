@@ -20,9 +20,17 @@ pub struct FrpsConfig {
     /// TLS cert/key (PEM) enabling frpc `transport.tls` connections.
     /// Empty or unreadable paths fall back to an ephemeral self-signed pair,
     /// exactly like frp itself does when no certificate is configured.
-    #[serde(default = "d_tls_cert")]
+    #[serde(
+        default = "d_tls_cert",
+        serialize_with = "opt_path::serialize",
+        deserialize_with = "opt_path::deserialize"
+    )]
     pub tls_cert_path: Option<String>,
-    #[serde(default = "d_tls_key")]
+    #[serde(
+        default = "d_tls_key",
+        serialize_with = "opt_path::serialize",
+        deserialize_with = "opt_path::deserialize"
+    )]
     pub tls_key_path: Option<String>,
     /// Cap on work connections pre-issued per control (client `poolCount`).
     /// frp's own default is 5; a larger cap only means the client opens more
@@ -59,6 +67,32 @@ fn d_heartbeat() -> u64 { 90 }
 fn d_tls_cert() -> Option<String> { Some("/etc/remgr/ssl/frps_cert.pem".into()) }
 fn d_tls_key() -> Option<String> { Some("/etc/remgr/ssl/frps_key.pem".into()) }
 fn d_crypto_salt() -> String { crate::crypto::DEFAULT_SALT.to_string() }
+
+/// Serde for the two PEM path fields: with a plain `Option<String>` and a
+/// non-empty `default`, "no certificate configured" cannot survive a save/load
+/// round-trip. TOML has no `null`, so `None` was written as a missing key and
+/// the default path reappeared on the next load — `PUT /api/config/frps
+/// {"tls_cert_path":null}` silently reverted to the default path, and the
+/// field could never be cleared.
+///
+/// An empty string is the wire form of "not configured" instead: it is written
+/// explicitly (so it comes back as `None`, not as the default), it reads back
+/// as `None`, and `server.rs` already treats an empty path as unconfigured.
+/// A missing key still takes the default, so existing config files are
+/// unaffected, and `Some("")` never occurs.
+mod opt_path {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(path: &Option<String>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(path.as_deref().unwrap_or(""))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+        // `null` (JSON) and a missing key never reach this function; an empty
+        // string does, and means the same as "not configured".
+        Ok(Option::<String>::deserialize(d)?.filter(|p| !p.is_empty()))
+    }
+}
 
 impl Default for FrpsConfig {
     fn default() -> Self {

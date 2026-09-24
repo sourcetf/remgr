@@ -13,6 +13,8 @@ const RING_SIZE: usize = 1000;
 const LOG_FILE: &str = "/var/log/remgr/remgr.log";
 /// Rotate to `<file>.1` once the file passes this size (one generation kept).
 const LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// Longest unterminated fragment held while reassembling a log line.
+const MAX_PARTIAL: usize = 64 * 1024;
 
 /// The on-disk half of the log hub. `/var/log/remgr` is unveiled for it; a
 /// filesystem that refuses the write (read-only, full, absent directory) must
@@ -30,8 +32,29 @@ impl FileSink {
     }
 
     fn open(&mut self) {
-        match OpenOptions::new().create(true).append(true).open(&self.path) {
+        // The very first start-up lines carry the bootstrap console password,
+        // so the file is created root-only rather than with the process umask.
+        #[cfg(unix)]
+        let opened = {
+            use std::os::unix::fs::OpenOptionsExt;
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .mode(0o600)
+                .open(&self.path)
+        };
+        #[cfg(not(unix))]
+        let opened = OpenOptions::new().create(true).append(true).open(&self.path);
+
+        match opened {
             Ok(f) => {
+                // an existing file keeps whatever mode it has: tighten it too,
+                // the file may predate this and be world-readable
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = f.set_permissions(std::fs::Permissions::from_mode(0o600));
+                }
                 self.written = f.metadata().map(|m| m.len()).unwrap_or(0);
                 self.file = Some(f);
             }
@@ -89,7 +112,9 @@ impl LogHub {
     }
 
     fn push_line(&self, line: &str) {
-        let mut entries = self.entries.lock().unwrap();
+        // plain std mutexes: a panic elsewhere while one was held must not turn
+        // every later log line (and /api/logs) into a panic
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         if entries.len() == RING_SIZE {
             entries.pop_front();
         }
@@ -103,7 +128,7 @@ impl LogHub {
     }
 
     pub fn snapshot(&self, n: usize) -> Vec<String> {
-        let entries = self.entries.lock().unwrap();
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let skip = entries.len().saturating_sub(n);
         entries.iter().skip(skip).cloned().collect()
     }
@@ -113,13 +138,23 @@ impl LogHub {
     }
 
     fn ingest(&self, buf: &str) {
-        let mut partial = self.partial.lock().unwrap();
+        let mut partial = self.partial.lock().unwrap_or_else(|e| e.into_inner());
         partial.push_str(buf);
         while let Some(pos) = partial.find('\n') {
             let line: String = partial.drain(..=pos).collect();
             let line = line.trim_end();
             if !line.is_empty() {
                 self.push_line(line);
+            }
+        }
+        // A writer that never emits a newline (a very long message) would
+        // otherwise grow this buffer for the lifetime of the process.
+        if partial.len() > MAX_PARTIAL {
+            let line = partial.trim_end().to_string();
+            partial.clear();
+            drop(partial);
+            if !line.is_empty() {
+                self.push_line(&line);
             }
         }
     }

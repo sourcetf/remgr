@@ -206,10 +206,46 @@ impl Config {
         if !out.ends_with('\n') {
             out.push('\n');
         }
-        // write via temp file + rename for atomicity
+        // write via temp file + rename for atomicity. The file holds the console
+        // password hash and every service token, so it is created owner-only;
+        // fsync before the rename and on the directory after it, so a crash
+        // between the two cannot leave an empty or half-written config behind.
         let tmp = path.with_extension("toml.tmp");
-        std::fs::write(&tmp, out.as_bytes())?;
+        {
+            use std::io::Write;
+            let mut f = open_private(&tmp)?;
+            f.write_all(out.as_bytes())?;
+            f.flush()?;
+            f.sync_all()?;
+        }
         std::fs::rename(&tmp, path)?;
+        if let Some(parent) = path.parent() {
+            if let Ok(dir) = std::fs::File::open(parent) {
+                let _ = dir.sync_all();
+            }
+        }
         Ok(())
+    }
+}
+
+/// Create (or truncate) a file that is never more readable than owner-only.
+fn open_private(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
     }
 }

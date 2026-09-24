@@ -96,6 +96,15 @@ fn main() {
         }
     }
 
+    // run() pins the working directory to /var/lib/remgr, after which a relative
+    // --config would be re-resolved against the new cwd: the file would be read
+    // from one place and every later save written to another.
+    if config_path.is_relative() {
+        if let Ok(cwd) = std::env::current_dir() {
+            config_path = cwd.join(config_path);
+        }
+    }
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

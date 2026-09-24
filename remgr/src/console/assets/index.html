@@ -42,9 +42,11 @@ main{max-width:1180px;margin:0 auto;padding:22px}
 .kv{background:var(--bg3);border-radius:7px;padding:10px}
 .kv .l{font-size:11px;color:var(--tx2);margin-bottom:3px}
 .kv .v{font-size:14px;font-family:ui-monospace,Consolas,monospace;word-break:break-all}
+.kv.warn .l{color:var(--yellow)}
 .badge{display:inline-block;padding:3px 10px;border-radius:10px;font-size:11px;font-weight:600}
 .badge.run{background:rgba(63,185,80,.15);color:var(--green)}
 .badge.stop{background:rgba(248,81,73,.15);color:var(--red)}
+.badge.warn{background:rgba(210,153,34,.15);color:var(--yellow)}
 .badge.off{background:rgba(139,148,158,.15);color:var(--tx2)}
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:12px}
 .switch{display:flex;align-items:center;gap:7px;font-size:13px;cursor:pointer;margin-left:auto}
@@ -75,9 +77,11 @@ th{color:var(--tx2);font-weight:500}
   <div class="box">
     <h1>⚙ ReMgr</h1>
     <p>Relay Manager Console</p>
-    <div class="fg"><input type="password" id="login-pw" placeholder="管理密码" onkeydown="if(event.key==='Enter')doLogin()"></div>
-    <button class="btn primary" style="width:100%" onclick="doLogin()">登录</button>
+    <div class="fg"><input type="password" id="login-pw" placeholder="管理密码" autofocus onkeydown="if(event.key==='Enter')doLogin()"></div>
+    <button class="btn primary" id="login-btn" style="width:100%" onclick="doLogin()">登录</button>
     <p id="login-err" style="color:var(--red);margin-top:12px;min-height:14px"></p>
+    <p style="margin-bottom:0">初始口令为 <code>admin</code>（首次启动写入
+      <code>/var/run/remgr/initial_password</code>），登录后请在「系统」页修改。</p>
   </div>
 </div>
 
@@ -100,13 +104,14 @@ th{color:var(--tx2);font-weight:500}
       <h3>🔧 控制台设置</h3>
       <div class="grid" id="console-form"></div>
       <div class="row">
-        <button class="btn primary" onclick="saveConsole()">保存</button>
-        <button class="btn warn" onclick="applyConsole()">立即应用（重新绑定）</button>
+        <button class="btn primary" id="console-save" onclick="saveConsole()">保存</button>
+        <button class="btn warn" id="console-apply" onclick="applyConsole()">立即应用（重新绑定）</button>
         <button class="btn" onclick="genCert('console')">🔐 生成控制台证书</button>
         <button class="btn" onclick="uploadCert('console')">📥 上传控制台证书</button>
       </div>
       <div class="hint">端口/TLS 的改动需点「立即应用」重新绑定控制台；证书路径默认指向 <code>/etc/remgr/ssl</code>。
-        若启用了 HTTPS 但证书不可读，控制台会退回 HTTP 以免失联。</div>
+        端口须为 1-65535 的整数，会话有效期为正整数（秒）。
+        若启用了 HTTPS 但证书不可读，控制台会退回 HTTP 以免失联（届时上方「应用后地址」只是配置值，实际以浏览器地址栏为准）。</div>
     </div>
     <div class="card">
       <h3>🔑 修改控制台密码</h3>
@@ -143,16 +148,25 @@ const API = {
   get: (p) => fetch(p, {headers: {'x-remgr-csrf':'1'}}),
   send: (p, method, body) => fetch(p, {method, headers:{'Content-Type':'application/json','x-remgr-csrf':'1'}, body: body!==undefined?JSON.stringify(body):undefined}),
 };
-const SERVICES = ['easytier','stun_turn','rustdesk','frps','frpc'];
 const TITLES = {easytier:'⚡ EasyTier 中心', stun_turn:'🌐 STUN / TURN', rustdesk:'🖥 RustDesk 中继', frps:'📡 frps 反向代理', frpc:'🔌 frpc 客户端'};
-let status=null, configs={}, curTab='dashboard', editService=null, ws=null, logTimer=null;
+let status=null, configs={}, curTab='dashboard', editService=null, loggingIn=false;
+let ws=null, wsTimer=null, wsFails=0, logTimer=null, lastLogText=null, logErrShown=false;
 
+/* ---------- helpers ---------- */
+const ESC_MAP={'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'};
+/// Escape a value before it goes into innerHTML — text *and* quoted attributes.
+/// Server data (network names, db/certificate paths, error strings) and names
+/// chosen by *remote* frpc clients (frps proxy names) may contain <, & or
+/// quotes; unescaped they would break the markup or run script in this session.
+function esc(v){ return String(v??'').replace(/[&<>"']/g, c=>ESC_MAP[c]) }
+/// null / undefined / "" render as "—" instead of an empty cell.
+function val(v){ return (v===undefined||v===null||v==='')?'—':v }
+function el(id){ return document.getElementById(id) }
 function toast(msg, ok=true){
   const t=document.createElement('div');t.className='toast '+(ok?'ok':'err');t.textContent=msg;
-  document.getElementById('toast').appendChild(t);
+  el('toast').appendChild(t);
   setTimeout(()=>t.remove(), 3500);
 }
-async function j(p, opt){const r=await API.get(p) , o=opt; return r}
 async function api(p, method, body){
   const r = method ? await API.send(p, method, body) : await API.get(p);
   if(r.status===401){showLogin();throw new Error('未登录')}
@@ -160,19 +174,34 @@ async function api(p, method, body){
   if(!r.ok) throw new Error(d.error||('HTTP '+r.status));
   return d;
 }
+function connState(ok, text){
+  el('conn').classList.toggle('ok', !!ok);
+  el('conn-tx').textContent=text;
+}
+/// Click-to-select for a read-only copy field. A named handler rather than
+/// `this.select()` inline, so the static handler checks see a defined function.
+function selectText(input){ try{ input.select() }catch(e){} }
 
 /* ---------- auth ---------- */
 async function doLogin(){
-  const pw=document.getElementById('login-pw').value;
+  if(loggingIn) return;
+  loggingIn=true;
+  const err=el('login-err'), btn=el('login-btn'), pw=el('login-pw').value;
+  err.textContent=''; btn.disabled=true;
   try{
     await api('/api/login','POST',{password:pw});
-    document.getElementById('login').classList.add('hidden');
-    document.getElementById('app').classList.remove('hidden');
-    boot();
-  }catch(e){document.getElementById('login-err').textContent=e.message}
+    el('login').classList.add('hidden');
+    el('app').classList.remove('hidden');
+    boot().catch(e=>toast('初始化失败: '+(e&&e.message||e), false));
+  }catch(e){err.textContent=e.message}
+  finally{loggingIn=false;btn.disabled=false}
 }
 async function doLogout(){try{await api('/api/logout','POST')}catch(e){} location.reload()}
-function showLogin(){document.getElementById('login').classList.remove('hidden');document.getElementById('app').classList.add('hidden')}
+function showLogin(){
+  el('login').classList.remove('hidden');el('app').classList.add('hidden');
+  el('login-err').textContent='登录状态已失效，请重新登录。';
+  if(wsTimer){clearTimeout(wsTimer);wsTimer=null}
+}
 
 /* ---------- boot ---------- */
 async function boot(){
@@ -180,17 +209,23 @@ async function boot(){
   await refreshAll();
   await refreshConsoleCfg();
   connectWS();
+  if(logTimer) clearInterval(logTimer);
   logTimer = setInterval(tickLogs, 4000);
 }
+let statusErrShown=false;
 async function refreshAll(){
   try{
-    status = await api('/api/status');
-    for(const s of SERVICES){ try{ configs[s]=await api('/api/config/'+s); }catch(e){} }
-    render();
-  }catch(e){ if(e.message!=='未登录') toast(e.message,false) }
+    status = await api('/api/status'); statusErrShown=false;
+  }catch(e){
+    // Keep the last known status on screen (a poll hiccup must not blank the
+    // console), but say once that the figures on screen are the old ones.
+    if(e.message!=='未登录' && !statusErrShown){ statusErrShown=true; toast('状态读取失败: '+e.message, false) }
+    return;
+  }
+  render();
 }
 function buildNav(){
-  const nav=document.getElementById('nav');
+  const nav=el('nav');
   const tabs=[['dashboard','总览'],['easytier','EasyTier'],['stun_turn','STUN/TURN'],['rustdesk','RustDesk'],['frps','frps'],['frpc','frpc'],['system','系统']];
   nav.innerHTML=tabs.map(([id,label])=>`<button data-t="${id}" class="${id===curTab?'active':''}" onclick="switchTab('${id}')">${label}</button>`).join('');
 }
@@ -198,18 +233,27 @@ function switchTab(t){
   curTab=t;
   document.querySelectorAll('#nav button').forEach(b=>b.classList.toggle('active',b.dataset.t===t));
   for(const id of ['dashboard','easytier','stun_turn','rustdesk','frps','frpc','system'])
-    document.getElementById('tab-'+id).classList.toggle('hidden', id!==t);
-  if(t==='system'){tickLogs(); scrollLogs(); refreshConsoleCfg()}
+    el('tab-'+id).classList.toggle('hidden', id!==t);
+  if(t==='system'){ scrollLogs(); refreshConsoleCfg() }
   render();
 }
 
 /* ---------- render ---------- */
+let renderErrShown=false;
 function render(){
   if(!status) return;
-  renderDashboard(); renderServiceTabs(); if(curTab==='system') tickLogs();
+  try{
+    renderDashboard(); renderServiceTabs();
+  }catch(e){
+    // a malformed payload must not leave the console blank with no explanation
+    if(!renderErrShown){ renderErrShown=true; toast('界面渲染失败: '+e.message, false) }
+    return;
+  }
+  if(curTab==='system') tickLogs();
 }
-function badge(run, enabled){
-  if(!enabled) return '<span class="badge off">已禁用</span>';
+function badge(run, enabled, warnText){
+  if(enabled===false) return '<span class="badge off">已禁用</span>';
+  if(warnText) return `<span class="badge warn">${esc(warnText)}</span>`;
   return run?'<span class="badge run">运行中</span>':'<span class="badge stop">已停止</span>';
 }
 // The center node is an EasyTier instance, which only exists while the module
@@ -232,47 +276,69 @@ function nodeStateText(e){
   return e.network_name ? '未启动（模块已停止，点「启动」）' : '未启动（「网络名称」为空）';
 }
 function fmtBytes(n){
+  n=Number(n);
+  if(!Number.isFinite(n)||n<0) return '—';
   if(n<1024) return n+' B';
   const u=['KB','MB','GB','TB'];let i=-1;
   do{n/=1024;i++}while(n>=1024&&i<u.length-1);
   return n.toFixed(1)+' '+u[i];
 }
-function svcCard(name, running, enabled, kvs, extraButtons=''){
-  const c = configs[name]||{};
-  return `<div class="card"><h3>${TITLES[name]} ${badge(running,enabled)}</h3>
-    <div class="grid">${kvs.map(([l,v])=>`<div class="kv"><div class="l">${l}</div><div class="v">${v??'—'}</div></div>`).join('')}</div>
+function kvCell(label, value){
+  return `<div class="kv"><div class="l">${esc(label)}</div><div class="v">${esc(val(value))}</div></div>`;
+}
+function kvWarn(label, value){
+  return `<div class="kv warn"><div class="l">${esc(label)}</div><div class="v">${esc(val(value))}</div></div>`;
+}
+function svcCard(name, running, enabled, kvs, extraButtons='', warnText=''){
+  // A disabled module cannot be started by the checkbox path, but the server's
+  // start action clears the flag itself — so 启动 stays clickable and the card
+  // says what will happen instead of greying the button out silently.
+  const note = enabled===false
+    ? '<span class="hint" style="margin-left:6px">模块已禁用：点「启动」会自动重新启用它</span>' : '';
+  return `<div class="card"><h3>${esc(TITLES[name])} ${badge(running,enabled,warnText)}</h3>
+    <div class="grid">${kvs.map(([l,v])=>kvCell(l,v)).join('')}</div>
     <div class="row">
-      <button class="btn success sm" onclick="svcAction('${name}','start')" ${enabled?'':'disabled'}>▶ 启动</button>
+      <button class="btn success sm" onclick="svcAction('${name}','start')">▶ 启动</button>
       <button class="btn danger sm" onclick="svcAction('${name}','stop')">■ 停止</button>
       <button class="btn primary sm" onclick="openConfig('${name}')">⚙ 配置</button>
       ${extraButtons}
-      <label class="switch"><input type="checkbox" ${enabled?'checked':''} onchange="toggleEnabled('${name}',this.checked)"> 开机启用</label>
+      <label class="switch"><input type="checkbox" ${enabled?'checked':''} onchange="toggleEnabled('${name}',this.checked)"> 开机启用</label>${note}
     </div></div>`;
 }
 function renderDashboard(){
-  const s=status, up=s.uptime_s, d=Math.floor(up/86400), h=Math.floor(up%86400/3600), m=Math.floor(up%3600/60);
-  const el=document.getElementById('tab-dashboard');
+  const s=status, sv=s.services||{}, c=s.console||{};
+  const up=Number(s.uptime_s)||0, d=Math.floor(up/86400), h=Math.floor(up%86400/3600), m=Math.floor(up%3600/60);
+  // `console.tls` is what the config asks for; TLS material that cannot be read
+  // makes the server fall back to plaintext on the same port. Prefer the
+  // server's `tls_active` when it reports it, otherwise the scheme this page was
+  // actually served over is the truth for this session.
+  const cfgTls=!!c.tls;
+  const liveTls=(typeof c.tls_active==='boolean') ? c.tls_active : (location.protocol==='https:');
+  const livePort=location.port||c.port||'—';
+  const el0=el('tab-dashboard');
   let html=`<div class="card"><h3>🖥 系统</h3>
     <div class="grid">
-      <div class="kv"><div class="l">版本</div><div class="v">ReMgr ${s.version} (${s.os})</div></div>
-      <div class="kv"><div class="l">运行时间</div><div class="v">${d}天 ${h}时 ${m}分</div></div>
-      <div class="kv"><div class="l">控制台</div><div class="v">${s.console.tls?'HTTPS':'HTTP'} :${s.console.port}</div></div>
-      <div class="kv"><div class="l">在线 frps 客户端</div><div class="v">${s.services.frps?.clients_online??0}</div></div>
+      ${kvCell('版本','ReMgr '+s.version+' ('+s.os+')')}
+      ${kvCell('运行时间',d+'天 '+h+'时 '+m+'分')}
+      ${kvCell('控制台',(liveTls?'HTTPS':'HTTP')+' :'+livePort)}
+      ${kvCell('在线 frps 客户端',sv.frps?.clients_online??0)}
+      ${cfgTls&&!liveTls?kvWarn('⚠ HTTPS 未生效','已配置 HTTPS，但当前以 HTTP 提供服务：证书/私钥不可读或端口无法监听，详见日志；修好后点「系统 → 立即应用」'):''}
     </div></div>`;
-  const sv=s.services;
   html += svcCard('easytier', sv.easytier?.running, sv.easytier?.enabled, [
     ['配置服务器端口', sv.easytier?.config_server_port],['API 端口', sv.easytier?.api_port],
     ['本地节点', nodeStateText(sv.easytier)],
-    ['网络名', sv.easytier?.network_name||'—'],
+    ['网络名', sv.easytier?.network_name],
   ]);
-  html += svcCard('stun_turn', sv.stun_turn?.running, sv.stun_turn?.enabled, [
-    ['STUN/TURN 端口', sv.stun_turn?.stun_port],['TLS 端口', sv.stun_turn?.tls_port+(sv.stun_turn?.tls_active?' (已启用)':'')],
-    ['域名', sv.stun_turn?.domain||'—'],['中继端口范围', sv.stun_turn?.relay_ports],
-    ['TURN 中继', sv.stun_turn?.turn_available===false?'未就绪':'可用'],
+  const st=sv.stun_turn||{};
+  html += svcCard('stun_turn', st.running, st.enabled, [
+    ['STUN/TURN 端口', st.stun_port],['TLS 端口', val(st.tls_port)+(st.tls_active?' (监听中)':' (未启用)')],
+    ['域名', st.domain],['中继端口范围', st.relay_ports],
+    ['TURN 中继', st.turn_available===false?'未就绪':'可用'],
   ]);
-  html += svcCard('rustdesk', sv.rustdesk?.running, sv.rustdesk?.enabled, [
-    ['中继端口 (hbbr)', sv.rustdesk?.relay_port],['ID 端口 (hbbs)', sv.rustdesk?.hbbs_port],
-    ['服务器 Key', sv.rustdesk?.key_set?'已设置':'未设置'],['', ''],
+  const rd=sv.rustdesk||{};
+  html += svcCard('rustdesk', rd.running, rd.enabled, [
+    ['中继端口 (hbbr)', rd.relay_port],['ID 端口 (hbbs)', rd.hbbs_port],
+    ['服务器 Key', rd.key_set?'已设置':'未设置'],
   ]);
   const fp=sv.frps||{};
   html += svcCard('frps', fp.running, fp.enabled, [
@@ -283,111 +349,128 @@ function renderDashboard(){
   ]);
   const fc=sv.frpc||{};
   html += svcCard('frpc', fc.running&&fc.connected, fc.enabled, [
-    ['上游', fc.upstream||'—'],['连接', fc.running?(fc.connected?'已连接':'连接中/重连中'):'未启动'],
+    ['上游', fc.upstream],['连接', fc.running?(fc.connected?'已连接':'连接中 / 重连中'):'未启动'],
     ['代理', (fc.proxies||[]).filter(p=>p.state==='running').length+' / '+(fc.proxies||[]).length+' 个运行中'],
     ['会话时长', (fc.session_uptime_s||0)+' 秒'],
     ['入站流量', fmtBytes(fc.bytes_in||0)],['出站流量', fmtBytes(fc.bytes_out||0)],
-  ]);
-  el.innerHTML=html;
+  ], '', fc.running&&!fc.connected?'运行中·未连接':'');
+  el0.innerHTML=html;
+}
+function proxyTable(rows, cols, emptyText){
+  if(!rows.length) return `<p style="color:var(--tx2);font-size:13px">${esc(emptyText)}</p>`;
+  return `<table><tr>${cols.map(c=>`<th>${esc(c)}</th>`).join('')}</tr>`+
+    rows.map(cells=>`<tr>${cells.map(x=>`<td>${esc(val(x))}</td>`).join('')}</tr>`).join('')+'</table>';
 }
 function renderServiceTabs(){
   const s=status?.services||{};
   const fp=s.frps||{};
-  document.getElementById('tab-easytier').innerHTML =
+  el('tab-easytier').innerHTML =
     svcCard('easytier', s.easytier?.running, s.easytier?.enabled, [
-      ['配置服务器端口 (UDP)', s.easytier?.config_server_port],['REST API', s.easytier?.api_addr+':'+s.easytier?.api_port],
+      ['配置服务器端口 (UDP)', s.easytier?.config_server_port],
+      ['REST API', s.easytier? val(s.easytier.api_addr)+':'+val(s.easytier.api_port) : '—'],
       ['本地节点', nodeStateText(s.easytier)],['数据库', s.easytier?.db_path],
-      ['监听器', (s.easytier?.listeners||[]).length+' 个'],['网络名', s.easytier?.network_name||'—'],
+      ['监听器', (s.easytier?.listeners||[]).length+' 个'],['网络名', s.easytier?.network_name],
     ], `<a class="btn sm" href="/et/" target="_blank" rel="noopener">🖧 EasyTier 控制台</a>`)
-    + (s.easytier?.node_note?`<div class="card"><h3>⚠ 本地节点未启动</h3><p style="color:var(--tx2);font-size:12px">${s.easytier.node_note}</p></div>`:'')
+    + (s.easytier?.node_note?`<div class="card"><h3>⚠ 本地节点未启动</h3><p style="color:var(--tx2);font-size:12px">${esc(s.easytier.node_note)}</p></div>`:'')
     + `<div class="card"><h3>🖧 EasyTier 仪表盘（easytier-web）</h3>
       <p style="color:var(--tx2);font-size:12px">同源提供于 <a href="/et/" target="_blank" rel="noopener">/et/</a>，登陆用户 <b>admin</b>；
       首次启动的默认口令为 <code>admin</code>（同时写入 <code>/var/run/remgr/easytier_dashboard_password</code>，可在仪表盘内自行修改）。
       本地中心节点以此账户注册，会作为一台设备出现在仪表盘中。</p></div>`;
-  document.getElementById('tab-stun_turn').innerHTML =
-    svcCard('stun_turn', s.stun_turn?.running, s.stun_turn?.enabled, [
-      ['STUN/TURN 端口', s.stun_turn?.stun_port],
-      ['TLS 端口', s.stun_turn?.tls_port+(s.stun_turn?.tls_active?' (监听中)':' (未启用)')],
-      ['域名', s.stun_turn?.domain||'—'],['外部 IP', s.stun_turn?.external_ip||'自动'],
-      ['中继端口范围', s.stun_turn?.relay_ports],['用户数', s.stun_turn?.users_count],
-      ['活跃分配', s.stun_turn?.turn_runtime?.allocations??0],
-      ['中继流量', fmtBytes(s.stun_turn?.turn_runtime?.bytes_relayed||0)],
+  const st=s.stun_turn||{};
+  el('tab-stun_turn').innerHTML =
+    svcCard('stun_turn', st.running, st.enabled, [
+      ['STUN/TURN 端口', st.stun_port],
+      ['TLS 端口', val(st.tls_port)+(st.tls_active?' (监听中)':' (未启用)')],
+      ['TURN 中继 (RFC 5766)', st.turn_available===false?'未就绪（见日志）':'可用'],
+      ['域名', st.domain],['外部 IP', st.external_ip||'自动'],
+      ['中继端口范围', st.relay_ports],['用户数', st.users_count],
+      ['活跃分配', st.turn_runtime?.allocations??0],
+      ['中继流量', fmtBytes(st.turn_runtime?.bytes_relayed||0)+'（仅客户端→对端方向，下限值）'],
     ]);
-  document.getElementById('tab-rustdesk').innerHTML =
-    svcCard('rustdesk', s.rustdesk?.running, s.rustdesk?.enabled, [
-      ['中继端口 (hbbr)', s.rustdesk?.relay_port],['ID 端口 (hbbs)', s.rustdesk?.hbbs_port],
-      ['NAT 测试端口', s.rustdesk?.nat_test_port],['WebSocket 端口', s.rustdesk?.websocket_port],
-      ['中继 WebSocket 端口', s.rustdesk?.relay_websocket_port],
-      ['Key', s.rustdesk?.key_set?'已设置':'未设置'],['', ''],
+  const rd=s.rustdesk||{};
+  const pub=rd.public_key||'';
+  el('tab-rustdesk').innerHTML =
+    svcCard('rustdesk', rd.running, rd.enabled, [
+      ['中继端口 (hbbr)', rd.relay_port],['ID 端口 (hbbs)', rd.hbbs_port],
+      ['NAT 测试端口', rd.nat_test_port],['WebSocket 端口', rd.websocket_port],
+      ['中继 WebSocket 端口', rd.relay_websocket_port],
+      ['Key', rd.key_set?'已设置':'未设置'],
     ]) + `<div class="card"><h3>🔑 服务器公钥</h3>
-      <p style="color:var(--tx2);font-size:12px;margin-bottom:8px">客户端「ID/中继服务器」配置中的 Key 填此值</p>
-      <input readonly value="${s.rustdesk?.public_key||'—'}" onclick="this.select()" style="font-family:monospace;font-size:12px"></div>`;
-  let proxyRows='';
-  if(fp.proxies && fp.proxies.length){
-    proxyRows = `<table><tr><th>代理名</th><th>类型</th><th>远程端口</th><th>用户</th></tr>`+
-      fp.proxies.map(p=>`<tr><td>${p.proxy_name}</td><td>${p.proxy_type}</td><td>${p.remote_port}</td><td>${p.user||''}</td></tr>`).join('')+'</table>';
-  }
-  document.getElementById('tab-frps').innerHTML =
+      <p style="color:var(--tx2);font-size:12px;margin-bottom:8px">客户端「ID/中继服务器」配置中的 Key 填此值</p>`+
+      (pub?`<input readonly value="${esc(pub)}" onclick="selectText(this)" style="font-family:monospace;font-size:12px">`
+          :`<p style="color:var(--yellow);font-size:12px">未提供：配置里的 Key 是自定义值（不是本机磁盘密钥），服务端不返回对应的公钥。
+            请把配置中的「服务器 Key」原样填给客户端；若想使用自动生成的密钥对，清空配置中的 Key 并重启模块。</p>`)+
+      `</div>`;
+  el('tab-frps').innerHTML =
     svcCard('frps', fp.running, fp.enabled, [
-      ['监听', fp.bind],['tcp_mux', String(fp.tcp_mux)],
+      ['监听', fp.bind],['在线客户端', fp.clients_online],['tcp_mux', String(fp.tcp_mux)],
       ['入站', fmtBytes(fp.bytes_in||0)],['出站', fmtBytes(fp.bytes_out||0)],
       ['累计登录', fp.total_logins],['用户连接', fp.total_user_conns],
       ['认证 Token', fp.token_set?'已设置':'未设置（任何客户端可登录）'],
       ['TLS 证书', fp.tls?'已配置':'临时自签证书'],
-    ]) + `<div class="card"><h3>📋 活跃代理</h3>${proxyRows||'<p style="color:var(--tx2);font-size:13px">暂无</p>'}</div>
+    ]) + `<div class="card"><h3>📋 活跃代理</h3>`+
+      proxyTable((fp.proxies||[]).map(p=>[p.proxy_name,p.proxy_type,p.remote_port,p.user,p.conns_total]),
+        ['代理名','类型','远程端口','用户','累计连接'],'暂无')+
+    `</div>
     <div class="card"><h3>ℹ frpc 兼容性</h3><p style="color:var(--tx2);font-size:12px">
       本服务端实现 frp V1 线协议（<code>transport.wireProtocol = "v1"</code>，现代 frpc 的默认值，已用 frpc 0.71 实测）。
-      客户端配置：<code>serverAddr</code> = 本机地址，<code>serverPort</code> = ${fp.bind?.split(':').pop()||7000}，
+      客户端配置：<code>serverAddr</code> = 本机地址，<code>serverPort</code> = ${esc(fp.bind?.split(':').pop()||7000)}，
       <code>auth.token</code> 与上方一致；TLS / tcp_mux 保持默认即可。
       支持 <code>tcp</code> / <code>udp</code> 代理；http/https/stcp/xtcp 类型返回协议错误。</p></div>`;
   // frpc: this box as a *client* of an upstream frps
   const fc=s.frpc||{};
-  const frpRows = (fc.proxies&&fc.proxies.length)
-    ? `<table><tr><th>代理名</th><th>类型</th><th>本地服务</th><th>远程端口</th><th>状态</th><th>流量</th></tr>`+
-      fc.proxies.map(p=>`<tr><td>${p.name}</td><td>${p.type}</td><td>${p.local_addr||''}</td><td>${p.remote_port||''}</td>`+
-        `<td>${p.state==='running'?'运行中':p.state==='waiting'?'注册中':p.state==='error'?'错误':'未启动'}${p.error?` — ${p.error}`:''}</td>`+
-        `<td>${fmtBytes(p.bytes_in||0)} / ${fmtBytes(p.bytes_out||0)}</td></tr>`).join('')+'</table>'
-    : '<p style="color:var(--tx2);font-size:13px">暂无</p>';
-  document.getElementById('tab-frpc').innerHTML =
+  const stateText=(p)=>p.state==='running'?'运行中':p.state==='waiting'?'注册中（等上游确认）':
+    p.state==='error'?'错误':p.state==='idle'?'未注册':'未启动';
+  const frpRows = proxyTable((fc.proxies||[]).map(p=>[
+      p.name, p.type||p.proxy_type, p.local_addr, p.remote_port,
+      stateText(p)+(p.error?(' — '+p.error):''),
+      fmtBytes(p.bytes_in||0)+' / '+fmtBytes(p.bytes_out||0), p.conns_total,
+    ]), ['代理名','类型','本地服务','远程端口','状态','流量 (入/出)','累计连接'], '暂无');
+  el('tab-frpc').innerHTML =
     svcCard('frpc', fc.running&&fc.connected, fc.enabled, [
-      ['上游服务器', fc.upstream||'—'],
+      ['上游服务器', fc.upstream],
       ['连接状态', fc.running?(fc.connected?'已连接':'连接中 / 重连中'):'未启动'],
       ['认证 Token', fc.token_set?'已设置':'未设置'],
       ['tcp_mux', String(fc.tcp_mux)],['TLS', fc.tls?'启用':'关闭'],
-      ['连接池', fc.pool_count],['累计登录', fc.total_logins],
+      ['连接池（配置值）', fc.pool_count],['累计登录', fc.total_logins],
       ['工作连接', fc.total_work_conns],['会话时长', (fc.session_uptime_s||0)+' 秒'],
       ['入站流量', fmtBytes(fc.bytes_in||0)],['出站流量', fmtBytes(fc.bytes_out||0)],
-    ]) + (fc.last_error?`<div class="card"><h3>⚠ 最近错误</h3><p style="color:var(--red);font-size:12px">${fc.last_error}</p></div>`:'')
+    ], '', fc.running&&!fc.connected?'运行中·未连接':'')
+    + (fc.last_error?`<div class="card"><h3>⚠ 最近错误</h3><p style="color:var(--red);font-size:12px">${esc(fc.last_error)}</p></div>`:'')
     + `<div class="card"><h3>📋 代理</h3>${frpRows}</div>
        <div class="card"><h3>ℹ frpc 说明</h3><p style="color:var(--tx2);font-size:12px">
        本模块让这台机器作为 frp <b>客户端</b>把本地服务发布到上游 frps（可为 fatedier/frp 或另一台 ReMgr）。
-       代理列表每行格式：<code>名称 类型 本地IP 本地端口 远程端口</code>，类型支持 <code>tcp</code>/<code>udp</code>；
+       代理列表每行格式：<code>名称 类型 本地IP 本地端口 远程端口</code>（名称不能含空格），类型支持 <code>tcp</code>/<code>udp</code>；
        <code>tcp_mux</code> 必须与上游一致；上游用自签证书时保持 TLS 开启（默认不校验证书，也可填 CA 文件）。</p></div>`;
 }
 
 /* ---------- actions ---------- */
 async function svcAction(name, action){
+  if(action==='stop'){
+    // Stopping persists enabled=false on the server (the module then stays down
+    // across a reboot), which silently unticks 开机启用 — say so first.
+    if(!confirm(`停止 ${TITLES[name]||name}？\n\n停止会同时关闭「开机启用」，重启后不再自动启动；\n下次点「启动」会自动重新启用。`)) return;
+  }
   try{
     await api(`/api/service/${name}/${action}`,'POST',{});
-    toast(`${name} ${action==='start'?'已启动':action==='stop'?'已停止':''}`);
-    await refreshAll();
+    toast(`${name} ${action==='start'?'已启动':action==='stop'?'已停止':action+' 完成'}`);
   }catch(e){toast(e.message,false)}
+  await refreshAll();
 }
 async function toggleEnabled(name, enabled){
   try{
-    const cfg = configs[name]||{};
-    cfg.enabled = enabled;
+    // Read the section fresh and send it whole: the server fills every missing
+    // field with its default, so a partial PUT (e.g. {enabled:true}) would quietly
+    // reset the rest of that service's configuration.
+    const cfg = await api('/api/config/'+name);
+    cfg.enabled = !!enabled;
     await api('/api/config/'+name,'PUT',cfg);
     toast(`${name} ${enabled?'已启用':'已禁用'}`);
-    await refreshAll();
-  }catch(e){toast(e.message,false);refreshAll()}
+  }catch(e){toast(e.message,false)}
+  await refreshAll();
 }
 
 /* ---------- config modal ---------- */
-function F(label, path, hint='', type='text'){
-  return `<div class="fg"><label>${label}</label><input type="${type}" data-path="${path}" value="">
-    ${hint?`<div class="hint">${hint}</div>`:''}</div>`;
-}
 const SCHEMAS = {
   easytier: [
     [['enabled','启用模块','',['checkbox']]],
@@ -441,7 +524,7 @@ const SCHEMAS = {
     [['tcp_mux','启用 yamux 多路复用','必须与上游一致（默认开启）',['checkbox']]],
     [['connect_timeout','连接超时 (秒)','',['number']]],
     [['pool_count','工作连接池大小','',['number']]],
-    [['proxies','代理列表 (每行一个)','格式：名称 类型 本地IP 本地端口 远程端口（类型 tcp/udp），例如 web tcp 127.0.0.1 8080 7001','textarea']],
+    [['proxies','代理列表 (每行一个)','格式：名称 类型 本地IP 本地端口 远程端口（类型 tcp/udp、名称不含空格），例如 web tcp 127.0.0.1 8080 7001','textarea']],
   ],
 };
 
@@ -465,58 +548,84 @@ function proxyLine(p){
   return [p.name, p.type||p.proxy_type||'tcp', p.local_ip||'127.0.0.1', p.local_port, p.remote_port].filter(x=>x!==undefined&&x!==null).join(' ');
 }
 
-function openConfig(svc){
+async function openConfig(svc){
+  // Always edit what the server has right now: a stale or missing copy would be
+  // sent back as a whole-section PUT and silently reset every field it lacks.
+  let cfg;
+  try{
+    cfg = await api('/api/config/'+svc);
+  }catch(e){
+    toast('读取配置失败，未打开编辑框: '+e.message,false);
+    return;
+  }
+  configs[svc]=cfg;
   editService=svc;
-  document.getElementById('modal-title').textContent='配置 — '+TITLES[svc];
-  const cfg=configs[svc]||{};
+  try{
+    el('modal-title').textContent='配置 — '+TITLES[svc];
+    el('modal-body').innerHTML=configFormHtml(svc, cfg);
+    el('modal').classList.remove('hidden');
+  }catch(e){ toast('生成配置表单失败: '+e.message, false) }
+}
+/// The editing controls for one service, from the configuration just read.
+function configFormHtml(svc, cfg){
   const fields=flattenSchema(svc).map(f=>{
     if(f.widget==='hidden') return '';
     const v=getPath(cfg,f.path);
     if(f.widget==='checkbox')
-      return `<div class="fg"><label class="switch" style="margin:0"><input type="checkbox" data-path="${f.path}" ${v?'checked':''}> ${f.label}</label></div>`;
+      return `<div class="fg"><label class="switch" style="margin:0"><input type="checkbox" data-path="${f.path}" ${v?'checked':''}> ${esc(f.label)}</label></div>`;
     if(f.widget==='textarea'){
       // Arrays of tables (frpc proxies, TURN users) are edited as one line each;
       // a proxy table can also be sent as its one-line form, which the server
       // parses back into the same structure.
       const text = v===undefined||v===null ? '' : (Array.isArray(v) ? v.map(x=>typeof x==='string'?x:proxyLine(x)).join('\n') : v);
-      return `<div class="fg"><label>${f.label}</label><textarea data-path="${f.path}" rows="4" style="width:100%;padding:9px;border:1px solid var(--border);border-radius:7px;background:var(--bg);color:var(--tx);font-size:12px;font-family:monospace">${text}</textarea>${f.hint?`<div class="hint">${f.hint}</div>`:''}</div>`;
+      return `<div class="fg"><label>${esc(f.label)}</label><textarea data-path="${f.path}" rows="4" style="width:100%;padding:9px;border:1px solid var(--border);border-radius:7px;background:var(--bg);color:var(--tx);font-size:12px;font-family:monospace">${esc(text)}</textarea>${f.hint?`<div class="hint">${esc(f.hint)}</div>`:''}</div>`;
     }
     const type = f.widget==='number' ? 'number' : 'text';
-    return `<div class="fg"><label>${f.label}</label><input type="${type}" data-path="${f.path}" value="${v!==undefined&&v!==null?String(v).replace(/"/g,'&quot;'):''}">${f.hint?`<div class="hint">${f.hint}</div>`:''}</div>`;
+    return `<div class="fg"><label>${esc(f.label)}</label><input type="${type}" data-path="${esc(f.path)}" value="${esc(v)}">${f.hint?`<div class="hint">${esc(f.hint)}</div>`:''}</div>`;
   }).join('');
-  // A certificate is what TURN-over-TLS and frpc's transport.tls need; offer to
-  // mint one for the domain entered above, or to install an existing pair (e.g.
-  // a real CA cert). Either way the paths below are filled in automatically.
+  // A certificate is what TURN-over-TLS and frps' TLS need; offer to mint one for
+  // the domain entered above, or to install an existing pair (e.g. a real CA
+  // cert). Either way the paths below are filled in automatically.
   const certSvc = {stun_turn:'turn', frps:'frps'}[svc];
   const certRow = certSvc
     ? `<div class="row" style="margin-top:12px"><button class="btn" onclick="genCert('${certSvc}')">🔐 生成自签证书</button>
        <button class="btn" onclick="uploadCert('${certSvc}')">📥 上传证书</button>
-       <span class="hint" style="margin-left:8px">生成按上方「域名」，或粘贴已有 PEM；证书路径会自动写入本页配置</span></div>`
+       <span class="hint" style="margin-left:8px">${svc==='stun_turn'?'生成按上方「域名」':'生成时会询问域名（本页无「域名」字段）'}，或粘贴已有 PEM；证书路径会自动写入本页配置</span></div>`
     : '';
-  document.getElementById('modal-body').innerHTML=fields+certRow;
-  document.getElementById('modal').classList.remove('hidden');
+  return fields+certRow+
+    `<div class="hint" style="margin-top:6px">数字输入留空表示保持原值；保存会立即写入磁盘并对运行中的模块生效（服务端会重启该模块）。</div>`;
 }
-function closeModal(){document.getElementById('modal').classList.add('hidden')}
+function closeModal(){el('modal').classList.add('hidden')}
 async function saveModal(){
   if(!editService) return;
-  const cfg=JSON.parse(JSON.stringify(configs[editService]||{}));
-  document.querySelectorAll('#modal-body [data-path]').forEach(el=>{
+  if(!configs[editService]) return toast('配置尚未加载，未保存',false);
+  const cfg=JSON.parse(JSON.stringify(configs[editService]));
+  let bad=null;
+  document.querySelectorAll('#modal-body [data-path]').forEach(elm=>{
     let v;
-    if(el.type==='checkbox') v=el.checked;
-    else if(el.tagName==='TEXTAREA'){
-      v=el.value;
+    if(elm.type==='checkbox') v=elm.checked;
+    else if(elm.tagName==='TEXTAREA'){
+      v=elm.value;
       // listeners / users / frpc proxies are string arrays (the server parses
       // each proxy line into the same table it would accept as JSON)
-      if(['listeners','users','proxies'].includes(el.dataset.path)) v=el.value.split('\n').map(x=>x.trim()).filter(Boolean);
+      if(['listeners','users','proxies'].includes(elm.dataset.path)) v=elm.value.split('\n').map(x=>x.trim()).filter(Boolean);
     }
-    else if(el.type==='number'){
+    else if(elm.type==='number'){
       // empty numeric inputs keep the existing value rather than becoming 0
-      if(el.value.trim()==='') return;
-      v=Number(el.value);
+      if(elm.value.trim()==='') return;
+      const n=Number(elm.value);
+      // the backend deserializes into u16/u32/u64: a fraction or NaN would come
+      // back as "invalid type: floating point/null", or silently as JSON null
+      if(!Number.isInteger(n)||n<0){
+        if(bad===null) bad=(elm.previousElementSibling?.textContent||elm.dataset.path||'').trim()||elm.dataset.path;
+        return;
+      }
+      v=n;
     }
-    else v=el.value;
-    setPath(cfg, el.dataset.path, v);
+    else v=elm.value;
+    setPath(cfg, elm.dataset.path, v);
   });
+  if(bad) return toast('字段「'+bad+'」必须是整数：请修正后再保存',false);
   try{
     await api('/api/config/'+editService,'PUT',cfg);
     toast('配置已保存并应用');closeModal();await refreshAll();
@@ -533,12 +642,13 @@ async function genCert(svc){
   if(!domain) return;
   try{
     const r=await api('/api/system/certs/generate','POST',{service:svc,domain});
-    toast('证书已生成: '+r.cert_path+(r.configured?.length?`（已写入 ${r.configured.join(', ')}）`:''));
+    toast('证书已生成: '+r.cert_path+(r.configured?.length?`（已写入 ${r.configured.join(', ')}）`:'')
+      +(svc==='console'?' —— 点「立即应用」后控制台才会使用新证书，否则会被浏览器警告/无法访问':''), true);
     await refreshAll();
-    if(!document.getElementById('modal').classList.contains('hidden')) openConfig(editService);
+    if(svc==='console') await refreshConsoleCfg();
+    if(editService&&!el('modal').classList.contains('hidden')) await openConfig(editService);
   }catch(e){toast(e.message,false)}
 }
-
 async function uploadCert(svc){
   const cert=prompt('粘贴证书 PEM（包含 BEGIN CERTIFICATE）:');
   if(!cert) return;
@@ -546,67 +656,112 @@ async function uploadCert(svc){
   if(!key) return;
   try{
     const r=await api('/api/system/certs/upload','POST',{service:svc,cert_pem:cert,key_pem:key});
-    toast('证书已写入: '+r.cert_path+(r.configured?.length?`（已写入 ${r.configured.join(', ')}）`:''));
+    toast('证书已写入: '+r.cert_path+(r.configured?.length?`（已写入 ${r.configured.join(', ')}）`:'')
+      +(svc==='console'?' —— 点「立即应用」后控制台才会使用新证书，否则会被浏览器警告/无法访问':''), true);
     await refreshAll();
-    if(!document.getElementById('modal').classList.contains('hidden')) openConfig(editService);
+    if(svc==='console') await refreshConsoleCfg();
+    if(editService&&!el('modal').classList.contains('hidden')) await openConfig(editService);
   }catch(e){toast(e.message,false)}
 }
 
 /* ---------- console settings ---------- */
-let consoleCfg=null;
+let consoleCfg=null, consoleCfgErr=null;
 async function refreshConsoleCfg(){
-  try{ consoleCfg=await api('/api/config/console'); }catch(e){ consoleCfg=null }
+  try{ consoleCfg=await api('/api/config/console'); consoleCfgErr=null }
+  catch(e){ consoleCfg=null; consoleCfgErr=e.message }
   renderConsoleForm();
 }
+function setConsoleButtons(on){
+  for(const id of ['console-save','console-apply']){
+    const b=el(id); if(b) b.disabled=!on;
+  }
+}
 function renderConsoleForm(){
-  const el=document.getElementById('console-form'); if(!el) return;
-  const c=consoleCfg||{};
+  const host=el('console-form'); if(!host) return;
+  const c=consoleCfg;
+  if(!c){
+    // Rendering the defaults here would hand the operator a form that silently
+    // overwrites the real settings on save — refuse instead.
+    host.innerHTML=`<div class="fg"><label>控制台配置</label><div class="v" style="color:var(--red);font-size:12px">读取失败${consoleCfgErr?('：'+esc(consoleCfgErr)):''}——
+      为避免用占位值覆盖磁盘上的设置，「保存」与「立即应用」已禁用。请稍后重试或刷新页面。</div></div>`;
+    setConsoleButtons(false);
+    return;
+  }
+  setConsoleButtons(true);
   const rows=[
     ['port','控制台端口',c.port??9443],
     ['tls_cert','TLS 证书路径',c.tls_cert??''],
     ['tls_key','TLS 私钥路径',c.tls_key??''],
     ['session_ttl','会话有效期（秒）',c.session_ttl??604800],
-  ].map(([p,l,v])=>`<div class="fg"><label>${l}</label><input data-cpath="${p}" value="${String(v).replace(/"/g,'&quot;')}"></div>`).join('');
-  el.innerHTML=rows+`<div class="fg"><label class="switch" style="margin:0"><input type="checkbox" data-cpath="tls" ${c.tls?'checked':''}> 启用 HTTPS（需证书；未启用则 HTTP）</label></div>`
-    +`<div class="hint">应用后地址：<code>${c.tls?'https':'http'}://${location.hostname}:${c.port??9443}/</code>
+  ].map(([p,l,v])=>`<div class="fg"><label>${esc(l)}</label><input data-cpath="${esc(p)}" value="${esc(v)}"></div>`).join('');
+  host.innerHTML=rows+`<div class="fg"><label class="switch" style="margin:0"><input type="checkbox" data-cpath="tls" ${c.tls?'checked':''}> 启用 HTTPS（需证书；未启用则 HTTP）</label></div>`
+    +`<div class="hint">配置值（已保存）：<code>${c.tls?'https':'http'}://${esc(location.hostname)}:${esc(c.port??9443)}/</code>
        —— 自签名证书浏览器会提示不受信任，可在此上传正式证书。</div>`;
 }
 function collectConsoleCfg(){
-  const c=JSON.parse(JSON.stringify(consoleCfg||{}));
-  document.querySelectorAll('#console-form [data-cpath]').forEach(el=>{
-    const p=el.dataset.cpath;
-    if(el.type==='checkbox') c[p]=el.checked;
-    else if(p==='port'||p==='session_ttl'){ if(el.value.trim()!=='') c[p]=Number(el.value); }
-    else c[p]=el.value;
+  if(!consoleCfg) throw new Error('控制台配置尚未读取成功');
+  const c=JSON.parse(JSON.stringify(consoleCfg));
+  document.querySelectorAll('#console-form [data-cpath]').forEach(elm=>{
+    const p=elm.dataset.cpath;
+    if(elm.type==='checkbox'){ c[p]=elm.checked; return }
+    if(p==='port'||p==='session_ttl'){
+      const raw=elm.value.trim();
+      const name = p==='port'?'端口':'会话有效期';
+      if(raw==='') throw new Error(name+'不能为空');
+      const n=Number(raw);
+      if(!Number.isInteger(n)||n<=0) throw new Error(name+'必须是正整数');
+      if(p==='port'&&n>65535) throw new Error('端口必须在 1-65535 之间');
+      c[p]=n; return;
+    }
+    c[p]=elm.value;
   });
   return c;
 }
 async function saveConsole(){
+  if(!consoleCfg) return toast('控制台配置尚未读取成功，未保存',false);
   try{
-    const r=await api('/api/config/console','PUT',collectConsoleCfg());
-    toast(r.note||'控制台设置已保存');
-    await refreshConsoleCfg();
-  }catch(e){toast(e.message,false)}
+    const c=collectConsoleCfg();
+    await api('/api/config/console','PUT',c);
+    toast('控制台设置已保存（端口/TLS 需点「立即应用」重新绑定后生效）');
+  }catch(e){return toast(e.message,false)}
+  await refreshConsoleCfg();
 }
 async function applyConsole(){
-  const c=consoleCfg||{};
-  // Rebinding can change the scheme and the port, so navigate to where the
-  // console will actually be — reloading the current URL would land on a dead
-  // address (e.g. http://host:9443 after switching to HTTPS).
-  const target=`${c.tls?'https':'http'}://${location.hostname}:${c.port||location.port||9443}/`;
+  if(!consoleCfg) return toast('控制台配置尚未读取成功，无法应用',false);
+  if(!confirm('将保存当前表单并重新绑定控制台监听（端口/TLS 变更会短暂断连）。\n\n若新设置无法监听，服务端会退回上一次可用的设置。继续？')) return;
+  let target;
   try{
-    const r=await api('/api/console/apply','POST',{});
-    toast((r.note||'控制台正在重新绑定…')+` → ${target}`);
-    setTimeout(()=>{ if(location.href.replace(/\/$/,'')!==target.replace(/\/$/,'')) location.replace(target); else location.reload(); },2000);
-  }catch(e){toast(e.message,false)}
+    // Save what is on screen first: applying the *stored* settings while the
+    // operator looks at edited fields would rebind somewhere they did not ask for.
+    const c=collectConsoleCfg();
+    await api('/api/config/console','PUT',c);
+    target=`${c.tls?'https':'http'}://${location.hostname}:${c.port}/`;
+    await api('/api/console/apply','POST',{});
+  }catch(e){return toast(e.message,false)}
+  toast('控制台正在重新绑定… 目标地址 '+target);
+  const up=await waitConsoleUp(target, 15000);
+  toast(up?'控制台已在新地址响应，正在跳转':'15 秒内未等到新地址响应（端口可能仍不可用），仍尝试跳转', up);
+  if(location.href.replace(/\/$/,'')===target.replace(/\/$/,'')) location.reload();
+  else location.replace(target);
+}
+/// Probe the address the console is being rebound to, so the operator is not
+/// thrown at a dead port right after the restart window.
+async function waitConsoleUp(target, ms){
+  const end=Date.now()+ms;
+  while(Date.now()<end){
+    try{ await fetch(target+'api/status',{mode:'no-cors',cache:'no-store'}); return true }catch(e){}
+    await new Promise(r=>setTimeout(r,700));
+  }
+  return false;
 }
 async function changePassword(){
-  const old=document.getElementById('pw-old').value, nw=document.getElementById('pw-new').value;
+  const old=el('pw-old').value, nw=el('pw-new').value;
   if(!old||!nw) return toast('请填写当前密码与新密码',false);
+  if(nw.trim().length<4) return toast('新密码至少 4 位',false);
   try{
     await api('/api/console/password','POST',{old,new:nw});
-    document.getElementById('pw-old').value=''; document.getElementById('pw-new').value='';
-    toast('密码已修改');
+    el('pw-old').value=''; el('pw-new').value='';
+    toast('密码已修改（其它已登录的会话仍然有效，必要时可重启控制台会话）');
   }catch(e){toast(e.message,false)}
 }
 
@@ -615,46 +770,77 @@ async function tickLogs(){
   if(curTab!=='system') return;
   try{
     const d=await api('/api/logs?n=400');
-    const el=document.getElementById('logs');
-    if(el.dataset.count===String(d.lines.length)) return;
-    el.textContent=d.lines.join('\n');
-    el.dataset.count=String(d.lines.length);
+    const lines=Array.isArray(d.lines)?d.lines:[];
+    const host=el('logs');
+    // Compare the text, not the line count: the server keeps a 1000-line ring and
+    // n=400 always returns 400 lines once it is full, so a count check would stop
+    // refreshing the view for good.
+    const text=lines.join('\n');
+    logErrShown=false;
+    if(lastLogText===text) return;
+    lastLogText=text;
+    host.textContent=text;
     scrollLogs();
-  }catch(e){}
+  }catch(e){
+    if(!logErrShown){ logErrShown=true; toast('日志读取失败: '+e.message,false) }
+  }
 }
-function scrollLogs(){const el=document.getElementById('logs'); if(document.getElementById('log-follow')?.checked) el.scrollTop=el.scrollHeight}
+function scrollLogs(){const host=el('logs'); if(el('log-follow')?.checked) host.scrollTop=host.scrollHeight}
 function downloadLogs(){
   // Prefer the file log: unlike the in-memory ring buffer it survives restarts.
   api('/api/logs?n=20000&file=1').catch(()=>api('/api/logs?n=1000')).then(d=>{
+    const lines=(d&&Array.isArray(d.lines))?d.lines:[];
     const stamp=new Date().toISOString().slice(0,19).replace(/[:T]/g,'');
-    const blob=new Blob([(d.lines||[]).join('\n')],{type:'text/plain;charset=utf-8'});
+    const blob=new Blob([lines.join('\n')+'\n'],{type:'text/plain;charset=utf-8'});
     const a=document.createElement('a');
-    a.href=URL.createObjectURL(blob);
+    const url=URL.createObjectURL(blob);
+    a.href=url;
     a.download=`remgr-log-${stamp}.txt`;
     document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(()=>URL.revokeObjectURL(a.href),10000);
-  }).catch(e=>toast(e.message,false));
+    setTimeout(()=>URL.revokeObjectURL(url),10000);
+  }).catch(e=>toast('下载日志失败: '+e.message,false));
 }
 function connectWS(){
   try{
+    if(ws && (ws.readyState===0||ws.readyState===1)) return;   // one socket only
     const proto=location.protocol==='https:'?'wss':'ws';
     ws=new WebSocket(`${proto}://${location.host}/api/ws/logs`);
-    ws.onopen=()=>{document.getElementById('conn').classList.add('ok');document.getElementById('conn-tx').textContent='已连接'};
+    ws.onopen=()=>{wsFails=0; connState(true,'已连接')};
     ws.onmessage=ev=>{
       if(curTab!=='system')return;
-      const el=document.getElementById('logs');
-      el.textContent+='\n'+ev.data;
-      while(el.textContent.length>200000) el.textContent=el.textContent.slice(el.textContent.indexOf('\n')+1);
+      const host=el('logs');
+      host.textContent+='\n'+String(ev.data??'');
+      // keep the DOM bounded — drop whole lines, and never cut inside one (a
+      // single huge line without a newline used to loop forever)
+      while(host.textContent.length>200000){
+        const i=host.textContent.indexOf('\n');
+        if(i<0){host.textContent=host.textContent.slice(-100000);break}
+        host.textContent=host.textContent.slice(i+1);
+      }
+      lastLogText=null;   // let the next poll re-sync its signature
       scrollLogs();
     };
-    ws.onclose=()=>{document.getElementById('conn').classList.remove('ok');document.getElementById('conn-tx').textContent='断开';setTimeout(connectWS,4000)};
+    ws.onclose=()=>{
+      ws=null;
+      // Not logged in (login overlay up) → no point retrying; boot() reconnects.
+      if(el('app').classList.contains('hidden')) return;
+      connState(false,'日志流已断开，重连中…');
+      wsFails++;
+      const delay=Math.min(4000*Math.pow(2,wsFails-1),30000);   // back off, do not hammer
+      if(wsTimer) clearTimeout(wsTimer);
+      wsTimer=setTimeout(connectWS, delay);
+    };
     ws.onerror=()=>{try{ws.close()}catch(e){}};
-  }catch(e){}
+  }catch(e){
+    if(wsTimer) clearTimeout(wsTimer);
+    wsFails++;
+    wsTimer=setTimeout(connectWS, Math.min(4000*Math.pow(2,wsFails-1),30000));
+  }
 }
 
 /* status poll */
-setInterval(()=>{ if(status && !document.getElementById('app').classList.contains('hidden')) refreshAll(); }, 10000);
-document.getElementById('modal').addEventListener('click', e=>{ if(e.target.id==='modal') closeModal() });
+setInterval(()=>{ if(status && !el('app').classList.contains('hidden')) refreshAll(); }, 10000);
+el('modal').addEventListener('click', e=>{ if(e.target.id==='modal') closeModal() });
 </script>
 </body>
 </html>

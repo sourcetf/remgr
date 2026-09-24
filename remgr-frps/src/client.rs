@@ -95,9 +95,26 @@ const LOCAL_DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// broken upstream cannot make the client allocate unboundedly. Stateless UDP
 /// flows recover by opening a new socket on the next datagram.
 const MAX_UDP_USER_SESSIONS: usize = 1024;
+/// Sanity bound on `pool_count`: the upstream is asked to pre-issue this many
+/// work connections, and every one of them becomes a stream and a task here.
+const MAX_POOL_COUNT: u32 = 1000;
 
 fn now_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
+}
+
+/// `host:port` for dialing or displaying: a bare IPv6 literal has to be
+/// bracketed (`[::1]:7000`), or the resolver reads `::1:7000` as a hostname and
+/// every connection through that proxy fails. `server_addr` may equally be a
+/// name or an address, which is why the brackets are added here and not by the
+/// caller.
+fn host_port(host: &str, port: u16) -> String {
+    let host = host.trim();
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
 }
 
 fn d_true() -> bool {
@@ -127,7 +144,7 @@ fn d_local_ip() -> String {
 /// Deserializes from either a table (`{"name":…,"proxy_type":…}`) or a single
 /// line (`"web tcp 127.0.0.1 8080 7001"` / `"web,udp,127.0.0.1,5353,5353"`),
 /// so the console can offer a plain textarea and TOML/JSON can use tables.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct FrpcProxyConfig {
     pub name: String,
     #[serde(rename = "type")]
@@ -138,9 +155,11 @@ pub struct FrpcProxyConfig {
 }
 
 impl FrpcProxyConfig {
-    /// `127.0.0.1:8080` — the address the local service is dialed on.
+    /// `127.0.0.1:8080` — the address the local service is dialed on. An IPv6
+    /// literal keeps the brackets frp's own config uses (`[::1]:8080`): without
+    /// them `::1:8080` is not a valid socket address and the dial fails.
     pub fn local_addr(&self) -> String {
-        format!("{}:{}", self.local_ip, self.local_port)
+        host_port(&self.local_ip, self.local_port)
     }
 
     /// Parse `name [tcp|udp] [local_ip] local_port remote_port`; commas may be
@@ -164,14 +183,36 @@ impl FrpcProxyConfig {
             remote_port: 0,
         };
         let mut ports: Vec<u16> = Vec::new();
+        let mut ip_seen = false;
         for tok in &parts[1..] {
             if tok.eq_ignore_ascii_case("tcp") || tok.eq_ignore_ascii_case("udp") {
                 p.proxy_type = tok.to_ascii_lowercase();
             } else if let Ok(n) = tok.parse::<u16>() {
                 ports.push(n);
-            } else {
+            } else if let Ok(n) = tok.parse::<i64>() {
+                // all digits but unusable as a port (70000, -1, …): a typo that
+                // would otherwise be taken for an address and dialed as one
+                return Err(format!("proxy {:?}: port {n} is out of range (0-65535)", p.name));
+            } else if !ip_seen {
                 p.local_ip = (*tok).to_string();
+                ip_seen = true;
+            } else {
+                // A second address (or any other word) is a typo, not a value
+                // to guess about: silently ignoring it turns "…127.0.0.1 8080
+                // 7001 typo" into a proxy dialing the host "typo".
+                return Err(format!(
+                    "proxy {:?}: unexpected field {:?} \
+                     (name [tcp|udp] [local_ip] local_port remote_port)",
+                    p.name, tok
+                ));
             }
+        }
+        if ports.len() > 2 {
+            return Err(format!(
+                "proxy {:?} has {} port values, expected local_port and remote_port",
+                p.name,
+                ports.len()
+            ));
         }
         if ports.len() < 2 {
             return Err(format!(
@@ -229,7 +270,7 @@ impl<'de> Deserialize<'de> for FrpcProxyConfig {
 }
 
 /// Upstream connection settings plus the proxies to publish.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FrpcConfig {
     /// Off by default: unlike the server modules a client has no useful default
     /// upstream, and auto-starting one that points nowhere would only produce a
@@ -257,6 +298,14 @@ pub struct FrpcConfig {
     #[serde(default)]
     pub server_name: String,
     /// `transport.tcpMux`
+    ///
+    /// Off means the legacy transport where every work connection is its own TCP
+    /// connection. Measured against frp 0.71.0: an frps of 0.52 or newer *always*
+    /// multiplexes (its `transport.tcpMux` is gone) and answers the plain
+    /// protocol with `yamux: Invalid protocol version: 111` — 111 being the `o`
+    /// of the Login frame it just read. ReMgr's own frps behaves the same way
+    /// while its `tcp_mux` is on, so with this off the upstream has to be an
+    /// older frps or a ReMgr server configured with `tcp_mux` off as well.
     #[serde(default = "d_true")]
     pub tcp_mux: bool,
     /// seconds to reach the upstream and to finish TLS + login
@@ -299,6 +348,17 @@ impl FrpcConfig {
         if self.connect_timeout == 0 {
             bail!("frpc: connect_timeout must not be 0");
         }
+        // The upstream pre-issues one work connection per pooled slot. A real
+        // frps does not clamp this the way ReMgr's own does, so an absurd value
+        // would have the upstream (and this client, which then has to open that
+        // many streams) allocate until something gives.
+        if self.pool_count > MAX_POOL_COUNT {
+            bail!(
+                "frpc: pool_count {} is out of range (0-{})",
+                self.pool_count,
+                MAX_POOL_COUNT
+            );
+        }
         let mut seen: Vec<&str> = Vec::new();
         for (i, p) in self.proxies.iter().enumerate() {
             if p.name.trim().is_empty() {
@@ -326,9 +386,44 @@ impl FrpcConfig {
             if p.remote_port == 0 {
                 bail!("frpc: proxy {:?} has no remote_port", p.name);
             }
+            // A proxy whose local service is the upstream's own listener (or its
+            // own published port on the upstream host) forwards user traffic
+            // straight back into itself: reject the literals that can be seen
+            // without resolving names.
+            if same_host(&p.local_ip, &self.server_addr) && p.local_port == self.server_port {
+                bail!(
+                    "frpc: proxy {:?} forwards to {:?}, the upstream's own control port — \
+                     it would loop back into the tunnel",
+                    p.name,
+                    host_port(&p.local_ip, p.local_port)
+                );
+            }
+            if same_host(&p.local_ip, &self.server_addr) && p.local_port == p.remote_port {
+                bail!(
+                    "frpc: proxy {:?} forwards to {:?}, its own published port on the \
+                     upstream — it would loop back into the tunnel",
+                    p.name,
+                    host_port(&p.local_ip, p.local_port)
+                );
+            }
         }
         Ok(())
     }
+}
+
+/// Do two configured hosts name the same machine? Only the forms that can be
+/// compared without resolving — an exact match, and the loopback spellings —
+/// because resolving here would turn a validation into a name lookup.
+fn same_host(a: &str, b: &str) -> bool {
+    let (a, b) = (a.trim(), b.trim());
+    if a.eq_ignore_ascii_case(b) {
+        return true;
+    }
+    fn loopback(h: &str) -> bool {
+        h.eq_ignore_ascii_case("localhost")
+            || h.trim_start_matches('[').trim_end_matches(']').parse::<std::net::IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
+    }
+    loopback(a) && loopback(b)
 }
 
 // ---------------------------------------------------------------- status
@@ -718,13 +813,22 @@ impl FrpcClient {
     /// ended so the supervisor reconnects with the new settings; unchanged
     /// proxies keep their counters and their traffic only pauses for the
     /// reconnect (this is also what `apply_config` in the console path does).
+    ///
+    /// Re-sending the configuration the client already has — which is what the
+    /// console's `start` and every `apply_config` do — is *not* a change: it
+    /// must not bounce a live session or reset its uptime.
     pub async fn update_config(&self, cfg: FrpcConfig) {
+        if *self.shared.cfg.read().await == cfg {
+            return;
+        }
+        // Rebuild the proxy registry before publishing the new config: a session
+        // that picks the config up immediately must find every proxy in it.
         self.shared.rebuild_proxies(&cfg);
         *self.shared.cfg.write().await = cfg;
-        self.shared.cfg_gen.fetch_add(1, Ordering::Relaxed);
+        let gen = self.shared.cfg_gen.fetch_add(1, Ordering::Relaxed) + 1;
         // Only reaches a receiver while a supervisor is running; a send error
         // simply means "nobody to notify".
-        let _ = self.shared.cfg_tx.send(self.shared.cfg_gen.load(Ordering::Relaxed));
+        let _ = self.shared.cfg_tx.send(gen);
     }
 
     pub async fn config(&self) -> FrpcConfig {
@@ -736,6 +840,13 @@ impl FrpcClient {
     /// console's "start" shows the reason immediately.
     pub async fn start(&self) -> Result<()> {
         let mut run = self.run.lock().await;
+        // A supervisor that ended by itself (a configuration it could not use)
+        // leaves its handle behind. Without this check `start` would report
+        // success while nothing was running, and neither the console's Start
+        // button nor `restart_if_running` could ever bring the client back.
+        if run.as_ref().is_some_and(|h| h.join.is_finished()) {
+            *run = None;
+        }
         if run.is_some() {
             return Ok(());
         }
@@ -755,10 +866,18 @@ impl FrpcClient {
         let shared = self.shared.clone();
         let join = tokio::spawn(supervise(shared, token.clone()));
         *run = Some(RunHandle { token, join });
+        if !cfg.tcp_mux {
+            // Not fatal (an old frps, or ReMgr's own server with tcp_mux off,
+            // still works), but the failure it produces otherwise is the bare
+            // "early eof", which says nothing about the cause.
+            tracing::warn!(
+                "frpc: tcp_mux is off — frp 0.52 and newer multiplex every connection, so this \
+                 only works against an older frps or a ReMgr server with tcp_mux off"
+            );
+        }
         tracing::info!(
-            "frpc: started (upstream {}:{} tcp_mux={} tls={} proxies={})",
-            cfg.server_addr,
-            cfg.server_port,
+            "frpc: started (upstream {} tcp_mux={} tls={} proxies={})",
+            host_port(&cfg.server_addr, cfg.server_port),
             cfg.tcp_mux,
             cfg.tls,
             cfg.proxies.len()
@@ -768,9 +887,14 @@ impl FrpcClient {
 
     /// Stop and wait for the session to be torn down (bounded: a hung network
     /// call must not hold the console, and the task is cancel-aware anyway).
+    ///
+    /// The run lock stays held until the supervisor is gone, so a `stop` racing
+    /// a `start` (the console's restart, or two browser tabs) cannot leave a
+    /// second supervisor and a second session next to the one still tearing
+    /// down — the old session's teardown would report the new one as down.
     pub async fn stop(&self) -> Result<()> {
-        let handle = self.run.lock().await.take();
-        if let Some(h) = handle {
+        let mut run = self.run.lock().await;
+        if let Some(h) = run.take() {
             h.token.cancel();
             if tokio::time::timeout(SHUTDOWN_GRACE, h.join).await.is_err() {
                 tracing::warn!("frpc: shutdown took longer than {}s, continuing without it", SHUTDOWN_GRACE.as_secs());
@@ -808,7 +932,7 @@ impl FrpcClient {
         FrpcStatus {
             running,
             connected,
-            upstream: format!("{}:{}", cfg.server_addr, cfg.server_port),
+            upstream: host_port(&cfg.server_addr, cfg.server_port),
             run_id: self.shared.previous_run_id(),
             tcp_mux: cfg.tcp_mux,
             tls: cfg.tls,
@@ -857,7 +981,7 @@ async fn supervise(shared: Arc<Shared>, token: CancellationToken) {
         // and its first `changed()` returns immediately, which would restart the
         // session in a tight loop.
         let _ = cfg_rx.borrow_and_update();
-        let upstream = format!("{}:{}", cfg.server_addr, cfg.server_port);
+        let upstream = host_port(&cfg.server_addr, cfg.server_port);
         let started = Instant::now();
         let outcome = tokio::select! {
             _ = token.cancelled() => break,
@@ -900,8 +1024,14 @@ async fn supervise(shared: Arc<Shared>, token: CancellationToken) {
             _ = cfg_rx.changed() => {}
         }
     }
-    shared.set_connected(false, "");
-    shared.mark_all_proxies_idle();
+    // A cancelled token means the run was stopped from outside: `stop()` owns
+    // the reported state from here on, and a `start` racing its grace period
+    // may already have a newer session up. Writing "disconnected" here would
+    // report that new session as down.
+    if !token.is_cancelled() {
+        shared.set_connected(false, "");
+        shared.mark_all_proxies_idle();
+    }
 }
 
 /// Does this session error look like "the upstream refused our token"?
@@ -1001,7 +1131,20 @@ async fn run_session_inner(
     let login_timeout = Duration::from_secs(cfg.connect_timeout.max(1));
     let (tb, body) = tokio::time::timeout(login_timeout, msg::read_frame(&mut control))
         .await
-        .map_err(|_| anyhow!("timed out waiting for LoginResp"))??;
+        .map_err(|_| anyhow!("timed out waiting for LoginResp"))?
+        .with_context(|| {
+            // With tcp_mux off the far side may have wrapped the connection in
+            // yamux anyway — frp 0.52 and newer always do — and then this read
+            // fails with an EOF or a nonsense length instead of anything that
+            // names the cause.
+            if cfg.tcp_mux {
+                "reading LoginResp".to_string()
+            } else {
+                "reading LoginResp with tcp_mux off (frp servers 0.52 and newer always multiplex; \
+                 the upstream has to be an older frps or a ReMgr server with tcp_mux off)"
+                    .to_string()
+            }
+        })?;
     if tb != msg::TYPE_LOGIN_RESP {
         bail!("first message from the upstream is not LoginResp (type {tb:#04x})");
     }
@@ -1148,14 +1291,19 @@ async fn run_session_inner(
     };
 
     // ---- teardown
-    // Cancelling first stops the mux driver and every work connection; the
-    // reader task ends with the control connection (or on this token).
+    // `token` is only already cancelled when the *supervisor* was cancelled, so
+    // this session was stopped from outside and `stop()` owns the reported
+    // state (a `start` racing stop's grace period may already have a newer
+    // session up, which must not be reported as disconnected by this one).
+    let stopped_from_outside = token.is_cancelled();
     token.cancel();
     if let Some(mux) = &session.mux {
         mux.close().await;
     }
     reader.abort();
-    shared.set_connected(false, "");
+    if !stopped_from_outside {
+        shared.set_connected(false, "");
+    }
     result
 }
 
@@ -1215,12 +1363,21 @@ where
 /// Connect to the upstream: TCP, then optionally frp's custom TLS handshake.
 async fn connect_upstream(cfg: &FrpcConfig) -> Result<BoxDuplex> {
     let timeout = Duration::from_secs(cfg.connect_timeout.max(1));
-    let host_port = format!("{}:{}", cfg.server_addr, cfg.server_port);
-    let tcp = tokio::time::timeout(timeout, TcpStream::connect(&host_port))
+    let target = host_port(&cfg.server_addr, cfg.server_port);
+    let tcp = tokio::time::timeout(timeout, TcpStream::connect(&target))
         .await
-        .map_err(|_| anyhow!("timed out connecting to {host_port}"))?
-        .with_context(|| format!("connecting to {host_port}"))?;
+        .map_err(|_| anyhow!("timed out connecting to {target}"))?
+        .with_context(|| format!("connecting to {target}"))?;
     let _ = tcp.set_nodelay(true);
+    // With tcp_mux neither side sends an application-level heartbeat (frpc ≥0.52
+    // removed it, and rust-yamux only pings while it is being polled and never
+    // fails a connection on an unacknowledged ping). Without this, a peer whose
+    // host dies silently — no FIN: a power loss, a dropped NAT mapping — leaves
+    // the session reported as connected forever. TCP keepalive lets the kernel
+    // notice; the timing is sysctl-driven on OpenBSD.
+    if let Err(e) = socket2::SockRef::from(&tcp).set_keepalive(true) {
+        tracing::debug!("frpc: could not enable tcp keepalive on {target}: {e}");
+    }
 
     if !cfg.tls {
         return Ok(Box::new(tcp));
@@ -1237,7 +1394,7 @@ async fn connect_upstream(cfg: &FrpcConfig) -> Result<BoxDuplex> {
     let name = ServerName::try_from(server_name(cfg)).map_err(|e| anyhow!("invalid TLS server name: {e}"))?;
     let stream = tokio::time::timeout(timeout, connector.connect(name, tcp))
         .await
-        .map_err(|_| anyhow!("timed out during the TLS handshake with {host_port}"))?
+        .map_err(|_| anyhow!("timed out during the TLS handshake with {target}"))?
         .context("TLS handshake with the upstream")?;
     Ok(Box::new(stream))
 }
@@ -1483,6 +1640,19 @@ async fn serve_tcp(io: BoxDuplex, rt: Arc<ProxyRuntime>, session: Arc<Session>) 
 /// idle expiry of the per-user sockets and the 30s keepalive Ping on the work
 /// connection (frpc keeps the udp work connection framed, unlike tcp).
 async fn serve_udp(io: BoxDuplex, rt: Arc<ProxyRuntime>, session: Arc<Session>) -> Result<()> {
+    // Resolve the local service *before* anything is spawned: an up-front
+    // failure then ends the whole tunnel, instead of leaving a writer task (and
+    // the work connection it holds) pinging the upstream until the session ends.
+    let local_addr = rt.cfg.local_addr();
+    // frp resolves the local service once and then dials it with a wildcard
+    // ephemeral socket per user (`net.DialUDP(nil, dstAddr)`); the family of the
+    // resolved address decides the bind address.
+    let local_dst = resolve_local(&local_addr).await?;
+    let bind_addr: SocketAddr = match local_dst {
+        SocketAddr::V4(_) => "0.0.0.0:0".parse()?,
+        SocketAddr::V6(_) => "[::]:0".parse()?,
+    };
+
     let (mut work_r, mut work_w) = tokio::io::split(io);
     let (tx, mut rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(128);
     // Child token: ending this work connection must not end the session, but the
@@ -1532,15 +1702,6 @@ async fn serve_udp(io: BoxDuplex, rt: Arc<ProxyRuntime>, session: Arc<Session>) 
         let _ = work_w.shutdown().await;
     });
 
-    let local_addr = rt.cfg.local_addr();
-    // frp resolves the local service once and then dials it with a wildcard
-    // ephemeral socket per user (`net.DialUDP(nil, dstAddr)`); the family of the
-    // resolved address decides the bind address.
-    let local_dst = resolve_local(&local_addr).await?;
-    let bind_addr: SocketAddr = match local_dst {
-        SocketAddr::V4(_) => "0.0.0.0:0".parse()?,
-        SocketAddr::V6(_) => "[::]:0".parse()?,
-    };
     let counter = ByteCounter { proxy: rt.bytes_in.clone(), total: session.shared.bytes_in.clone() };
     let out_counter = ByteCounter { proxy: rt.bytes_out.clone(), total: session.shared.bytes_out.clone() };
     // One socket per user address, connected to the local service; a dead
@@ -1600,10 +1761,18 @@ async fn serve_udp(io: BoxDuplex, rt: Arc<ProxyRuntime>, session: Arc<Session>) 
         let alive = match users.get(&user) {
             Some(u) if u.alive.load(Ordering::Relaxed) => u.clone(),
             _ => {
-                let sock = Arc::new(UdpSocket::bind(bind_addr).await?);
+                // Break instead of `?`: the teardown below has to run, or the
+                // writer task (and with it the work connection) outlives this
+                // tunnel.
+                let sock = match UdpSocket::bind(bind_addr).await {
+                    Ok(s) => Arc::new(s),
+                    Err(e) => break Err(anyhow!("binding a udp socket for {local_addr} failed: {e}")),
+                };
                 // Connected, like frp's `net.DialUDP`: replies can only come from
                 // the local service, and `recv` needs no address bookkeeping.
-                sock.connect(local_dst).await?;
+                if let Err(e) = sock.connect(local_dst).await {
+                    break Err(anyhow!("connecting a udp socket to {local_addr} failed: {e}"));
+                }
                 let u = Arc::new(UdpUser { sock: sock.clone(), alive: Arc::new(AtomicBool::new(true)) });
                 let tx = tx.clone();
                 let token = tunnel.clone();
@@ -1743,5 +1912,164 @@ mod tests {
         cfg.proxies.clear();
         cfg.server_addr = String::new();
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn proxy_lines_reject_typos_instead_of_guessing() {
+        // a second address, an extra port and an unusable port are all errors:
+        // guessing turned them into a proxy dialing the wrong host
+        assert!(FrpcProxyConfig::parse_line("web tcp 127.0.0.1 8080 7001 typo").is_err());
+        assert!(FrpcProxyConfig::parse_line("web tcp 127.0.0.1 8080 7001 7002").is_err());
+        assert!(FrpcProxyConfig::parse_line("web tcp 127.0.0.1 8080 70000").unwrap_err().contains("out of range"));
+        assert!(FrpcProxyConfig::parse_line("web tcp 127.0.0.1 99999 7001").is_err());
+        assert!(FrpcProxyConfig::parse_line("web tcp 127.0.0.1 -1 7001").is_err());
+        // two types written out are still accepted (last one wins), an IPv6
+        // literal is an address and not a port
+        let p = FrpcProxyConfig::parse_line("v6 udp ::1 5353 5353").unwrap();
+        assert_eq!((p.proxy_type.as_str(), p.local_ip.as_str()), ("udp", "::1"));
+    }
+
+    #[test]
+    fn host_port_brackets_ipv6() {
+        assert_eq!(host_port("127.0.0.1", 7000), "127.0.0.1:7000");
+        assert_eq!(host_port("example.org", 7000), "example.org:7000");
+        assert_eq!(host_port("::1", 7000), "[::1]:7000");
+        assert_eq!(host_port("[::1]", 7000), "[::1]:7000");
+        let p = FrpcProxyConfig::parse_line("v6 tcp ::1 5353 15353").unwrap();
+        assert_eq!(p.local_addr(), "[::1]:5353");
+    }
+
+    #[test]
+    fn validate_rejects_loops_and_absurd_pools() {
+        let mut cfg = FrpcConfig { server_addr: "127.0.0.1".into(), ..Default::default() };
+        // the upstream is this box: a proxy aimed at its own control port or at
+        // its own published port would loop user traffic back into the tunnel
+        cfg.proxies.push(FrpcProxyConfig { name: "ctl".into(), proxy_type: "tcp".into(), local_ip: "127.0.0.1".into(), local_port: 7000, remote_port: 8000 });
+        assert!(cfg.validate().unwrap_err().to_string().contains("loop"));
+        cfg.proxies[0].local_port = 8000;
+        cfg.proxies[0].remote_port = 8000;
+        assert!(cfg.validate().unwrap_err().to_string().contains("loop"));
+        // the same port numbers against a *different* host stay fine
+        cfg.server_addr = "example.org".into();
+        assert!(cfg.validate().is_ok());
+        // and so do distinct ports on the loopback upstream (the dev harness)
+        cfg.server_addr = "127.0.0.1".into();
+        cfg.proxies[0].local_port = 18080;
+        cfg.proxies[0].remote_port = 17080;
+        assert!(cfg.validate().is_ok());
+
+        cfg.pool_count = MAX_POOL_COUNT + 1;
+        assert!(cfg.validate().unwrap_err().to_string().contains("pool_count"));
+    }
+
+    #[tokio::test]
+    async fn non_mux_session_carries_a_tcp_proxy_end_to_end() {
+        // The one transport frp 0.52+ servers no longer speak: this client and
+        // ReMgr's own frps both support it, so a ReMgr-to-ReMgr tunnel with
+        // `tcp_mux` off has to work (login, work connection as its own TCP
+        // connection, proxy registration, byte relay).
+        use crate::config::FrpsConfig as ServerConfig;
+        use crate::server::FrpsServer;
+
+        let port = |p: u16| ("127.0.0.1", p);
+        let (srv_port, echo_port, remote_port) = (19701u16, 19702u16, 19703u16);
+
+        // local service: echoes what it receives, prefixed
+        let listener = tokio::net::TcpListener::bind(port(echo_port)).await.unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 1024];
+                    while let Ok(n) = s.read(&mut buf).await {
+                        if n == 0 {
+                            break;
+                        }
+                        let mut out = b"echo:".to_vec();
+                        out.extend_from_slice(&buf[..n]);
+                        if s.write_all(&out).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let srv = Arc::new(FrpsServer::new(ServerConfig {
+            server_port: srv_port,
+            token: "nonmuxtoken".into(),
+            tcp_mux: false,
+            ..Default::default()
+        }));
+        srv.start().await.unwrap();
+
+        let client = FrpcClient::new(FrpcConfig {
+            enabled: true,
+            server_addr: "127.0.0.1".into(),
+            server_port: srv_port,
+            token: "nonmuxtoken".into(),
+            tcp_mux: false,
+            connect_timeout: 5,
+            pool_count: 1,
+            proxies: vec![FrpcProxyConfig {
+                name: "echo".into(),
+                proxy_type: "tcp".into(),
+                local_ip: "127.0.0.1".into(),
+                local_port: echo_port,
+                remote_port,
+            }],
+            ..Default::default()
+        });
+        client.start().await.unwrap();
+
+        let mut up = false;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let st = client.status().await;
+            if st.connected && st.proxies.iter().all(|p| p.state == "running") {
+                up = true;
+                break;
+            }
+        }
+        assert!(up, "the non-mux session never came up: {:?}", client.status().await.last_error);
+
+        let mut s = TcpStream::connect(port(remote_port)).await.unwrap();
+        s.write_all(b"non-mux\n").await.unwrap();
+        let mut buf = vec![0u8; 64];
+        let n = tokio::time::timeout(Duration::from_secs(5), s.read(&mut buf))
+            .await
+            .expect("a reply through the non-mux tunnel")
+            .unwrap();
+        assert_eq!(&buf[..n], b"echo:non-mux\n");
+
+        client.stop().await.unwrap();
+        srv.stop().await.unwrap();
+        assert!(!client.status().await.connected);
+    }
+
+    #[tokio::test]
+    async fn a_supervisor_that_gave_up_does_not_block_a_restart() {
+        // A live configuration that becomes unusable ends the supervisor by
+        // itself (there is no point retrying). The handle it leaves behind must
+        // not turn a later `start` into a silent no-op: the console's Start
+        // button would report success while nothing was running.
+        let client = FrpcClient::new(FrpcConfig {
+            enabled: true,
+            server_addr: "127.0.0.1".into(),
+            server_port: 1,
+            connect_timeout: 1,
+            ..Default::default()
+        });
+        client.start().await.unwrap();
+        client.update_config(FrpcConfig { enabled: true, ..Default::default() }).await;
+        for _ in 0..200 {
+            if !client.status().await.running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!client.status().await.running, "the supervisor should have given up on the empty server_addr");
+        // The configuration is still unusable, so the restart has to report
+        // *that* — not the dead supervisor as a running client.
+        assert!(client.start().await.is_err(), "start() answered from a stale handle");
     }
 }

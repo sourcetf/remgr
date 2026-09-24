@@ -30,6 +30,12 @@ pub struct AppState {
     snapshot: Mutex<Config>,
     pub config_path: PathBuf,
     pub sessions: Mutex<HashMap<String, u64>>,
+    /// Failed console logins in the current window: (count, window start).
+    /// The console is meant to be reachable from the network and ships a short
+    /// default password, so unthrottled guessing is a real risk; a correct
+    /// password is never refused (see `login`), so this cannot lock an operator
+    /// out of their own console.
+    pub login_failures: Mutex<(u32, u64)>,
     pub logs: Arc<LogHub>,
     pub started_at: Instant,
     pub easytier: EasyTierModule,
@@ -47,6 +53,10 @@ pub struct AppState {
     /// "the port I want is held by me" (a scheme switch) from "held by someone
     /// else" (an error the caller should see).
     pub console_serving_port: Mutex<Option<u16>>,
+    /// Whether that listener is serving TLS. The session cookie may only carry
+    /// `Secure` when it is: sent over plain HTTP the browser would drop it and
+    /// lock the operator out of the console.
+    pub console_serving_tls: Mutex<bool>,
 }
 
 impl AppState {
@@ -65,6 +75,7 @@ impl AppState {
             config: RwLock::new(config),
             config_path,
             sessions: Mutex::new(HashMap::new()),
+            login_failures: Mutex::new((0u32, 0u64)),
             logs,
             started_at: Instant::now(),
             easytier: EasyTierModule::new(weak),
@@ -76,6 +87,7 @@ impl AppState {
             console_stop: Mutex::new(None),
             console_pending: Mutex::new(None),
             console_serving_port: Mutex::new(None),
+            console_serving_tls: Mutex::new(false),
         })
     }
 
@@ -89,17 +101,27 @@ impl AppState {
     /// mean an empty password hash, a blank frps token, or defaults written over
     /// a live setting).
     pub fn config_blocking(&self) -> Config {
-        for _ in 0..20 {
+        for i in 0..20 {
             if let Ok(c) = self.config.try_read() {
                 let cfg = c.clone();
                 drop(c);
                 *self.snapshot.lock().unwrap_or_else(|e| e.into_inner()) = cfg.clone();
                 return cfg;
             }
-            std::thread::sleep(std::time::Duration::from_millis(2));
+            // A writer holds this lock for the duration of a config save. Yield
+            // first — the holder is a task on another worker and can finish
+            // immediately — and only then sleep, so contention costs one
+            // timeslice instead of a full sleep this thread cannot be scheduled
+            // out of. (The caller is usually async: a real sleep here blocks a
+            // worker thread.)
+            if i < 4 {
+                std::thread::yield_now();
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
         }
         tracing::warn!(
-            "config lock still held after 40ms; reporting the last observed configuration"
+            "config lock still held after 16ms; reporting the last observed configuration"
         );
         self.snapshot.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
