@@ -137,6 +137,25 @@ impl super::ServiceModule for EasyTierModule {
             .map(|h| h.node_instance.is_some())
             .unwrap_or(false);
         drop(run);
+
+        // Why the node is or is not up, as a machine-readable state plus a hint.
+        // The console renders this instead of guessing: guessing produced
+        // "缺少网络名称" for a node that was merely stopped, which reads as a
+        // configuration problem and sends the operator looking in the wrong place.
+        let (node_state, node_note) = if !cfg.node_enabled {
+            ("off", "本地节点未启用（配置中的「启用本地节点」为关闭）")
+        } else if !cfg.enabled {
+            ("disabled", "模块已禁用：本地节点不会启动（点「启动」或勾选「开机启用」）")
+        } else if !running {
+            ("stopped", "模块已停止，本地节点未运行（点「启动」）")
+        } else if cfg.network_name.trim().is_empty() {
+            ("no_network", "「网络名称」为空，节点实例不会启动：填一个网络名再点「启动」")
+        } else if node_running {
+            ("running", "")
+        } else {
+            ("failed", "模块已启动且网络名称已设置，但节点实例未建立（见下方日志/数据库路径）")
+        };
+
         serde_json::json!({
             "enabled": cfg.enabled,
             "running": running,
@@ -145,11 +164,8 @@ impl super::ServiceModule for EasyTierModule {
             "api_port": cfg.api_port,
             "node_enabled": cfg.node_enabled,
             "node_running": node_running,
-            "node_note": if cfg.node_enabled && cfg.network_name.is_empty() {
-                "已启用本地节点，但「网络名称」为空，节点实例不会启动"
-            } else {
-                ""
-            },
+            "node_state": node_state,
+            "node_note": node_note,
             "node_name": cfg.node_name,
             "network_name": cfg.network_name,
             "virtual_ipv4": cfg.virtual_ipv4,

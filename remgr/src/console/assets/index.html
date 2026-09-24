@@ -112,7 +112,7 @@ th{color:var(--tx2);font-weight:500}
       <h3>🔑 修改控制台密码</h3>
       <div class="row">
         <input id="pw-old" type="password" placeholder="当前密码" style="max-width:200px">
-        <input id="pw-new" type="password" placeholder="新密码（至少 8 位）" style="max-width:240px">
+        <input id="pw-new" type="password" placeholder="新密码（至少 4 位）" style="max-width:240px">
         <button class="btn primary" onclick="changePassword()">修改</button>
       </div>
     </div>
@@ -212,6 +212,25 @@ function badge(run, enabled){
   if(!enabled) return '<span class="badge off">已禁用</span>';
   return run?'<span class="badge run">运行中</span>':'<span class="badge stop">已停止</span>';
 }
+// The center node is an EasyTier instance, which only exists while the module
+// runs and only once it has a network to join. The server reports which of those
+// is missing (`node_state`), so the console states the actual reason instead of
+// guessing — a stopped module used to read as "缺少网络名称".
+function nodeStateText(e){
+  if(!e) return '—';
+  switch(e.node_state){
+    case 'running':   return e.node_name || '运行中';
+    case 'off':       return '关闭';
+    case 'disabled':  return '未启动（模块已禁用，点「启动」）';
+    case 'stopped':   return '未启动（模块已停止，点「启动」）';
+    case 'no_network':return '未启动（「网络名称」为空）';
+    case 'failed':    return '未启动（实例未建立，见日志）';
+  }
+  // older server without node_state: fall back to the two facts it does send
+  if(e.node_running) return e.node_name || '运行中';
+  if(!e.node_enabled) return '关闭';
+  return e.network_name ? '未启动（模块已停止，点「启动」）' : '未启动（「网络名称」为空）';
+}
 function fmtBytes(n){
   if(n<1024) return n+' B';
   const u=['KB','MB','GB','TB'];let i=-1;
@@ -243,7 +262,7 @@ function renderDashboard(){
   const sv=s.services;
   html += svcCard('easytier', sv.easytier?.running, sv.easytier?.enabled, [
     ['配置服务器端口', sv.easytier?.config_server_port],['API 端口', sv.easytier?.api_port],
-    ['本地节点', sv.easytier?.node_running?(sv.easytier?.node_name||'—'):(sv.easytier?.node_enabled?'未启动（缺少网络名称）':'关闭')],
+    ['本地节点', nodeStateText(sv.easytier)],
     ['网络名', sv.easytier?.network_name||'—'],
   ]);
   html += svcCard('stun_turn', sv.stun_turn?.running, sv.stun_turn?.enabled, [
@@ -277,13 +296,13 @@ function renderServiceTabs(){
   document.getElementById('tab-easytier').innerHTML =
     svcCard('easytier', s.easytier?.running, s.easytier?.enabled, [
       ['配置服务器端口 (UDP)', s.easytier?.config_server_port],['REST API', s.easytier?.api_addr+':'+s.easytier?.api_port],
-      ['本地节点', s.easytier?.node_running?'运行中':'未启动'],['数据库', s.easytier?.db_path],
+      ['本地节点', nodeStateText(s.easytier)],['数据库', s.easytier?.db_path],
       ['监听器', (s.easytier?.listeners||[]).length+' 个'],['网络名', s.easytier?.network_name||'—'],
     ], `<a class="btn sm" href="/et/" target="_blank" rel="noopener">🖧 EasyTier 控制台</a>`)
     + (s.easytier?.node_note?`<div class="card"><h3>⚠ 本地节点未启动</h3><p style="color:var(--tx2);font-size:12px">${s.easytier.node_note}</p></div>`:'')
     + `<div class="card"><h3>🖧 EasyTier 仪表盘（easytier-web）</h3>
       <p style="color:var(--tx2);font-size:12px">同源提供于 <a href="/et/" target="_blank" rel="noopener">/et/</a>，登陆用户 <b>admin</b>；
-      首次启动的随机口令见 <code>/var/run/remgr/easytier_dashboard_password</code>（可在仪表盘内自行修改）。
+      首次启动的默认口令为 <code>admin</code>（同时写入 <code>/var/run/remgr/easytier_dashboard_password</code>，可在仪表盘内自行修改）。
       本地中心节点以此账户注册，会作为一台设备出现在仪表盘中。</p></div>`;
   document.getElementById('tab-stun_turn').innerHTML =
     svcCard('stun_turn', s.stun_turn?.running, s.stun_turn?.enabled, [
