@@ -3,6 +3,7 @@
 use async_trait::async_trait;
 
 pub mod easytier;
+pub mod frpc;
 pub mod frps;
 pub mod rustdesk;
 pub mod stun_turn;

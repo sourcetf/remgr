@@ -209,11 +209,12 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
     // auto-start enabled modules
     {
         let snapshot = state.config_blocking();
-        let order: [(&str, bool); 4] = [
+        let order: [(&str, bool); 5] = [
             ("easytier", snapshot.easytier.enabled),
             ("stun_turn", snapshot.stun_turn.enabled),
             ("rustdesk", snapshot.rustdesk.enabled),
             ("frps", snapshot.frps.enabled),
+            ("frpc", snapshot.frpc.enabled),
         ];
         for (name, enabled) in order {
             if !enabled {
@@ -234,7 +235,7 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
         tracing::info!("shutdown signal received, stopping modules");
         let snapshot = stop_state.config_blocking();
         let _ = snapshot;
-        for name in ["frps", "rustdesk", "stun_turn", "easytier"] {
+        for name in ["frpc", "frps", "rustdesk", "stun_turn", "easytier"] {
             if let Some(module) = stop_state.module(name) {
                 module.stop().await.ok();
             }

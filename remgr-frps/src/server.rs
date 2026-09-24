@@ -80,8 +80,8 @@ impl Stats {
     fn set_proxy(&self, info: ProxyInfo) {
         self.proxy_infos.lock().unwrap().insert(info.proxy_name.clone(), info);
     }
-    fn remove_proxy(&self, name: &str) {
-        self.proxy_infos.lock().unwrap().remove(name);
+    fn remove_proxy(&self, name: &str) -> Option<ProxyInfo> {
+        self.proxy_infos.lock().unwrap().remove(name)
     }
     fn snapshot(&self) -> Vec<ProxyInfo> {
         let mut v: Vec<ProxyInfo> = self.proxy_infos.lock().unwrap().values().cloned().collect();
@@ -95,6 +95,10 @@ impl Stats {
 struct ServerShared {
     cfg: Arc<RwLock<FrpsConfig>>,
     stats: Arc<Stats>,
+    /// Cancelled when the server stops. Every control is created as a child of
+    /// it, so a login that races with `stop()` still tears itself down instead
+    /// of surviving with listeners bound.
+    run_token: CancellationToken,
     /// run_id -> control state
     controls: Mutex<HashMap<String, Arc<ControlState>>>,
     /// bound ports -> proxy name
@@ -103,19 +107,19 @@ struct ServerShared {
 }
 
 impl ServerShared {
-    fn server_token(&self) -> String {
-        match self.cfg.try_read() {
-            Ok(c) => c.token.clone(),
-            Err(_) => String::new(),
-        }
+    async fn server_token(&self) -> String {
+        self.cfg.read().await.token.clone()
     }
 
-    fn token_is_empty(&self) -> bool {
-        self.server_token().is_empty()
+    async fn token_is_empty(&self) -> bool {
+        self.server_token().await.is_empty()
     }
 
-    fn auth_ok(&self, timestamp: i64, key: &str) -> bool {
-        let expect = msg::auth_key(&self.server_token(), timestamp);
+    /// Constant-time check of `privilege_key = hex(md5(token + timestamp))`.
+    /// Like frp, the timestamp itself is not bounded: it is only an input to
+    /// the digest, so an out-of-window value cannot pass without the token.
+    async fn auth_ok(&self, timestamp: i64, key: &str) -> bool {
+        let expect = msg::auth_key(&self.server_token().await, timestamp);
         if expect.len() != key.len() {
             return false;
         }
@@ -142,9 +146,19 @@ impl ServerShared {
         Ok(())
     }
 
-    fn release_proxy_ports(&self, name: &str) {
-        self.tcp_ports.lock().unwrap().retain(|_, v| v != name);
-        self.udp_ports.lock().unwrap().retain(|_, v| v != name);
+    /// Release one port, and only while it is still owned by `name`: proxy
+    /// names are only unique per control, so a name-keyed release would drop
+    /// the reservation of another client's proxy that happens to share it.
+    fn release_proxy_port(&self, proxy_type: &str, port: u16, name: &str) {
+        let map = match proxy_type {
+            "tcp" => &self.tcp_ports,
+            "udp" => &self.udp_ports,
+            _ => return,
+        };
+        let mut guard = map.lock().unwrap();
+        if guard.get(&port).map(|owner| owner == name).unwrap_or(false) {
+            guard.remove(&port);
+        }
     }
 }
 
@@ -186,10 +200,15 @@ impl AsyncWrite for Prefixed {
 
 // ---------------------------------------------------------------- control state
 
+/// A control message queued for the writer task. The optional latch fires once
+/// the frame has reached the wire, which lets proxy registration order itself
+/// after the NewProxyResp (see [`ControlState::send_and_flush`]).
+type Outgoing = (Message, Option<tokio::sync::oneshot::Sender<()>>);
+
 struct ControlState {
     run_id: String,
     user: String,
-    send_tx: mpsc::Sender<Message>,
+    send_tx: mpsc::Sender<Outgoing>,
     work_tx: mpsc::Sender<BoxDuplex>,
     work_rx: AsyncMutex<mpsc::Receiver<BoxDuplex>>,
     last_active: AtomicU64,
@@ -214,18 +233,50 @@ impl ControlState {
         now_secs().saturating_sub(self.last_active.load(Ordering::Relaxed))
     }
 
+    /// Queue a control message, waiting for room in the writer's channel only.
+    async fn send(&self, m: Message) {
+        let _ = self.send_tx.send((m, None)).await;
+    }
+
+    /// Queue a control message and wait for the writer to put it on the wire.
+    ///
+    /// A proxy must not hand out work conns before its NewProxyResp has left:
+    /// frpc ignores — and silently closes — a work conn that arrives while its
+    /// proxy wrapper is still in `wait_start` (`client/proxy/proxy_wrapper.go`),
+    /// so the proxy would answer "start proxy success" and then carry nothing
+    /// for the rest of the session.
+    async fn send_and_flush(&self, m: Message) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self.send_tx.send((m, Some(tx))).await.is_ok() {
+            // The writer drops the latch when it stops, so this cannot hang.
+            let _ = rx.await;
+        }
+    }
+
     /// Take a ready work stream or request one over the control connection.
     async fn get_work_conn(&self) -> Result<BoxDuplex> {
         self.touch();
-        {
+        let pooled = {
             let mut rx = self.work_rx.lock().await;
-            if let Ok(s) = rx.try_recv() {
-                return Ok(s);
-            }
+            rx.try_recv().ok()
+        };
+        if let Some(s) = pooled {
+            // Replace what the pool just lost, like frp's server ("When we get
+            // a work connection from pool, replace it with a new one"): the
+            // next user connection then does not wait for a round trip.
+            self.send(Message::ReqWorkConn(msg::ReqWorkConn {})).await;
+            return Ok(s);
         }
-        let _ = self.send_tx.send(Message::ReqWorkConn(msg::ReqWorkConn {})).await;
+        self.send(Message::ReqWorkConn(msg::ReqWorkConn {})).await;
         let mut rx = self.work_rx.lock().await;
-        match tokio::time::timeout(Duration::from_secs(20), rx.recv()).await {
+        let waited = tokio::time::timeout(Duration::from_secs(20), rx.recv());
+        let got = tokio::select! {
+            // Without this, a user connection whose control died while it
+            // waited would hold on until the timeout expires.
+            _ = self.token.cancelled() => bail!("control closed waiting for a work conn"),
+            r = waited => r,
+        };
+        match got {
             Ok(Some(s)) => {
                 self.touch();
                 Ok(s)
@@ -237,14 +288,22 @@ impl ControlState {
     fn close_proxy(&self, name: &str) {
         if let Some(tk) = self.proxies.lock().unwrap().remove(name) {
             tk.cancel();
-            self.stats.remove_proxy(name);
-            self.shared.release_proxy_ports(name);
+            if let Some(info) = self.stats.remove_proxy(name) {
+                self.shared.release_proxy_port(&info.proxy_type, info.remote_port, name);
+            }
             tracing::info!("frps proxy {name} closed");
         }
     }
 
     fn teardown(&self) {
         self.token.cancel();
+        // Pooled work conns are never handed out again, and in non-mux mode
+        // they are plain TCP connections that nothing else would close; frp's
+        // server drops its pool at the same point. Skipped while a waiter
+        // holds the receiver — its own token-cancelled path runs next.
+        if let Ok(mut rx) = self.work_rx.try_lock() {
+            while rx.try_recv().is_ok() {}
+        }
         let names: Vec<String> = self.proxies.lock().unwrap().keys().cloned().collect();
         for n in names {
             self.close_proxy(&n);
@@ -277,13 +336,14 @@ fn now_secs() -> u64 {
 
 /// Does this client keep the control connection alive with frp-level heartbeats?
 ///
-/// frp <= 0.51 sends a Ping every `heartbeatInterval` (30s) and expects a Pong;
-/// from 0.52 on the heartbeat was removed and liveness is left to the transport
-/// (yamux's own 30s keepalive, which the server never sees as a message). So an
-/// idle-control monitor applies to the old clients only — enforcing it for the
-/// new ones closes every session after the timeout and makes frpc reconnect
-/// forever. An unknown or missing version is treated as "no heartbeats", i.e.
-/// permissive, matching frp's own server behaviour.
+/// frp <= 0.51 sends a Ping every `heartbeatInterval` (30s) and expects a Pong.
+/// Modern clients keep the app-level heartbeat only while `tcpMux` is off: with
+/// mux on (the default) frpc completes `heartbeatInterval` to -1 and leaves
+/// liveness to yamux's own 30s keepalive, which the server never sees as a
+/// message. So an idle-control monitor can only trust the old clients —
+/// enforcing it for the new ones closes every session after the timeout and
+/// makes frpc reconnect forever. An unknown or missing version is treated as
+/// "no heartbeats", i.e. permissive, matching frp's own server behaviour.
 fn client_sends_heartbeats(version: &str) -> bool {
     let mut it = version.trim().split(['.', '-', '+']);
     let (Some(major), Some(minor)) = (
@@ -366,16 +426,17 @@ impl FrpsServer {
             cfg.tls_cert_path.is_some()
         );
 
+        let token = CancellationToken::new();
         let shared = Arc::new(ServerShared {
             cfg: self.cfg.clone(),
             stats: self.stats.clone(),
+            run_token: token.clone(),
             controls: Mutex::new(HashMap::new()),
             tcp_ports: Mutex::new(HashMap::new()),
             udp_ports: Mutex::new(HashMap::new()),
         });
         *self.shared.lock().await = Some(shared.clone());
 
-        let token = CancellationToken::new();
         let accept_shared = shared.clone();
         let accept_tls = tls.clone();
         let accept_token = token.clone();
@@ -416,7 +477,14 @@ impl FrpsServer {
                 tokio::select! {
                     _ = hb_token.cancelled() => break,
                     _ = tick.tick() => {
-                        let timeout = hb_shared.cfg.try_read().map(|c| c.heartbeat_timeout).unwrap_or(90);
+                        let timeout = hb_shared.cfg.read().await.heartbeat_timeout;
+                        // 0 disables the monitor, like frp's HeartbeatTimeout
+                        // ("set negative value to disable it") — treating it as
+                        // "close everything idle for a second" would drop every
+                        // client that does send heartbeats.
+                        if timeout == 0 {
+                            continue;
+                        }
                         let entries: Vec<Arc<ControlState>> = hb_shared
                             .controls
                             .lock()
@@ -425,7 +493,7 @@ impl FrpsServer {
                             .cloned()
                             .collect();
                         for st in entries {
-                            if st.idle_secs() > timeout && st.enforce_idle {
+                            if st.enforce_idle && st.idle_secs() > timeout {
                                 tracing::info!("frps control {} idle {}s, closing", st.run_id, st.idle_secs());
                                 st.teardown();
                             }
@@ -441,13 +509,16 @@ impl FrpsServer {
 
     pub async fn stop(&self) -> Result<()> {
         if let Some(handle) = self.run.lock().await.take() {
+            // Cancel before looking at the controls: a login that is in flight
+            // right now creates its control token as a child of this one, so it
+            // tears itself down even though it is not in the map yet.
+            handle.token.cancel();
             if let Some(shared) = self.shared.lock().await.take() {
                 let entries: Vec<Arc<ControlState>> = shared.controls.lock().unwrap().values().cloned().collect();
                 for st in entries {
                     st.teardown();
                 }
             }
-            handle.token.cancel();
             for j in handle.joins {
                 let _ = j.await;
             }
@@ -519,7 +590,7 @@ async fn handle_accepted(
     shared: Arc<ServerShared>,
     tls: Arc<tokio_rustls::TlsAcceptor>,
 ) -> Result<()> {
-    let cfg_mux = shared.cfg.try_read().map(|c| c.tcp_mux).unwrap_or(true);
+    let cfg_mux = shared.cfg.read().await.tcp_mux;
 
     // Clients from frp 0.52 on send no application-level heartbeat, so a half-dead
     // peer (vanished host, dropped NAT mapping) would otherwise hold a control
@@ -641,34 +712,51 @@ async fn handle_work_io(shared: Arc<ServerShared>, mut io: BoxDuplex) -> Result<
 
 async fn handle_work_io_with_frame(
     shared: Arc<ServerShared>,
-    io: BoxDuplex,
+    mut io: BoxDuplex,
     first: msg::RawMsg,
 ) -> Result<()> {
     let (tb, body) = first;
-    if tb != msg::TYPE_NEW_WORK_CONN {
-        bail!("first message on work conn is not NewWorkConn (type {tb:#04x})");
-    }
-    let nwc: msg::NewWorkConn = serde_json::from_slice(&body)?;
-    let state = {
-        let controls = shared.controls.lock().unwrap();
-        controls.get(&nwc.run_id).cloned()
-    };
-    let Some(state) = state else {
-        bail!("work conn for unknown run_id {}", nwc.run_id);
-    };
-    // frpc sends the same md5(token+ts) credential on work conns once a token is
-    // configured; a wrong one is rejected outright, and a missing one is at
-    // least surfaced (some client versions omit it, so it stays accepted).
-    if !nwc.privilege_key.is_empty() {
-        if !shared.auth_ok(nwc.timestamp, &nwc.privilege_key) {
-            bail!("work conn privilege key invalid for run_id {}", nwc.run_id);
+    let outcome: Result<Arc<ControlState>> = async {
+        if tb != msg::TYPE_NEW_WORK_CONN {
+            bail!("first message on work conn is not NewWorkConn (type {tb:#04x})");
         }
-    } else if !shared.token_is_empty() {
-        tracing::debug!(
-            "frps: work conn for run_id {} arrived without a privilege key",
-            nwc.run_id
-        );
+        let nwc: msg::NewWorkConn = serde_json::from_slice(&body)?;
+        let state = {
+            let controls = shared.controls.lock().unwrap();
+            controls.get(&nwc.run_id).cloned()
+        };
+        let Some(state) = state else {
+            bail!("work conn for unknown run_id {}", nwc.run_id);
+        };
+        // frpc sends the same md5(token+ts) credential on work conns once a token is
+        // configured; a wrong one is rejected outright, and a missing one is at
+        // least surfaced (some client versions omit it, so it stays accepted).
+        if !nwc.privilege_key.is_empty() {
+            if !shared.auth_ok(nwc.timestamp, &nwc.privilege_key).await {
+                bail!("work conn privilege key invalid for run_id {}", nwc.run_id);
+            }
+        } else if !shared.token_is_empty().await {
+            tracing::debug!(
+                "frps: work conn for run_id {} arrived without a privilege key",
+                nwc.run_id
+            );
+        }
+        Ok(state)
     }
+    .await;
+
+    let state = match outcome {
+        Ok(state) => state,
+        Err(e) => {
+            // frpc blocks on the first message of a work conn it just opened and
+            // reports whatever frps puts there ("StartWorkConn contains error"),
+            // so name the reason before dropping it — an unexplained rejection
+            // just looks like a hang on the client.
+            let stwc = msg::StartWorkConn { error: e.to_string(), ..Default::default() };
+            let _ = msg::write_msg(&mut io, &stwc, msg::TYPE_START_WORK_CONN).await;
+            return Err(e);
+        }
+    };
     state.touch();
     let _ = state.work_tx.send(io).await;
     Ok(())
@@ -693,7 +781,7 @@ async fn run_control_with_login(
     }
     let login: msg::Login = serde_json::from_slice(&body)?;
 
-    if !shared.auth_ok(login.timestamp, &login.privilege_key) {
+    if !shared.auth_ok(login.timestamp, &login.privilege_key).await {
         let resp = msg::LoginResp { error: "authentication failed".into(), ..Default::default() };
         let _ = msg::write_msg(&mut io, &resp, msg::TYPE_LOGIN_RESP).await;
         // Make sure the reason reaches the client. Over a yamux session the
@@ -719,13 +807,16 @@ async fn run_control_with_login(
         }
     }
 
-    let cfg = shared.cfg.try_read().map(|c| c.clone()).unwrap_or_default();
+    // A blocking read, not try_read: falling back to a default here would
+    // derive the control cipher key from an empty token, which silently
+    // garbles every message after the login response.
+    let cfg = shared.cfg.read().await.clone();
 
-    let (send_tx, send_rx) = mpsc::channel::<Message>(256);
+    let (send_tx, send_rx) = mpsc::channel::<Outgoing>(256);
     let (work_tx, work_rx) = mpsc::channel::<BoxDuplex>(64);
-    let token = CancellationToken::new();
-
-    shared.stats.clients_online.fetch_add(1, Ordering::Relaxed);
+    // Child of the server's run token, so a login that lands while the server
+    // is stopping cannot keep its listeners once stop() has run.
+    let token = shared.run_token.child_token();
 
     // Advertise the protocol generation, not a release number: this server
     // implements the classic V1 wire protocol that frpc still selects by
@@ -734,6 +825,9 @@ async fn run_control_with_login(
     let reply = msg::LoginResp { version: "0.51.3".into(), run_id: run_id.clone(), error: String::new() };
     msg::write_msg(&mut io, &reply, msg::TYPE_LOGIN_RESP).await?;
     tracing::info!("frps client logged in: user={:?} run_id={run_id} pool={}", login.user, login.pool_count);
+    // Counted only after the response went out: an early return above used to
+    // leave the online gauge incremented for a client that never logged in.
+    shared.stats.clients_online.fetch_add(1, Ordering::Relaxed);
 
     // Everything after LoginResp travels through the golib-compatible CFB
     // stream, keyed by the server token — the same value frpc derives from
@@ -772,7 +866,7 @@ async fn run_control_with_login(
             tokio::select! {
                 _ = wtok.cancelled() => break,
                 m = send_rx.recv() => {
-                    let Some(m) = m else { break };
+                    let Some((m, written)) = m else { break };
                     let body = match &m {
                         Message::LoginResp(v) => serde_json::to_vec(v),
                         Message::NewProxyResp(v) => serde_json::to_vec(v),
@@ -782,8 +876,14 @@ async fn run_control_with_login(
                         Message::UdpPacket(v) => serde_json::to_vec(v),
                         _ => Ok(Vec::new()),
                     };
+                    // Dropping `written` on the error paths below releases the
+                    // sender's latch, so a wait can never outlive the writer.
                     let Ok(body) = body else { continue };
-                    if msg::write_frame(&mut w, m.type_byte(), &body).await.is_err() {
+                    let sent = msg::write_frame(&mut w, m.type_byte(), &body).await.is_ok();
+                    if let Some(tx) = written {
+                        let _ = tx.send(());
+                    }
+                    if !sent {
                         break;
                     }
                 }
@@ -792,9 +892,9 @@ async fn run_control_with_login(
     });
 
     // pre-issue pool work conns (capped)
-    let pool = login.pool_count.min(cfg.max_pool_count);
+    let pool = login.pool_count.clamp(0, cfg.max_pool_count as i64) as u32;
     for _ in 0..pool {
-        let _ = send_tx.send(Message::ReqWorkConn(msg::ReqWorkConn {})).await;
+        state.send(Message::ReqWorkConn(msg::ReqWorkConn {})).await;
     }
 
     // reader loop
@@ -834,87 +934,136 @@ async fn control_reader_loop<R: AsyncRead + Unpin + Send>(state: Arc<ControlStat
                         // default frpc sends unsigned pings (empty privilege key);
                         // only validate when one is present
                         let err = if ping.privilege_key.is_empty()
-                            || state.shared.auth_ok(ping.timestamp, &ping.privilege_key)
+                            || state.shared.auth_ok(ping.timestamp, &ping.privilege_key).await
                         {
                             String::new()
                         } else {
                             "authentication failed".into()
                         };
-                        let _ = state.send_tx.send(Message::Pong(msg::Pong { error: err })).await;
+                        state.send(Message::Pong(msg::Pong { error: err })).await;
                     }
                     msg::TYPE_NEW_WORK_CONN => {
                         // dedicated work conns are dispatched at accept time
                         tracing::debug!("unexpected NewWorkConn frame on control stream");
                     }
                     msg::TYPE_UDP_PACKET => { /* udp flows over work conns */ }
-                    other => bail!("unexpected frp control message type {other:#04x}"),
+                    other => {
+                        // frp's server only fails the connection on a type byte it
+                        // does not know (`ErrMsgType`); a message it defines but has
+                        // no handler for is skipped. Dropping the session here would
+                        // break any client that sends one of those (a newer frpc, or
+                        // a visitor message on a shared connection).
+                        if !msg::is_known_type(other) {
+                            bail!("unknown frp control message type {other:#04x}");
+                        }
+                        tracing::debug!("ignoring frp control message type {other:#04x}");
+                    }
                 }
             }
         }
     }
 }
 
+/// Port a proxy asked for, or `None` when the request does not name a usable
+/// port. Upstream's field is an `int` and a bad value fails that one proxy
+/// (`port … is not allowed` / allocation error) instead of the connection.
+fn remote_port_of(np: &msg::NewProxy) -> Option<u16> {
+    u16::try_from(np.remote_port).ok().filter(|p| *p != 0)
+}
+
 async fn handle_new_proxy(state: Arc<ControlState>, np: msg::NewProxy) {
     tracing::debug!("frps handle_new_proxy entered: {}", np.proxy_name);
+    // Registration awaits a bind and a message write, so the control can be
+    // gone by the time this runs: registering then would strand a listener and
+    // its port reservation, since teardown() has already walked the map.
+    if state.token.is_cancelled() {
+        return;
+    }
+    // frp refuses a second proxy under a live name ("proxy name [%s] is already
+    // in use"); replacing the entry silently would drop the previous token
+    // without closing its listener.
+    if state.proxies.lock().unwrap().contains_key(&np.proxy_name) {
+        proxy_error(&state, &np, format!("proxy name {} is already in use", np.proxy_name)).await;
+        return;
+    }
     if np.use_encryption || np.use_compression {
-        proxy_error(&state, &np, "use_encryption/use_compression not supported by remgr-frps".into());
+        proxy_error(&state, &np, "use_encryption/use_compression not supported by remgr-frps".into()).await;
         return;
     }
     match np.proxy_type.as_str() {
         "tcp" => start_tcp_proxy(state, np).await,
         "udp" => start_udp_proxy(state, np).await,
-        other => proxy_error(&state, &np, format!("proxy type \"{other}\" not supported by remgr-frps")),
+        other => proxy_error(&state, &np, format!("proxy type \"{other}\" not supported by remgr-frps")).await,
     }
 }
 
-fn proxy_error(state: &Arc<ControlState>, np: &msg::NewProxy, err: String) {
+async fn proxy_error(state: &Arc<ControlState>, np: &msg::NewProxy, err: String) {
     tracing::info!("frps proxy {} rejected: {err}", np.proxy_name);
-    let _ = state.send_tx.try_send(Message::NewProxyResp(msg::NewProxyResp {
-        proxy_name: np.proxy_name.clone(),
-        remote_addr: String::new(),
-        error: err,
-    }));
+    // frpc keeps the proxy in `wait_start` until this arrives (and retries it),
+    // so it must not be dropped on a full queue — that would look like a hang.
+    state
+        .send_and_flush(Message::NewProxyResp(msg::NewProxyResp {
+            proxy_name: np.proxy_name.clone(),
+            remote_addr: String::new(),
+            error: err,
+        }))
+        .await;
 }
 
 async fn start_tcp_proxy(state: Arc<ControlState>, np: msg::NewProxy) {
-    let cfg = state.shared.cfg.try_read().map(|c| c.clone()).unwrap_or_default();
-    if !cfg.port_allowed(np.remote_port) {
-        proxy_error(&state, &np, format!("remote port {} not allowed", np.remote_port));
+    let cfg = state.shared.cfg.read().await.clone();
+    let Some(remote_port) = remote_port_of(&np) else {
+        proxy_error(&state, &np, format!("invalid remote port {}", np.remote_port)).await;
+        return;
+    };
+    if !cfg.port_allowed(remote_port) {
+        proxy_error(&state, &np, format!("remote port {} not allowed", remote_port)).await;
         return;
     }
-    if let Err(e) = state.shared.register_proxy_port("tcp", np.remote_port, &np.proxy_name) {
-        proxy_error(&state, &np, e.to_string());
+    if let Err(e) = state.shared.register_proxy_port("tcp", remote_port, &np.proxy_name) {
+        proxy_error(&state, &np, e.to_string()).await;
         return;
     }
-    let addr: SocketAddr = match format!("{}:{}", cfg.bind_addr, np.remote_port).parse() {
+    let addr: SocketAddr = match format!("{}:{}", cfg.bind_addr, remote_port).parse() {
         Ok(a) => a,
         Err(e) => {
-            state.shared.release_proxy_ports(&np.proxy_name);
-            proxy_error(&state, &np, format!("invalid bind addr: {e}"));
+            state.shared.release_proxy_port("tcp", remote_port, &np.proxy_name);
+            proxy_error(&state, &np, format!("invalid bind addr: {e}")).await;
             return;
         }
     };
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {
-            state.shared.release_proxy_ports(&np.proxy_name);
-            proxy_error(&state, &np, format!("bind tcp {} failed: {e}", np.remote_port));
+            state.shared.release_proxy_port("tcp", remote_port, &np.proxy_name);
+            proxy_error(&state, &np, format!("bind tcp {} failed: {e}", remote_port)).await;
             return;
         }
     };
     tracing::info!("frps tcp proxy {} listening on {}", np.proxy_name, addr);
-    let _ = state.send_tx.send(Message::NewProxyResp(msg::NewProxyResp {
-        proxy_name: np.proxy_name.clone(),
-        remote_addr: addr.to_string(),
-        error: String::new(),
-    })).await;
+    state
+        .send_and_flush(Message::NewProxyResp(msg::NewProxyResp {
+            proxy_name: np.proxy_name.clone(),
+            remote_addr: addr.to_string(),
+            error: String::new(),
+        }))
+        .await;
 
     let ptk = state.token.child_token();
     state.proxies.lock().unwrap().insert(np.proxy_name.clone(), ptk.clone());
+    // The control can disappear between the bind and the response. A token that
+    // is born cancelled (or cancelled while we were binding) means teardown()
+    // has already walked the map and will not notice this late entry, so undo
+    // the reservation here instead of leaving the port taken for good.
+    if ptk.is_cancelled() {
+        state.shared.release_proxy_port("tcp", remote_port, &np.proxy_name);
+        state.close_proxy(&np.proxy_name);
+        return;
+    }
     state.stats.set_proxy(ProxyInfo {
         proxy_name: np.proxy_name.clone(),
         proxy_type: "tcp".into(),
-        remote_port: np.remote_port,
+        remote_port,
         user: state.user.clone(),
         ..Default::default()
     });
@@ -926,7 +1075,19 @@ async fn start_tcp_proxy(state: Arc<ControlState>, np: msg::NewProxy) {
             tokio::select! {
                 _ = ptk.cancelled() => break,
                 accepted = listener.accept() => {
-                    let Ok((user_stream, peer)) = accepted else { break };
+                    let (user_stream, peer) = match accepted {
+                        Ok(v) => v,
+                        // A transient accept failure (out of file descriptors,
+                        // for instance) must not end the proxy: frpc would keep
+                        // reporting a healthy proxy that refuses every
+                        // connection. Only cancellation closes the listener.
+                        Err(e) => {
+                            if ptk.is_cancelled() { break; }
+                            tracing::warn!("frps tcp proxy {} accept error: {e}", proxy_name);
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            continue;
+                        }
+                    };
                     user_stream.set_nodelay(true).ok();
                     st.stats.total_user_conns.fetch_add(1, Ordering::Relaxed);
 
@@ -950,10 +1111,16 @@ async fn bridge_tcp_user(
     peer: SocketAddr,
 ) -> Result<()> {
     let mut work = state.get_work_conn().await?;
+    // Same src/dst pair frp's server sends (`userConn.RemoteAddr()` and
+    // `userConn.LocalAddr()`); proxies that care about the destination — the
+    // stcp/xtcp family — rely on it.
+    let local = user.local_addr().ok();
     let swc = msg::StartWorkConn {
         proxy_name: proxy_name.clone(),
         src_addr: peer.ip().to_string(),
         src_port: peer.port(),
+        dst_addr: local.map(|a| a.ip().to_string()).unwrap_or_default(),
+        dst_port: local.map(|a| a.port()).unwrap_or_default(),
         ..Default::default()
     };
     msg::write_msg(&mut work, &swc, msg::TYPE_START_WORK_CONN).await?;
@@ -995,52 +1162,69 @@ where
 }
 
 async fn start_udp_proxy(state: Arc<ControlState>, np: msg::NewProxy) {
-    let cfg = state.shared.cfg.try_read().map(|c| c.clone()).unwrap_or_default();
-    if !cfg.port_allowed(np.remote_port) {
-        proxy_error(&state, &np, format!("remote port {} not allowed", np.remote_port));
+    let cfg = state.shared.cfg.read().await.clone();
+    let Some(remote_port) = remote_port_of(&np) else {
+        proxy_error(&state, &np, format!("invalid remote port {}", np.remote_port)).await;
+        return;
+    };
+    if !cfg.port_allowed(remote_port) {
+        proxy_error(&state, &np, format!("remote port {} not allowed", remote_port)).await;
         return;
     }
-    if let Err(e) = state.shared.register_proxy_port("udp", np.remote_port, &np.proxy_name) {
-        proxy_error(&state, &np, e.to_string());
+    if let Err(e) = state.shared.register_proxy_port("udp", remote_port, &np.proxy_name) {
+        proxy_error(&state, &np, e.to_string()).await;
         return;
     }
-    let addr: SocketAddr = match format!("{}:{}", cfg.bind_addr, np.remote_port).parse() {
+    let addr: SocketAddr = match format!("{}:{}", cfg.bind_addr, remote_port).parse() {
         Ok(a) => a,
         Err(e) => {
-            state.shared.release_proxy_ports(&np.proxy_name);
-            proxy_error(&state, &np, format!("invalid bind addr: {e}"));
+            state.shared.release_proxy_port("udp", remote_port, &np.proxy_name);
+            proxy_error(&state, &np, format!("invalid bind addr: {e}")).await;
             return;
         }
     };
     let socket = Arc::new(match tokio::net::UdpSocket::bind(addr).await {
         Ok(s) => s,
         Err(e) => {
-            state.shared.release_proxy_ports(&np.proxy_name);
-            proxy_error(&state, &np, format!("bind udp {} failed: {e}", np.remote_port));
+            state.shared.release_proxy_port("udp", remote_port, &np.proxy_name);
+            proxy_error(&state, &np, format!("bind udp {} failed: {e}", remote_port)).await;
             return;
         }
     });
     tracing::info!("frps udp proxy {} listening on {}", np.proxy_name, addr);
-    let _ = state.send_tx.send(Message::NewProxyResp(msg::NewProxyResp {
-        proxy_name: np.proxy_name.clone(),
-        remote_addr: addr.to_string(),
-        error: String::new(),
-    })).await;
+    state
+        .send_and_flush(Message::NewProxyResp(msg::NewProxyResp {
+            proxy_name: np.proxy_name.clone(),
+            remote_addr: addr.to_string(),
+            error: String::new(),
+        }))
+        .await;
 
     let ptk = state.token.child_token();
     state.proxies.lock().unwrap().insert(np.proxy_name.clone(), ptk.clone());
+    // See start_tcp_proxy: undo a registration that outlived its control.
+    if ptk.is_cancelled() {
+        state.shared.release_proxy_port("udp", remote_port, &np.proxy_name);
+        state.close_proxy(&np.proxy_name);
+        return;
+    }
     // the udp task needs the name for StartWorkConn (see below)
     let proxy_name = np.proxy_name.clone();
     state.stats.set_proxy(ProxyInfo {
         proxy_name: np.proxy_name.clone(),
         proxy_type: "udp".into(),
-        remote_port: np.remote_port,
+        remote_port,
         user: state.user.clone(),
         ..Default::default()
     });
 
     tokio::spawn(async move {
         let local = socket.local_addr().ok();
+        // frpc drops a work conn that arrives before it has processed this
+        // proxy's NewProxyResp, and does so silently (its wrapper is still in
+        // `wait_start`), which leaves the proxy registered on both sides but
+        // carrying nothing. frp's own server waits out that window too.
+        tokio::time::sleep(Duration::from_millis(500)).await;
         loop {
             if ptk.is_cancelled() { break; }
             let mut work = match state.get_work_conn().await {

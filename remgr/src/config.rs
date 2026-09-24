@@ -20,6 +20,8 @@ pub struct Config {
     pub stun_turn: StunTurnConfig,
     pub rustdesk: RustDeskConfig,
     pub frps: FrpsConfig,
+    /// frp client: expose local services through an upstream frps
+    pub frpc: FrpcConfig,
     #[serde(skip_serializing, skip_deserializing)]
     pub config_path: PathBuf,
 }
@@ -162,6 +164,7 @@ impl Default for RustDeskConfig {
 }
 
 pub type FrpsConfig = remgr_frps::FrpsConfig;
+pub type FrpcConfig = remgr_frps::FrpcConfig;
 
 impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
@@ -189,6 +192,7 @@ impl Config {
             stun_turn: &'a StunTurnConfig,
             rustdesk: &'a RustDeskConfig,
             frps: &'a FrpsConfig,
+            frpc: &'a FrpcConfig,
         }
         let wire = Wire {
             console: &self.console,
@@ -196,6 +200,7 @@ impl Config {
             stun_turn: &self.stun_turn,
             rustdesk: &self.rustdesk,
             frps: &self.frps,
+            frpc: &self.frpc,
         };
         let mut out = toml::to_string_pretty(&wire)?;
         if !out.ends_with('\n') {

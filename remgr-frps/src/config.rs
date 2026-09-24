@@ -25,9 +25,14 @@ pub struct FrpsConfig {
     #[serde(default = "d_tls_key")]
     pub tls_key_path: Option<String>,
     /// Cap on work connections pre-issued per control (client `poolCount`).
+    /// frp's own default is 5; a larger cap only means the client opens more
+    /// idle work conns up front when it asks for them.
     #[serde(default = "d_max_pool")]
     pub max_pool_count: u32,
-    /// Seconds without ping/work-conn activity before a control is closed.
+    /// Seconds without control activity before a client that is known to send
+    /// heartbeats (frp <= 0.51) is closed. 0 disables the monitor, like frp's
+    /// `heartbeat_timeout`. Newer clients keep the connection alive through the
+    /// multiplexer instead and are never judged by it.
     #[serde(default = "d_heartbeat")]
     pub heartbeat_timeout: u64,
     /// Optional allowed remote port range for tcp/udp proxies, e.g. "6000-6100,7000".

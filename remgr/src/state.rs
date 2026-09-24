@@ -9,7 +9,10 @@ use tokio::sync::RwLock;
 
 use crate::config::Config;
 use crate::logging::LogHub;
-use crate::modules::{easytier::EasyTierModule, frps::FrpsModule, rustdesk::RustDeskModule, stun_turn::StunTurnModule};
+use crate::modules::{
+    easytier::EasyTierModule, frpc::FrpcModule, frps::FrpsModule, rustdesk::RustDeskModule,
+    stun_turn::StunTurnModule,
+};
 
 /// A console listening socket prepared but not served yet.
 ///
@@ -33,6 +36,7 @@ pub struct AppState {
     pub stun_turn: StunTurnModule,
     pub rustdesk: RustDeskModule,
     pub frps: FrpsModule,
+    pub frpc: FrpcModule,
     /// loopback client for the `/et` reverse proxy to the easytier-web API
     pub et_http: reqwest::Client,
     /// Asks the serving console to stop so it rebinds with current settings.
@@ -67,6 +71,7 @@ impl AppState {
             stun_turn: StunTurnModule::new(weak),
             rustdesk: RustDeskModule::new(weak),
             frps: FrpsModule::new(weak),
+            frpc: FrpcModule::new(weak),
             et_http,
             console_stop: Mutex::new(None),
             console_pending: Mutex::new(None),
@@ -109,6 +114,7 @@ impl AppState {
             "stun_turn" => Some(&self.stun_turn),
             "rustdesk" => Some(&self.rustdesk),
             "frps" => Some(&self.frps),
+            "frpc" => Some(&self.frpc),
             _ => None,
         }
     }

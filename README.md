@@ -10,6 +10,7 @@
 | STUN/TURN | STUN：RFC 5389 纯 Rust；TURN：`turn` crate（RFC 5766，纯 Rust） | Rust 库进程内链接；UDP 3478 + TURN over TLS 5349（RFC 5766 §11.5 流式分帧），分配数/中继字节数取自真实运行时 |
 | RustDesk 中继 (hbbr) + ID 服务器 (hbbs) | `third_party/rustdesk-server` | Rust 库进程内链接（新增 lib 导出层） |
 | frps 服务端 | `remgr-frps`（自研，与 fatedier/frp 线协议兼容：V1 帧、yamux/tcp_mux、TLS 首字节、md5 token 认证、tcp/udp 代理、工作连接池） | 纯 Rust 进程内 |
+| **frpc 客户端** | `remgr-frps::client`（自研：登录/令牌认证 + golib 控制通道加密 + yamux + TLS(0x17) + tcp/udp 代理 + 工作连接池 + 断线重连退避） | 纯 Rust 进程内；把本机服务发布到上游 frps（fatedier/frp 或另一台 ReMgr），控制台 frpc 页可配 |
 
 Web 控制台（axum + 内嵌 SPA）：每个服务的全部可配置项、启停开关、实时日志（WebSocket）、证书生成/上传（P-384 自签或 PEM 上传）、流量统计。
 
@@ -82,6 +83,7 @@ rcctl start remgr
 - 与 fatedier/frp 客户端（V1 线协议 + yamux/tcp_mux + TLS 首字节 + golib 控制通道加密）兼容。
   已用 **frpc 0.71.0（openbsd/amd64 官方 release）** 实测：登录、注册 tcp/udp 代理、
   经隧道 GET 控制台首页（200，31 KB）、持续 4 分钟无重连；`tcp` 与 `udp` 代理均验证通过。
+  另外验证：`poolCount=3`（4/4 会话的 udp 都通）、`tcp_mux=false` 非多路复用路径、TLS 首字节 0x17、错 token 被拒并明确报错。
 - frpc 建议：`transport.wireProtocol` 保持默认 `"v1"`（0.52+ 的默认值，也是本服务端实现的协议）；
   `transport.tls.enable` 用默认值即可（服务端自动生成自签证书，客户端默认不校验）。
 - 控制通道加密：登录之后的所有控制消息用 AES-128-CFB 加密，密钥为 `PBKDF2-HMAC-SHA1(token, salt, 64, 16)`。
@@ -92,6 +94,18 @@ rcctl start remgr
   因此服务端的「空闲控制连接回收」只对 ≤ 0.51 的客户端生效，对其余客户端依赖 TCP keepalive 回收半死连接。
 - 支持 `tcp` / `udp` 代理（udp 走工作连接帧，与 frp 的 base64 `UDPPacket` 一致）；`http/https/stcp/xtcp/tcpmux` 类型会返回协议错误（后续版本补充）。
 - 未实现 frp 的 `use_encryption` / `use_compression`（客户端开启时该代理会收到明确错误，不会静默失败）。
+
+## frpc 模块（本机作为 frp 客户端）
+
+控制台新增 **frpc** 页，把本机服务发布到上游 frps（fatedier/frp 或另一台 ReMgr）：
+
+- 必填：上游 `server_addr` / `server_port`、`token`（与上游 `auth.token` 一致）；
+  `tcp_mux` 必须与上游一致（默认开启）；上游用自签证书时保持 TLS 开启（默认不校验证书，也可填 `trusted_ca_file` 做校验）。
+- 代理列表每行一个：`名称 类型 本地IP 本地端口 远程端口`，类型支持 `tcp` / `udp`。
+  例：`web tcp 127.0.0.1 8080 7001`。
+- 状态页显示上游连通性、会话时长、累计登录/工作连接、每代理的状态与流量（入=上游→本地服务，出=本地服务→上游）。
+  上游拒绝登录等失败会写在「最近错误」里，重连按 1s→30s 退避（认证失败后固定 30s，不会风暴）。
+- 只支持 `tcp`/`udp` 代理；http/https/stcp/xtcp 在配置校验阶段就会报错，不会半途失败。
 
 ## 控制台可配置项（控制台自身）
 

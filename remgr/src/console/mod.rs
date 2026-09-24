@@ -523,6 +523,7 @@ async fn status(State(state): State<Arc<AppState>>) -> Response {
         "stun_turn": state.stun_turn.status().await,
         "rustdesk": state.rustdesk.status().await,
         "frps": state.frps.status().await,
+        "frpc": state.frpc.status().await,
     });
     Json(json!({
         "version": env!("CARGO_PKG_VERSION"),
@@ -627,6 +628,7 @@ async fn get_config(State(state): State<Arc<AppState>>, Path(service): Path<Stri
         "stun_turn" => serde_json::to_value(&cfg.stun_turn).ok(),
         "rustdesk" => serde_json::to_value(&cfg.rustdesk).ok(),
         "frps" => serde_json::to_value(&cfg.frps).ok(),
+        "frpc" => serde_json::to_value(&cfg.frpc).ok(),
         "console" => {
             let base = serde_json::to_value(&cfg.console).unwrap_or(serde_json::Value::Null);
             let mut v = match base {
@@ -698,6 +700,7 @@ async fn put_config(
             "stun_turn" => new_cfg.stun_turn = serde_json::from_value(value)?,
             "rustdesk" => new_cfg.rustdesk = serde_json::from_value(value)?,
             "frps" => new_cfg.frps = serde_json::from_value(value)?,
+            "frpc" => new_cfg.frpc = serde_json::from_value(value)?,
             _ => anyhow::bail!("unknown service"),
         }
         new_cfg.save()?;
@@ -722,6 +725,19 @@ async fn service_action(
     let Some(module) = state.module(&service) else {
         return api_error(StatusCode::NOT_FOUND, "unknown service");
     };
+    // Start is only possible while the module is enabled, and a stop persists
+    // enabled=false — so "start" has to clear that flag *before* calling into the
+    // module, otherwise the button would fail with "module is disabled" and a
+    // stopped service could never be started again from the console.
+    if action == "start" || action == "restart" {
+        let mut cfg = state.config_blocking();
+        if set_enabled_flag(&mut cfg, &service, true) {
+            if let Err(e) = cfg.save() {
+                tracing::warn!("could not persist the enabled flag for {service}: {e:#}");
+            }
+            *state.config.write().await = cfg;
+        }
+    }
     let result = match action.as_str() {
         "start" => module.start().await,
         "stop" => module.stop().await,
@@ -737,24 +753,32 @@ async fn service_action(
             // same value back into memory, otherwise the file and what
             // /api/status reports disagree until the next restart.
             if action == "start" || action == "stop" {
-                let enabled = action == "start";
                 let mut cfg = state.config_blocking();
-                match service.as_str() {
-                    "easytier" => cfg.easytier.enabled = enabled,
-                    "stun_turn" => cfg.stun_turn.enabled = enabled,
-                    "rustdesk" => cfg.rustdesk.enabled = enabled,
-                    "frps" => cfg.frps.enabled = enabled,
-                    _ => {}
+                if set_enabled_flag(&mut cfg, &service, action == "start") {
+                    if let Err(e) = cfg.save() {
+                        tracing::warn!("could not persist the enabled flag for {service}: {e:#}");
+                    }
+                    *state.config.write().await = cfg;
                 }
-                if let Err(e) = cfg.save() {
-                    tracing::warn!("could not persist the enabled flag for {service}: {e:#}");
-                }
-                *state.config.write().await = cfg;
             }
             Json(json!({"ok": true})).into_response()
         }
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
+}
+
+/// Set a service's `enabled` flag in the given config snapshot.
+/// Returns whether the service is one this console knows about.
+fn set_enabled_flag(cfg: &mut crate::config::Config, service: &str, enabled: bool) -> bool {
+    match service {
+        "easytier" => cfg.easytier.enabled = enabled,
+        "stun_turn" => cfg.stun_turn.enabled = enabled,
+        "rustdesk" => cfg.rustdesk.enabled = enabled,
+        "frps" => cfg.frps.enabled = enabled,
+        "frpc" => cfg.frpc.enabled = enabled,
+        _ => return false,
+    }
+    true
 }
 
 // ---------------------------------------------------------------- certs

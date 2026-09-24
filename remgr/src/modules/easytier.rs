@@ -16,6 +16,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::state::AppState;
 
+/// Node name used when the config leaves `node_name` empty: the dashboard needs
+/// something non-empty to list the node and its instance under.
+const DEFAULT_NODE_NAME: &str = "remgr-node";
+
 pub struct EasyTierModule {
     state: std::sync::Weak<AppState>,
     run: tokio::sync::Mutex<Option<RunHandle>>,
@@ -24,8 +28,14 @@ pub struct EasyTierModule {
 struct RunHandle {
     /// cancels the web-client registration task
     token: CancellationToken,
-    /// strong ref: dropping the manager stops its background drivers
-    _manager: Arc<easytier::instance::factory::NativeInstanceManager>,
+    /// owns the node instances. The web-client task holds a second Arc to the
+    /// manager, so dropping this handle does not stop them — `stop` does that
+    /// explicitly, before the handle goes away.
+    manager: Arc<easytier::instance::factory::NativeInstanceManager>,
+    /// the "center" instance started from the config, if the config asked for
+    /// one — `None` when node_enabled was off or the network name was empty.
+    /// Reported by `status` so it matches what is actually running.
+    node_instance: Option<uuid::Uuid>,
     /// keeps the embedded easytier-web config server (udp) and REST api
     /// alive — dropping this handle aborts them (AbortOnDrop semantics),
     /// which is what releases udp:22020 / tcp:11211 on restart
@@ -44,32 +54,51 @@ impl EasyTierModule {
             .unwrap_or_default()
     }
 
+    /// Quote a value for a TOML basic string. A quote or a backslash in any of
+    /// the configured fields would otherwise terminate the string (or start an
+    /// escape) and make the whole document unparseable — the start then fails
+    /// with a TOML error that does not name the offending field. Control
+    /// characters are dropped: every one of these fields is a single-line
+    /// identifier or secret.
+    fn toml_string(value: &str) -> String {
+        let mut out = String::with_capacity(value.len());
+        for c in value.chars() {
+            match c {
+                '"' => out.push_str("\\\""),
+                '\\' => out.push_str("\\\\"),
+                c if c.is_control() => {}
+                c => out.push(c),
+            }
+        }
+        out
+    }
+
     fn build_instance_toml(cfg: &crate::config::EasyTierConfig) -> anyhow::Result<String> {
         let mut listeners = String::new();
         for l in &cfg.listeners {
-            listeners.push_str(&format!("  \"{l}\",\n"));
+            listeners.push_str(&format!("  \"{}\",\n", Self::toml_string(l)));
         }
-        let network_secret = if cfg.network_secret.is_empty() {
-            // stable per-install secret so the node can rejoin after restarts
-            let mut h: u64 = 1469598103934665603;
-            for b in cfg.network_name.as_bytes() {
-                h ^= u64::from(*b);
-                h = h.wrapping_mul(1099511628211);
-            }
-            format!("{h:016x}")
-        } else {
-            cfg.network_secret.clone()
-        };
+        let node_name = if cfg.node_name.is_empty() { DEFAULT_NODE_NAME } else { cfg.node_name.as_str() };
+        // `network_secret` goes in verbatim: an empty secret is a valid EasyTier
+        // setting ("no secret"), and peers are admitted by the digest of
+        // (network_name, network_secret) — synthesizing a value here silently
+        // gave this node a secret that no stock easytier node in the same
+        // network can match.
         // The EasyTier TOML key is `ipv4`, not `virtual_ipv4`: unknown keys are
         // dropped silently, so the node fell back to DHCP and — with no peer to
         // lease from — never created its TUN device at all.
         let ip_part = if cfg.virtual_ipv4.is_empty() {
             "dhcp = true".to_string()
         } else {
-            format!("ipv4 = \"{}\"\ndhcp = false", cfg.virtual_ipv4)
+            format!("ipv4 = \"{}\"\ndhcp = false", Self::toml_string(&cfg.virtual_ipv4))
         };
+        // Both names come from `node_name`: `hostname` is what the node reports
+        // in lists, and `instance_name` is the label the easytier-web dashboard
+        // shows for this instance (NetworkMeta) — without it the centre node
+        // shows up as "default".
         Ok(format!(
             "listeners = [\n{listeners}]\n\
+             instance_name = \"{host}\"\n\
              hostname = \"{host}\"\n\
              {ip_part}\n\
              [network_identity]\n\
@@ -78,9 +107,9 @@ impl EasyTierModule {
              [flags]\n\
              default_protocol = \"tcp\"\n\
              latency_first = true\n",
-            host = cfg.node_name,
-            name = cfg.network_name,
-            secret = network_secret,
+            host = Self::toml_string(node_name),
+            name = Self::toml_string(&cfg.network_name),
+            secret = Self::toml_string(&cfg.network_secret),
         ))
     }
 }
@@ -93,10 +122,17 @@ impl super::ServiceModule for EasyTierModule {
 
     async fn status(&self) -> serde_json::Value {
         let cfg = self.cfg();
-        let running = self.run.lock().await.is_some();
+        let run = self.run.lock().await;
+        let running = run.is_some();
         // The center node is an EasyTier *instance*, and an instance only exists
         // once it has a network to join: `node_enabled` alone starts nothing.
-        let node_running = cfg.node_enabled && !cfg.network_name.is_empty();
+        // It also only exists while this module holds the handle that started
+        // it, so a stopped module reports the node as stopped too.
+        let node_running = run
+            .as_ref()
+            .map(|h| h.node_instance.is_some())
+            .unwrap_or(false);
+        drop(run);
         serde_json::json!({
             "enabled": cfg.enabled,
             "running": running,
@@ -145,7 +181,12 @@ impl super::ServiceModule for EasyTierModule {
             db_path: cfg.db_path.clone(),
             config_server_protocol: "udp".into(),
             config_server_port: cfg.config_server_port,
-            api_addr: cfg.api_addr.parse()?,
+            api_addr: cfg.api_addr.parse().with_context(|| {
+                format!(
+                    "easytier api_addr \"{}\" is not an IP address (the console proxies /et to it)",
+                    cfg.api_addr
+                )
+            })?,
             api_port: cfg.api_port,
             geoip_db: None,
             heartbeat_min_response_ms: 0,
@@ -154,9 +195,10 @@ impl super::ServiceModule for EasyTierModule {
                 allow_auto_create_user: true,
             }),
         };
+        const WEB_START_ATTEMPTS: u32 = 24;
         let mut web = None;
         let mut last_err: Option<anyhow::Error> = None;
-        for attempt in 0..24u32 {
+        for attempt in 0..WEB_START_ATTEMPTS {
             match easytier_web::start::start_web(web_cfg.clone()).await {
                 Ok(w) => {
                     web = Some(w);
@@ -164,18 +206,49 @@ impl super::ServiceModule for EasyTierModule {
                 }
                 Err(e) => {
                     last_err = Some(e);
-                    if attempt < 23 {
+                    if attempt + 1 < WEB_START_ATTEMPTS {
                         tokio::time::sleep(Duration::from_millis(250)).await;
                     }
                 }
             }
         }
-        let web = web.ok_or_else(|| {
-            last_err
-                .map(|e| e.context(format!("easytier-web start (db={})", cfg.db_path)))
-                .unwrap_or_else(|| anyhow::anyhow!("easytier-web start failed"))
-        })?;
+        let web = match web {
+            Some(w) => w,
+            None => {
+                // The console reports `to_string()` of the error, which stops at
+                // the outermost context — so the cause (which socket, which
+                // errno) has to be part of the message itself, otherwise a port
+                // conflict reads as a bare "start failed".
+                let cause = match last_err {
+                    Some(e) => format!("{e:#}"),
+                    None => "no attempt was made".to_string(),
+                };
+                anyhow::bail!(
+                    "easytier-web did not start after {WEB_START_ATTEMPTS} attempts \
+                     (config server udp:{}, api {}:{}, db={}): {cause}",
+                    cfg.config_server_port,
+                    cfg.api_addr,
+                    cfg.api_port,
+                    cfg.db_path
+                );
+            }
+        };
 
+        // 2) local node instance manager
+        let manager = Arc::new(easytier::instance::factory::native_cli_instance_manager());
+
+        // The static node config is built before anything is spawned: it is the
+        // only step left that can fail, and a failure must not leave the
+        // web-client task (and with it a registration against the config
+        // server) behind, orphaned and retrying forever.
+        let node_loader = if cfg.node_enabled && !cfg.network_name.is_empty() {
+            let toml = Self::build_instance_toml(&cfg)?;
+            Some(easytier::common::config::TomlConfigLoader::new_from_str(&toml)?)
+        } else {
+            None
+        };
+
+        // Cancels the registration task when the module stops.
         let token = CancellationToken::new();
 
         // Dashboard credential bootstrap.
@@ -336,24 +409,34 @@ impl super::ServiceModule for EasyTierModule {
             }
         }
 
-        // 2) local node instance manager
-        let manager = Arc::new(easytier::instance::factory::native_cli_instance_manager());
-        let mut instance_ids: Vec<uuid::Uuid> = Vec::new();
-
         // 3) register the node with the embedded config server so the
         //    easytier-web dashboard can manage it (in-process)
         let wc_token = token.clone();
         let wc_mgr = manager.clone();
         let config_server_port = web.config_server_port;
-        let node_name = if cfg.node_name.is_empty() { "remgr-node".to_string() } else { cfg.node_name.clone() };
+        let node_name = if cfg.node_name.is_empty() { DEFAULT_NODE_NAME.to_string() } else { cfg.node_name.clone() };
         // stable machine id: persisted once, reused across restarts (the
         // platform state-dir lookup is unsupported on openbsd)
         let machine_id_path = std::path::Path::new(&db_dir).join("machine_id");
-        let machine_id = match std::fs::read_to_string(&machine_id_path) {
-            Ok(s) => s.trim().to_string(),
-            Err(_) => {
+        // The file is read back as-is, and a value the library cannot parse is
+        // *hashed* into a machine id — an empty or truncated file would then
+        // give this install the same id as any other install with the same
+        // garbage, so only a well-formed one is reused.
+        let stored = std::fs::read_to_string(&machine_id_path)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| uuid::Uuid::parse_str(s).is_ok());
+        let machine_id = match stored {
+            Some(id) => id,
+            None => {
                 let id = uuid::Uuid::new_v4().to_string();
-                let _ = std::fs::write(&machine_id_path, &id);
+                if let Err(e) = std::fs::write(&machine_id_path, &id) {
+                    tracing::warn!(
+                        "easytier: cannot persist the machine id in {} ({e}) — the config \
+                         server will list a new device after the next process restart",
+                        machine_id_path.display()
+                    );
+                }
                 id
             }
         };
@@ -388,14 +471,16 @@ impl super::ServiceModule for EasyTierModule {
             }
         });
 
-        // 4) default network instance (the "center" node identity)
-        if cfg.node_enabled && !cfg.network_name.is_empty() {
-            let toml = Self::build_instance_toml(&cfg)?;
-            let loader = easytier::common::config::TomlConfigLoader::new_from_str(&toml)?;
+        // 4) default network instance (the "center" node identity). The config
+        //    was parsed above; `run_network_instance` only queues the instance,
+        //    so a listener that cannot bind is reported by the instance itself
+        //    (and shows up in the dashboard's node events).
+        let mut node_instance = None;
+        if let Some(loader) = node_loader {
             match manager.run_network_instance(loader, easytier::common::config::ConfigFileControl::STATIC_CONFIG) {
                 Ok(id) => {
                     tracing::info!("easytier node instance started: {id}");
-                    instance_ids.push(id);
+                    node_instance = Some(id);
                 }
                 Err(e) => tracing::error!("easytier node instance failed: {e:#}"),
             }
@@ -404,8 +489,7 @@ impl super::ServiceModule for EasyTierModule {
         // NOTE: `web` must live in the handle — dropping it aborts the
         // config-server and REST api tasks (AbortOnDropHandle semantics), which
         // is what frees udp:22020 / tcp:11211 for the next start.
-        *run = Some(RunHandle { token, _manager: manager, _web: web });
-        let _ = instance_ids;
+        *run = Some(RunHandle { token, manager, node_instance, _web: web });
         Ok(())
     }
 
@@ -416,6 +500,18 @@ impl super::ServiceModule for EasyTierModule {
         // a caller rebinds the same ports.
         let handle = self.run.lock().await.take();
         if let Some(handle) = handle {
+            // Stop the node instances explicitly instead of relying on the
+            // handle's drop: the web-client task holds a second Arc to the
+            // manager, so the manager (and with it the instances: TUN device,
+            // listener sockets, routes) is only released once that task is
+            // scheduled and drops its clone — well after `stop` returned. A
+            // restart would then race the old instance for the same ports.
+            let instance_ids = handle.manager.instance_ids();
+            if !instance_ids.is_empty() {
+                if let Err(e) = handle.manager.delete_network_instances(instance_ids).await {
+                    tracing::warn!("easytier: stopping the node instance failed: {e:#}");
+                }
+            }
             handle.token.cancel();
             drop(handle);
             tokio::time::sleep(Duration::from_millis(300)).await;

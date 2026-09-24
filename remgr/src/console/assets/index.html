@@ -94,6 +94,7 @@ th{color:var(--tx2);font-weight:500}
   <div id="tab-stun_turn" class="hidden"></div>
   <div id="tab-rustdesk" class="hidden"></div>
   <div id="tab-frps" class="hidden"></div>
+  <div id="tab-frpc" class="hidden"></div>
   <div id="tab-system" class="hidden">
     <div class="card">
       <h3>🔧 控制台设置</h3>
@@ -142,8 +143,8 @@ const API = {
   get: (p) => fetch(p, {headers: {'x-remgr-csrf':'1'}}),
   send: (p, method, body) => fetch(p, {method, headers:{'Content-Type':'application/json','x-remgr-csrf':'1'}, body: body!==undefined?JSON.stringify(body):undefined}),
 };
-const SERVICES = ['easytier','stun_turn','rustdesk','frps'];
-const TITLES = {easytier:'⚡ EasyTier 中心', stun_turn:'🌐 STUN / TURN', rustdesk:'🖥 RustDesk 中继', frps:'📡 frps 反向代理'};
+const SERVICES = ['easytier','stun_turn','rustdesk','frps','frpc'];
+const TITLES = {easytier:'⚡ EasyTier 中心', stun_turn:'🌐 STUN / TURN', rustdesk:'🖥 RustDesk 中继', frps:'📡 frps 反向代理', frpc:'🔌 frpc 客户端'};
 let status=null, configs={}, curTab='dashboard', editService=null, ws=null, logTimer=null;
 
 function toast(msg, ok=true){
@@ -190,13 +191,13 @@ async function refreshAll(){
 }
 function buildNav(){
   const nav=document.getElementById('nav');
-  const tabs=[['dashboard','总览'],['easytier','EasyTier'],['stun_turn','STUN/TURN'],['rustdesk','RustDesk'],['frps','frps'],['system','系统']];
+  const tabs=[['dashboard','总览'],['easytier','EasyTier'],['stun_turn','STUN/TURN'],['rustdesk','RustDesk'],['frps','frps'],['frpc','frpc'],['system','系统']];
   nav.innerHTML=tabs.map(([id,label])=>`<button data-t="${id}" class="${id===curTab?'active':''}" onclick="switchTab('${id}')">${label}</button>`).join('');
 }
 function switchTab(t){
   curTab=t;
   document.querySelectorAll('#nav button').forEach(b=>b.classList.toggle('active',b.dataset.t===t));
-  for(const id of ['dashboard','easytier','stun_turn','rustdesk','frps','system'])
+  for(const id of ['dashboard','easytier','stun_turn','rustdesk','frps','frpc','system'])
     document.getElementById('tab-'+id).classList.toggle('hidden', id!==t);
   if(t==='system'){tickLogs(); scrollLogs(); refreshConsoleCfg()}
   render();
@@ -261,6 +262,13 @@ function renderDashboard(){
     ['TLS 证书', fp.tls?'已配置':'使用临时自签证书'],
     ['入站流量', fmtBytes(fp.bytes_in||0)],['出站流量', fmtBytes(fp.bytes_out||0)],
   ]);
+  const fc=sv.frpc||{};
+  html += svcCard('frpc', fc.running&&fc.connected, fc.enabled, [
+    ['上游', fc.upstream||'—'],['连接', fc.running?(fc.connected?'已连接':'连接中/重连中'):'未启动'],
+    ['代理', (fc.proxies||[]).filter(p=>p.state==='running').length+' / '+(fc.proxies||[]).length+' 个运行中'],
+    ['会话时长', (fc.session_uptime_s||0)+' 秒'],
+    ['入站流量', fmtBytes(fc.bytes_in||0)],['出站流量', fmtBytes(fc.bytes_out||0)],
+  ]);
   el.innerHTML=html;
 }
 function renderServiceTabs(){
@@ -290,6 +298,7 @@ function renderServiceTabs(){
     svcCard('rustdesk', s.rustdesk?.running, s.rustdesk?.enabled, [
       ['中继端口 (hbbr)', s.rustdesk?.relay_port],['ID 端口 (hbbs)', s.rustdesk?.hbbs_port],
       ['NAT 测试端口', s.rustdesk?.nat_test_port],['WebSocket 端口', s.rustdesk?.websocket_port],
+      ['中继 WebSocket 端口', s.rustdesk?.relay_websocket_port],
       ['Key', s.rustdesk?.key_set?'已设置':'未设置'],['', ''],
     ]) + `<div class="card"><h3>🔑 服务器公钥</h3>
       <p style="color:var(--tx2);font-size:12px;margin-bottom:8px">客户端「ID/中继服务器」配置中的 Key 填此值</p>
@@ -312,6 +321,29 @@ function renderServiceTabs(){
       客户端配置：<code>serverAddr</code> = 本机地址，<code>serverPort</code> = ${fp.bind?.split(':').pop()||7000}，
       <code>auth.token</code> 与上方一致；TLS / tcp_mux 保持默认即可。
       支持 <code>tcp</code> / <code>udp</code> 代理；http/https/stcp/xtcp 类型返回协议错误。</p></div>`;
+  // frpc: this box as a *client* of an upstream frps
+  const fc=s.frpc||{};
+  const frpRows = (fc.proxies&&fc.proxies.length)
+    ? `<table><tr><th>代理名</th><th>类型</th><th>本地服务</th><th>远程端口</th><th>状态</th><th>流量</th></tr>`+
+      fc.proxies.map(p=>`<tr><td>${p.name}</td><td>${p.type}</td><td>${p.local_addr||''}</td><td>${p.remote_port||''}</td>`+
+        `<td>${p.state==='running'?'运行中':p.state==='waiting'?'注册中':p.state==='error'?'错误':'未启动'}${p.error?` — ${p.error}`:''}</td>`+
+        `<td>${fmtBytes(p.bytes_in||0)} / ${fmtBytes(p.bytes_out||0)}</td></tr>`).join('')+'</table>'
+    : '<p style="color:var(--tx2);font-size:13px">暂无</p>';
+  document.getElementById('tab-frpc').innerHTML =
+    svcCard('frpc', fc.running&&fc.connected, fc.enabled, [
+      ['上游服务器', fc.upstream||'—'],
+      ['连接状态', fc.running?(fc.connected?'已连接':'连接中 / 重连中'):'未启动'],
+      ['认证 Token', fc.token_set?'已设置':'未设置'],
+      ['tcp_mux', String(fc.tcp_mux)],['TLS', fc.tls?'启用':'关闭'],
+      ['连接池', fc.pool_count],['累计登录', fc.total_logins],
+      ['工作连接', fc.total_work_conns],['会话时长', (fc.session_uptime_s||0)+' 秒'],
+      ['入站流量', fmtBytes(fc.bytes_in||0)],['出站流量', fmtBytes(fc.bytes_out||0)],
+    ]) + (fc.last_error?`<div class="card"><h3>⚠ 最近错误</h3><p style="color:var(--red);font-size:12px">${fc.last_error}</p></div>`:'')
+    + `<div class="card"><h3>📋 代理</h3>${frpRows}</div>
+       <div class="card"><h3>ℹ frpc 说明</h3><p style="color:var(--tx2);font-size:12px">
+       本模块让这台机器作为 frp <b>客户端</b>把本地服务发布到上游 frps（可为 fatedier/frp 或另一台 ReMgr）。
+       代理列表每行格式：<code>名称 类型 本地IP 本地端口 远程端口</code>，类型支持 <code>tcp</code>/<code>udp</code>；
+       <code>tcp_mux</code> 必须与上游一致；上游用自签证书时保持 TLS 开启（默认不校验证书，也可填 CA 文件）。</p></div>`;
 }
 
 /* ---------- actions ---------- */
@@ -380,6 +412,18 @@ const SCHEMAS = {
     [['crypto_salt','控制通道加密盐 (高级)','默认 frp（frp ≥ 0.44）；仅 frp < 0.44 的旧客户端需改为 crypto']],
     [['tls_cert_path','TLS 证书路径','留空=自动生成自签证书'],['tls_key_path','TLS 私钥路径','']],
   ],
+  frpc: [
+    [['enabled','启用模块','',['checkbox']]],
+    [['server_addr','上游 frps 地址',''],['server_port','上游 frps 端口','',['number']]],
+    [['token','认证 Token','必须与上游 frps 的 auth.token 一致']],
+    [['tls','启用 TLS','上游用自签证书时保持开启；默认不校验证书',['checkbox']]],
+    [['server_name','TLS SNI (可选)','']],
+    [['trusted_ca_file','CA 文件 (可选)','填了才校验证书，如 /etc/remgr/ssl/frps_cert.pem']],
+    [['tcp_mux','启用 yamux 多路复用','必须与上游一致（默认开启）',['checkbox']]],
+    [['connect_timeout','连接超时 (秒)','',['number']]],
+    [['pool_count','工作连接池大小','',['number']]],
+    [['proxies','代理列表 (每行一个)','格式：名称 类型 本地IP 本地端口 远程端口（类型 tcp/udp），例如 web tcp 127.0.0.1 8080 7001','textarea']],
+  ],
 };
 
 function flattenSchema(svc){
@@ -397,6 +441,10 @@ function flattenSchema(svc){
 }
 function getPath(o, path){ return path.split('.').reduce((a,k)=>a?.[k], o) }
 function setPath(o, path, v){ const ks=path.split('.'); const last=ks.pop(); ks.reduce((a,k)=>a[k]??=(a[k]={}),o)[last]=v }
+/// A proxy table as the console's one-line syntax (the server parses it back).
+function proxyLine(p){
+  return [p.name, p.type||p.proxy_type||'tcp', p.local_ip||'127.0.0.1', p.local_port, p.remote_port].filter(x=>x!==undefined&&x!==null).join(' ');
+}
 
 function openConfig(svc){
   editService=svc;
@@ -407,8 +455,13 @@ function openConfig(svc){
     const v=getPath(cfg,f.path);
     if(f.widget==='checkbox')
       return `<div class="fg"><label class="switch" style="margin:0"><input type="checkbox" data-path="${f.path}" ${v?'checked':''}> ${f.label}</label></div>`;
-    if(f.widget==='textarea')
-      return `<div class="fg"><label>${f.label}</label><textarea data-path="${f.path}" rows="4" style="width:100%;padding:9px;border:1px solid var(--border);border-radius:7px;background:var(--bg);color:var(--tx);font-size:12px;font-family:monospace">${v!==undefined&&v!==null?(Array.isArray(v)?v.join('\n'):v):''}</textarea>${f.hint?`<div class="hint">${f.hint}</div>`:''}</div>`;
+    if(f.widget==='textarea'){
+      // Arrays of tables (frpc proxies, TURN users) are edited as one line each;
+      // a proxy table can also be sent as its one-line form, which the server
+      // parses back into the same structure.
+      const text = v===undefined||v===null ? '' : (Array.isArray(v) ? v.map(x=>typeof x==='string'?x:proxyLine(x)).join('\n') : v);
+      return `<div class="fg"><label>${f.label}</label><textarea data-path="${f.path}" rows="4" style="width:100%;padding:9px;border:1px solid var(--border);border-radius:7px;background:var(--bg);color:var(--tx);font-size:12px;font-family:monospace">${text}</textarea>${f.hint?`<div class="hint">${f.hint}</div>`:''}</div>`;
+    }
     const type = f.widget==='number' ? 'number' : 'text';
     return `<div class="fg"><label>${f.label}</label><input type="${type}" data-path="${f.path}" value="${v!==undefined&&v!==null?String(v).replace(/"/g,'&quot;'):''}">${f.hint?`<div class="hint">${f.hint}</div>`:''}</div>`;
   }).join('');
@@ -433,8 +486,9 @@ async function saveModal(){
     if(el.type==='checkbox') v=el.checked;
     else if(el.tagName==='TEXTAREA'){
       v=el.value;
-      // listeners / users are string arrays
-      if(['listeners','users'].includes(el.dataset.path)) v=el.value.split('\n').map(x=>x.trim()).filter(Boolean);
+      // listeners / users / frpc proxies are string arrays (the server parses
+      // each proxy line into the same table it would accept as JSON)
+      if(['listeners','users','proxies'].includes(el.dataset.path)) v=el.value.split('\n').map(x=>x.trim()).filter(Boolean);
     }
     else if(el.type==='number'){
       // empty numeric inputs keep the existing value rather than becoming 0

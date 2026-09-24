@@ -1,4 +1,6 @@
-//! frp server-side protocol implementation (wire-compatible with fatedier/frp).
+//! frp protocol implementation, both directions: a **server** (`frps`) that
+//! fatedier/frp clients can talk to, and a **client** (`frpc`) that can talk to
+//! any fatedier/frp server (or to another ReMgr).
 //!
 //! Implemented protocol surface (frp "wire v1", the default for all current
 //! frpc releases):
@@ -6,17 +8,19 @@
 //! - token auth: `privilege_key = hex(md5(token + timestamp))`
 //! - `tcp_mux` (yamux) multiplexing: control stream + work-conn streams
 //! - plain (non-mux) work connections over separate TCP streams
-//! - optional TLS: frpc sends `0x16` as custom first byte, then TLS handshake
+//! - optional TLS: frpc sends `0x17` as custom first byte, then TLS handshake
 //! - proxy types: `tcp`, `udp`; other types are rejected with a protocol error
 //!
 //! frp wire protocol v2 (magic `FRP\0\x02\r\n`) is detected and rejected with a
 //! clear log message; no current frpc defaults to it.
 
+pub mod client;
 pub mod config;
 pub mod crypto;
 pub mod msg;
 pub mod server;
 
+pub use client::{FrpcClient, FrpcConfig, FrpcProxyConfig, FrpcStatus, ProxyStatus};
 pub use config::FrpsConfig;
 pub use server::{FrpsServer, ProxyInfo, ServerStats};
 #[cfg(test)]

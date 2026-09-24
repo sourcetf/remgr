@@ -41,6 +41,9 @@ const ATTR_SOFTWARE: u16 = 0x8022;
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TurnRuntimeInfo {
     pub allocations: u64,
+    /// Bytes relayed **from clients** (Send Indication / ChannelData). The crate's
+    /// counter is only bumped on that path, peer-to-client traffic is not counted:
+    /// the figure is a lower bound, not the total relayed volume.
     pub bytes_relayed: u64,
 }
 
@@ -53,6 +56,15 @@ struct RunHandle {
     token: CancellationToken,
     joins: Vec<tokio::task::JoinHandle<()>>,
     turn: Option<TurnHandles>,
+}
+
+impl RunHandle {
+    /// Every task this module spawned is still running. A task that died (bind
+    /// failure after a retry, runtime error, panic) means nothing is serving any
+    /// more, so the module must not be reported as running.
+    fn alive(&self) -> bool {
+        !self.token.is_cancelled() && self.joins.iter().all(|j| !j.is_finished())
+    }
 }
 
 impl StunTurnModule {
@@ -92,7 +104,7 @@ impl StunTurnModule {
     }
 
     async fn spawn_stun(&self, token: CancellationToken, cfg: StunTurnConfig) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-        let addr: SocketAddr = format!("{}:{}", cfg.bind_addr, cfg.stun_port).parse()?;
+        let addr = parse_bind(&cfg.bind_addr, cfg.stun_port)?;
         let socket = UdpSocket::bind(addr).await?;
         tracing::info!("STUN listening on udp://{addr}");
         Ok(tokio::spawn(async move {
@@ -127,7 +139,10 @@ impl super::ServiceModule for StunTurnModule {
     async fn status(&self) -> serde_json::Value {
         let cfg = self.cfg();
         let mut run = self.run.lock().await;
-        let running = run.is_some();
+        // `run` holding a handle is not enough: a task that died must show up as
+        // a stopped module, otherwise the console keeps offering "stop" for a
+        // service that is not listening.
+        let running = run.as_ref().map(|h| h.alive()).unwrap_or(false);
         let (allocations, bytes_relayed, tls_active, turn_available) = match run.as_mut() {
             Some(handle) => {
                 let tls_active = handle.turn.as_ref().map(|t| t.tls_listening).unwrap_or(false);
@@ -136,6 +151,9 @@ impl super::ServiceModule for StunTurnModule {
             }
             None => (0, 0, false, false),
         };
+        // Credentials without a `:` cannot be used at all; the console must not
+        // count them as users.
+        let usable_users = cred_entries(&cfg).count();
         serde_json::json!({
             "enabled": cfg.enabled,
             "running": running,
@@ -151,7 +169,7 @@ impl super::ServiceModule for StunTurnModule {
             "domain": cfg.domain,
             "external_ip": cfg.external_ip,
             "relay_ports": format!("{}-{}", cfg.relay_min_port, cfg.relay_max_port),
-            "users_count": cfg.users.len(),
+            "users_count": usable_users,
             "realm": cfg.realm,
             "cert_path": cfg.cert_path,
             "key_path": cfg.key_path,
@@ -160,8 +178,22 @@ impl super::ServiceModule for StunTurnModule {
 
     async fn start(&self) -> anyhow::Result<()> {
         let mut run = self.run.lock().await;
-        if run.is_some() {
-            return Ok(());
+        let mut stale = false;
+        match run.as_ref() {
+            Some(h) if h.alive() => return Ok(()),
+            // A handle whose tasks are gone is not a running module: drop it (the
+            // token stops the leftover close task) so this call really rebinds,
+            // instead of reporting success while nothing is listening.
+            Some(_) => stale = true,
+            None => {}
+        }
+        if stale {
+            if let Some(old) = run.take() {
+                old.token.cancel();
+                for j in old.joins {
+                    let _ = j.await;
+                }
+            }
         }
         let cfg = self.cfg();
         if !cfg.enabled {
@@ -216,28 +248,71 @@ impl super::ServiceModule for StunTurnModule {
     }
 }
 
+// ---------------------------------------------------------------- config plumbing
+
+/// Socket address for a configured bind address and port.
+///
+/// The console field takes an IP (`0.0.0.0`, `::`) and operators routinely paste
+/// the bracketed form of an IPv6 literal as it appears in URLs (`[::]`), so both
+/// are accepted. A host name or a typo is reported: silently falling back to the
+/// wildcard would bind a different address than the operator asked for.
+fn parse_bind(bind_addr: &str, port: u16) -> anyhow::Result<SocketAddr> {
+    let trimmed = bind_addr.trim();
+    let bare = trimmed
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    let ip: IpAddr = bare.parse().map_err(|_| {
+        anyhow::anyhow!("invalid bind address {bind_addr:?} (use an IP such as 0.0.0.0 or ::)")
+    })?;
+    Ok(SocketAddr::new(ip, port))
+}
+
+/// The bind address as the `turn` crate's relay generator needs it:
+/// `resolve_addr` formats `"<address>:<port>"` and parses it back, which only
+/// works for an IPv6 literal when it is bracketed.
+fn relay_bind_string(bind_addr: &str) -> String {
+    match parse_bind(bind_addr, 0) {
+        Ok(addr) if addr.is_ipv6() => format!("[{}]", addr.ip()),
+        _ => bind_addr.trim().to_string(),
+    }
+}
+
+/// The usable credential entries from `users`: `user:pass`, with a non-empty user
+/// (the long-term key is derived from the user name, so an empty one cannot be
+/// authenticated). Malformed entries are reported by [`cred_map`].
+fn cred_entries(cfg: &StunTurnConfig) -> impl Iterator<Item = (&str, &str)> {
+    cfg.users
+        .iter()
+        .filter_map(|u| u.split_once(':'))
+        .filter(|(user, _)| !user.is_empty())
+}
+
 // ---------------------------------------------------------------- STUN wire
 
-fn xor_mapped_address(src: SocketAddr) -> Vec<u8> {
+/// XOR-MAPPED-ADDRESS value (RFC 5389 §15.2).
+///
+/// The port and the address are XORed with `mask`, which is the magic cookie
+/// followed by the transaction id. For IPv4 only the cookie (the first four
+/// bytes) applies; for IPv6 the whole 16 bytes do — XORing a v6 address with the
+/// cookie alone, as a "cookie repeated" mask would, makes a client decode an
+/// address that is not its own.
+fn xor_mapped_address(src: SocketAddr, mask: &[u8; 16]) -> Vec<u8> {
     let mut val = Vec::with_capacity(20);
-    let cookie_be = MAGIC_COOKIE.to_be_bytes();
+    let xored_port = src.port() ^ (MAGIC_COOKIE >> 16) as u16;
+    let family = if src.is_ipv4() { 0x01u8 } else { 0x02u8 };
+    val.push(0x00);
+    val.push(family);
+    val.extend_from_slice(&xored_port.to_be_bytes());
     match src.ip() {
         IpAddr::V4(v4) => {
-            val.push(0x00);
-            val.push(0x01);
-            let xored_port = src.port() ^ (MAGIC_COOKIE >> 16) as u16;
-            val.extend_from_slice(&xored_port.to_be_bytes());
-            for (octet, mask) in v4.octets().iter().zip(cookie_be.iter()) {
-                val.push(octet ^ mask);
+            for (octet, m) in v4.octets().iter().zip(mask.iter()) {
+                val.push(octet ^ m);
             }
         }
         IpAddr::V6(v6) => {
-            val.push(0x00);
-            val.push(0x02);
-            let xored_port = src.port() ^ (MAGIC_COOKIE >> 16) as u16;
-            val.extend_from_slice(&xored_port.to_be_bytes());
-            for (i, octet) in v6.octets().iter().enumerate() {
-                val.push(octet ^ cookie_be[i % 4]);
+            for (octet, m) in v6.octets().iter().zip(mask.iter()) {
+                val.push(octet ^ m);
             }
         }
     }
@@ -248,17 +323,28 @@ fn xor_mapped_address(src: SocketAddr) -> Vec<u8> {
 /// different address or port. A single-socket responder cannot honour that, and
 /// answering anyway would report a mapped address the client would then treat as
 /// authoritative, so such requests are dropped instead.
-fn asks_for_alternate_address(packet: &[u8]) -> bool {
+///
+/// Only attributes inside the declared message length are inspected: bytes behind
+/// it are not part of the message (RFC 5389 §7.3), and reading them as attributes
+/// could turn a valid request into a dropped one.
+fn asks_for_alternate_address(packet: &[u8], body_len: usize) -> bool {
+    let msg_end = (20 + body_len).min(packet.len());
     let mut pos = 20usize;
-    while pos + 4 <= packet.len() {
+    while pos + 4 <= msg_end {
         let atype = u16::from_be_bytes([packet[pos], packet[pos + 1]]);
         let alen = u16::from_be_bytes([packet[pos + 2], packet[pos + 3]]) as usize;
-        let end = (pos + 4 + alen).min(packet.len());
+        let end = (pos + 4 + alen).min(msg_end);
         let body = &packet[pos + 4..end];
         if matches!(atype, ATTR_CHANGE_REQUEST | ATTR_RESPONSE_PORT)
             && body.iter().any(|b| *b != 0)
         {
             return true;
+        }
+        // An attribute whose length runs past the end of the message cannot be
+        // walked any further (the padding is unknown); stop instead of
+        // resynchronising on whatever the rest of the datagram contains.
+        if pos + 4 + alen > msg_end {
+            return false;
         }
         pos = end + ((4 - alen % 4) % 4);
     }
@@ -277,20 +363,27 @@ fn process_stun_packet(packet: &[u8], src: SocketAddr, socket: &UdpSocket) -> an
         return Ok(());
     }
     let body_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
-    if body_len + 20 > packet.len() {
+    // Attributes are padded to four bytes, so a length that is not a multiple of
+    // four cannot describe a valid message (the two low bits are always zero).
+    if body_len % 4 != 0 || body_len + 20 > packet.len() {
         return Ok(());
     }
     let tid = &packet[8..20];
+    // RFC 5389 §15.2: the address mask is the magic cookie concatenated with the
+    // 96-bit transaction id of the request.
+    let mut mask = [0u8; 16];
+    mask[..4].copy_from_slice(&MAGIC_COOKIE.to_be_bytes());
+    mask[4..].copy_from_slice(tid);
 
     if msg_type != BINDING_REQUEST {
         return Ok(()); // ignore indicators / other classes silently
     }
-    if asks_for_alternate_address(packet) {
+    if asks_for_alternate_address(packet, body_len) {
         tracing::debug!("STUN: ignoring request for an alternate address/port (unsupported)");
         return Ok(());
     }
 
-    let xor_val = xor_mapped_address(src);
+    let xor_val = xor_mapped_address(src, &mask);
     let software: &[u8] = b"ReMgr";
     let software_padded = (software.len() + 3) / 4 * 4;
     let attr_len: u16 = 4 + xor_val.len() as u16 + 4 + software_padded as u16;
@@ -317,11 +410,30 @@ fn process_stun_packet(packet: &[u8], src: SocketAddr, socket: &UdpSocket) -> an
 // ---------------------------------------------------------------- TURN relay
 
 /// Long-term credentials (RFC 5766 §4) built from the `user:pass` entries.
+///
+/// An entry without a `:` (or with an empty user) never authenticates, and a
+/// duplicate user silently replaces the earlier password, so both are reported
+/// instead of leaving the operator with a client whose credentials "look right"
+/// in the console but always get a 401.
 fn cred_map(cfg: &StunTurnConfig) -> HashMap<String, Vec<u8>> {
     let mut m = HashMap::new();
-    for u in &cfg.users {
-        if let Some((user, pass)) = u.split_once(':') {
-            m.insert(user.to_string(), generate_auth_key(user, &cfg.realm, pass));
+    for (i, u) in cfg.users.iter().enumerate() {
+        match u.split_once(':') {
+            // The value holds a password, so only the position is named.
+            Some((user, _)) if user.is_empty() => {
+                tracing::warn!("TURN: ignoring credential entry #{}: empty user name", i + 1);
+            }
+            Some((user, pass)) => {
+                if m.insert(user.to_string(), generate_auth_key(user, &cfg.realm, pass)).is_some() {
+                    tracing::warn!(
+                        "TURN: credential entry #{} repeats user {user:?}; the last one wins",
+                        i + 1
+                    );
+                }
+            }
+            None => {
+                tracing::warn!("TURN: ignoring credential entry #{} (expected user:pass)", i + 1);
+            }
         }
     }
     m
@@ -403,6 +515,16 @@ async fn spawn_turn_relay(
 ) -> anyhow::Result<(TurnHandles, Vec<tokio::task::JoinHandle<()>>)> {
     let mut joins = Vec::new();
 
+    // Both addresses are resolved before anything binds: an unusable bind address
+    // must fail while nothing is half-started (a socket that outlives the failed
+    // start would make every retry fail too).
+    let udp_addr = parse_bind(&cfg.bind_addr, cfg.stun_port)?;
+    let tls_addr = if cfg.tls_port != 0 {
+        Some(parse_bind(&cfg.bind_addr, cfg.tls_port)?)
+    } else {
+        None
+    };
+
     let creds = cred_map(&cfg);
     if creds.is_empty() {
         tracing::warn!("TURN enabled but no users configured; RFC 5766 requires credentials, every request will be rejected");
@@ -414,10 +536,11 @@ async fn spawn_turn_relay(
     } else {
         match local_ip().await {
             Some(ip) => ip,
-            None => match cfg.bind_addr.parse::<IpAddr>() {
+            None => match parse_bind(&cfg.bind_addr, 0) {
                 // No default route to probe: a concrete bind address is the
                 // best guess at how clients reach this host.
-                Ok(ip) if !ip.is_unspecified() => {
+                Ok(addr) if !addr.ip().is_unspecified() => {
+                    let ip = addr.ip();
                     tracing::warn!(
                         "TURN: could not probe a route to the internet; advertising relay address {ip} (the bind address)"
                     );
@@ -436,14 +559,13 @@ async fn spawn_turn_relay(
     };
 
     // ---- UDP listener (TURN allocations + STUN Binding on one socket)
-    let bind_addr: SocketAddr = format!("{}:{}", cfg.bind_addr, cfg.stun_port).parse()?;
     let udp_server = Arc::new(
         Server::new(ServerConfig {
             conn_configs: vec![ConnConfig {
-                conn: Arc::new(UdpSocket::bind(bind_addr).await?),
+                conn: Arc::new(UdpSocket::bind(udp_addr).await?),
                 relay_addr_generator: relay_generator(
                     relay_ip,
-                    cfg.bind_addr.clone(),
+                    relay_bind_string(&cfg.bind_addr),
                     cfg.relay_min_port,
                     cfg.relay_max_port,
                 ),
@@ -456,7 +578,7 @@ async fn spawn_turn_relay(
         .await?,
     );
     tracing::info!(
-        "TURN relay active on udp://{bind_addr} (external {relay_ip}, {} users)",
+        "TURN relay active on udp://{udp_addr} (external {relay_ip}, {} users)",
         cfg.users.len()
     );
     {
@@ -472,12 +594,11 @@ async fn spawn_turn_relay(
     // ---- TLS listener: one TURN server per connection (RFC 5766 §11.5)
     let tls: Arc<Mutex<HashMap<u64, Arc<Server>>>> = Arc::new(Mutex::new(HashMap::new()));
     let mut tls_listening = false;
-    if cfg.tls_port != 0 {
+    if let Some(tls_addr) = tls_addr {
         match resolve_turn_cert(&cert_dir, &cfg)
             .and_then(|(cert, key)| build_tls_acceptor(&cert, &key))
         {
             Ok(acceptor) => {
-                let tls_addr: SocketAddr = format!("{}:{}", cfg.bind_addr, cfg.tls_port).parse()?;
                 let listener = match TcpListener::bind(tls_addr).await {
                     Ok(l) => l,
                     Err(e) => {
@@ -495,7 +616,7 @@ async fn spawn_turn_relay(
 
                 let map = tls.clone();
                 let realm = cfg.realm.clone();
-                let bind = cfg.bind_addr.clone();
+                let bind = relay_bind_string(&cfg.bind_addr);
                 let relay_range = (cfg.relay_min_port, cfg.relay_max_port);
                 joins.push(tokio::spawn(async move {
                     let mut next_id: u64 = 0;
@@ -782,8 +903,14 @@ impl Conn for TlsTurnConn {
     }
 
     async fn close(&self) -> util::Result<()> {
+        // The `turn` crate closes the *client-facing* conn from
+        // `Allocation::close()`, i.e. when one allocation goes away — for a UDP
+        // socket that is a no-op, so the same call must not tear the stream down
+        // here: that would kill every other allocation on the connection and cut
+        // off the Refresh response still being written. Wake the connection task
+        // instead; the socket is released when the last `Arc` is dropped, which
+        // happens as soon as the serve task returns.
         self.closed.notify_one();
-        let _ = self.write.lock().await.shutdown().await;
         Ok(())
     }
 

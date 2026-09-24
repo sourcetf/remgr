@@ -60,8 +60,12 @@ pub struct Login {
     pub metas: Option<std::collections::HashMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_spec: Option<ClientSpec>,
-    #[serde(skip_serializing_if = "is_zero_u32")]
-    pub pool_count: u32,
+    /// Go's field is an `int`, and frps rejects a negative value with a
+    /// LoginResp error instead of failing to decode the login: keeping the
+    /// wider type here means a malformed count cannot tear the session down
+    /// before the client is told anything.
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub pool_count: i64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -98,8 +102,11 @@ pub struct NewProxy {
     pub metas: Option<std::collections::HashMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub annotations: Option<std::collections::HashMap<String, String>>,
-    #[serde(skip_serializing_if = "is_zero_u16")]
-    pub remote_port: u16,
+    /// Port range: Go's field is an `int` (see `remote_port_of` in server.rs);
+    /// a u16 here would turn an out-of-range port from a rejection the client
+    /// can log into a control connection that dies without explanation.
+    #[serde(skip_serializing_if = "is_zero_i64")]
+    pub remote_port: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub custom_domains: Option<Vec<String>>,
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -183,7 +190,12 @@ pub struct Pong {
 /// datagram from the client lost its `r` field, and the server dropped it for
 /// having no destination. Note `rename_all = "PascalCase"` is *not* enough here —
 /// it spells the `ip` field "Ip", which still does not match Go's "IP".
+///
+/// `zone` is `default`ed because our own serializer skips it when empty: without
+/// that, a packet this project emits cannot be parsed back by this project (Go
+/// always writes `Zone`, so client interop never revealed it).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct UdpAddrJson {
     #[serde(rename = "IP", alias = "ip", skip_serializing_if = "Option::is_none")]
     pub ip: Option<String>,
@@ -285,8 +297,32 @@ impl Message {
 }
 
 fn is_zero_i64(v: &i64) -> bool { *v == 0 }
-fn is_zero_u32(v: &u32) -> bool { *v == 0 }
 fn is_zero_u16(v: &u16) -> bool { *v == 0 }
+
+/// Is this one of the type bytes frp defines?
+///
+/// frp's reader fails on a byte it does not know (`ErrMsgType` in golib), but a
+/// known message with no registered handler is only skipped, so the server
+/// needs the same distinction to decide between dropping a session and
+/// ignoring a message.
+pub fn is_known_type(type_byte: u8) -> bool {
+    matches!(
+        type_byte,
+        TYPE_LOGIN
+            | TYPE_LOGIN_RESP
+            | TYPE_NEW_PROXY
+            | TYPE_NEW_PROXY_RESP
+            | TYPE_CLOSE_PROXY
+            | TYPE_NEW_WORK_CONN
+            | TYPE_REQ_WORK_CONN
+            | TYPE_START_WORK_CONN
+            | TYPE_NEW_VISITOR_CONN
+            | TYPE_NEW_VISITOR_CONN_RESP
+            | TYPE_PING
+            | TYPE_PONG
+            | TYPE_UDP_PACKET
+    )
+}
 
 /// Raw framed message: (type byte, body).
 pub type RawMsg = (u8, Vec<u8>);
