@@ -21,6 +21,10 @@ use std::time::Duration;
 
 use state::AppState;
 
+/// Password a fresh install gets for the console. Changeable from the console's
+/// 系统 page afterwards; only used while no hash is configured.
+const DEFAULT_CONSOLE_PASSWORD: &str = "admin";
+
 /// Names the console certificate should cover: the host name plus the addresses
 /// this machine answers on (loopback and the interface the default route uses).
 fn console_cert_names() -> Vec<String> {
@@ -128,12 +132,14 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
     }
 
     // bootstrap console password
+    //
+    // A fresh install gets the well-known default below, so the console can be
+    // logged into without first reading a file off the box. This only ever runs
+    // while the hash is empty: a password the operator set (系统 page, or
+    // `password_hash` in the config) is never overwritten.
     let mut initial_password: Option<String> = None;
     if cfg.console.password_hash.is_empty() {
-        use rand::RngCore;
-        let mut buf = [0u8; 8];
-        rand::thread_rng().fill_bytes(&mut buf);
-        let pw: String = buf.iter().map(|b| format!("{b:02x}")).collect();
+        let pw = DEFAULT_CONSOLE_PASSWORD.to_string();
         use argon2::password_hash::PasswordHasher;
         let salt = argon2::password_hash::SaltString::generate(&mut rand::rngs::OsRng);
         let hash = argon2::Argon2::default()
@@ -141,13 +147,10 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
             .map_err(|e| anyhow::anyhow!("hash password: {e}"))?
             .to_string();
         cfg.console.password_hash = hash;
-        initial_password = Some(pw);
+        initial_password = Some(pw.clone());
         cfg.save()?;
         let _ = std::fs::create_dir_all("/var/run/remgr");
-        let _ = std::fs::write(
-            "/var/run/remgr/initial_password",
-            format!("{}\n", initial_password.as_deref().unwrap_or("")),
-        );
+        let _ = std::fs::write("/var/run/remgr/initial_password", format!("{pw}\n"));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -156,6 +159,10 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
                 std::fs::Permissions::from_mode(0o600),
             );
         }
+        tracing::warn!(
+            "console: installed the default password \"{DEFAULT_CONSOLE_PASSWORD}\" — change it on the \
+             系统 page if this console is reachable from the network"
+        );
     }
 
     // console TLS bootstrap: a fresh install must not serve the admin console

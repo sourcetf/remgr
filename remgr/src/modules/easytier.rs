@@ -20,6 +20,10 @@ use crate::state::AppState;
 /// something non-empty to list the node and its instance under.
 const DEFAULT_NODE_NAME: &str = "remgr-node";
 
+/// Password a fresh install gets for the embedded dashboard's `admin` account,
+/// matching the console's default. Changeable from the dashboard itself.
+const DEFAULT_DASHBOARD_PASSWORD: &str = "admin";
+
 pub struct EasyTierModule {
     state: std::sync::Weak<AppState>,
     run: tokio::sync::Mutex<Option<RunHandle>>,
@@ -305,14 +309,9 @@ impl super::ServiceModule for EasyTierModule {
             }
 
             if !usable {
-                let password: String = {
-                    use rand::Rng;
-                    const ALPH: &[u8] = b"abcdefghjkmnpqrstuvwxyzABCDEFGHJKMNPQRSTUVWXYZ23456789";
-                    let mut rng = rand::thread_rng();
-                    (0..14)
-                        .map(|_| ALPH[rng.gen_range(0..ALPH.len())] as char)
-                        .collect()
-                };
+                // Same default as the console, so the two logins on this box are
+                // the same value until the operator changes them.
+                let password: String = DEFAULT_DASHBOARD_PASSWORD.to_string();
                 let digest = dashboard_credential(&password);
                 match tokio::task::spawn_blocking({
                     let d = digest.clone();

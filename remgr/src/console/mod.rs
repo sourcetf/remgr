@@ -17,6 +17,9 @@ use crate::modules::ServiceModule;
 use crate::state::{AppState, PreparedConsole};
 
 const COOKIE: &str = "remgr_session";
+/// Shortest password the console accepts. The install default ("admin") has to
+/// pass, so this is a floor against empty/silly values, not a strength policy.
+const MIN_PASSWORD_LEN: usize = 4;
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -308,8 +311,12 @@ async fn change_password(State(state): State<Arc<AppState>>, Json(req): Json<Pas
     if !ok {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "invalid old password"}))).into_response();
     }
-    if req.new.len() < 8 {
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": "new password too short (min 8)"}))).into_response();
+    if req.new.trim().len() < MIN_PASSWORD_LEN {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": format!("new password too short (min {MIN_PASSWORD_LEN})")})),
+        )
+            .into_response();
     }
     let salt = SaltString::generate(&mut rand::rngs::OsRng);
     let new_hash = match Argon2::default().hash_password(req.new.as_bytes(), &salt) {
