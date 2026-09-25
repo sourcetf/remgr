@@ -1,5 +1,37 @@
 #!/bin/ksh
 # /etc/rc.d/remgr — OpenBSD rc.d script for the ReMgr relay manager
+#
+# rc_bg=YES is load-bearing, not cosmetic. remgr does not fork: rc.subr(8) runs
+# the daemon in the foreground of `su -fl -c ...`, and _rc_wait_for_start only
+# breaks out of its poll loop when rc_bg=YES. Without it every
+# `rcctl start/restart remgr` waits the full daemon_timeout and then reports
+#     remgr(timeout)      <- exit status 1
+# although the daemon came up correctly (rc_check then says "ok"). Measured with
+# this script retargeted at a scratch instance (same rc.subr, same class):
+#     start   without rc_bg: 2m00.5s, rc=1, "(timeout)"   with rc_bg: 0.54s, rc=0
+#     restart without rc_bg: 2m00.1s, rc=1, "(timeout)"   with rc_bg: 0.61s, rc=0
+# The timeout also stalls the boot sequence, and the exit status makes boot-time
+# automation treat a healthy start as a failure. rc_bg=YES additionally gives
+# the service its own process group (rc_exec's `set -o monitor`), which is what
+# keeps a foreground daemon alive across the boot sequence's SIGHUP.
+# daemon_timeout stays generous on purpose: it is now only the bound for "the
+# process never appeared", and when it fires rc.subr kills the start job — i.e.
+# the daemon. Measured startup is 0.2-0.4s (log timestamps of
+# "remgr 0.1.0 starting" up to the last "listening" line), so 120s is ~300x
+# headroom and never triggers in practice.
+#
+# No rc_pre/rc_post hook is needed: the binary creates /etc/remgr,
+# /var/lib/remgr, /var/db/remgr, /var/log/remgr and /var/run/remgr itself
+# (secure::prepare_dirs, before unveil) on every start, so a reboot that empties
+# /var/run is handled. Deliberately no `ulimit -n` here either: rc_exec goes
+# through `su -fl -c <login class>`, which re-applies login.conf(5) and
+# discards limits set by the script. The fd limit comes from
+# /etc/login.conf.d/remgr (see scripts/login.conf.d/remgr).
+#
+# Install with: install -m 555 scripts/rc.d/remgr /etc/rc.d/remgr
+#               rcctl enable remgr && rcctl start remgr
+# scripts/preflight.sh verifies that the installed copy is byte-identical to the
+# one in the repo (this file has drifted before).
 
 daemon="/usr/local/bin/remgr"
 daemon_flags="--config /etc/remgr/config.toml"
@@ -8,5 +40,6 @@ daemon_timeout="120"
 
 . /etc/rc.d/rc.subr
 
+rc_bg=YES
 rc_reload=NO
 rc_cmd $1

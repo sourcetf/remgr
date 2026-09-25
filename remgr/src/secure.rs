@@ -29,12 +29,60 @@ fn unveil_paths() -> Vec<(String, &'static str)> {
         ("/etc/hosts".to_string(), "r"),
         ("/etc/services".to_string(), "r"),
     ];
-    // TUN devices for the EasyTier node + entropy
-    for i in 0..8 {
+    // TUN devices for the EasyTier node + entropy.
+    //
+    // The vendored rust-tun OpenBSD backend never uses the cloning device
+    // (/dev/tun): it opens /dev/tun{i} for i in 0..256 and keeps the first one
+    // that opens. Every device it may pick has to be unveiled — a node outside
+    // this list is invisible to the sandbox and the node then fails with "no
+    // available file descriptor" although the kernel would have had one. Paths
+    // that do not exist are dropped by unveil with ENOENT (as everywhere else
+    // here), so the range only has to cover the /dev/tunN nodes the box has:
+    // MAKEDEV decides how many EasyTier networks can run, this loop must merely
+    // not be the narrower limit.
+    for i in 0..16 {
         v.push((format!("/dev/tun{i}"), "rw"));
     }
     v.push(("/dev/urandom".to_string(), "r"));
     v
+}
+
+/// Directories the sandbox can read after unveil(2) locks the set.
+///
+/// Anything the configuration points at — certificates above all — has to live
+/// under one of these; a path outside is invisible to the process, which shows
+/// up as "the console silently serves plain HTTP" or a listener that cannot read
+/// its key. The console checks with [`path_is_visible`] so it can explain that
+/// instead of falling back.
+pub const VISIBLE_ROOTS: &[&str] = &[
+    "/var/lib/remgr",
+    "/etc/remgr",
+    "/var/db/remgr",
+    "/var/log/remgr",
+    "/var/run/remgr",
+    "/etc/ssl",
+];
+
+/// Is `path` inside a tree the sandbox can read?
+///
+/// Only meaningful on OpenBSD; elsewhere there is no unveil(2) and everything is
+/// visible, so the answer is always `true` (the check must not reject a value
+/// that works).
+pub fn path_is_visible(path: &str) -> bool {
+    #[cfg(not(target_os = "openbsd"))]
+    {
+        let _ = path;
+        return true;
+    }
+    #[cfg(target_os = "openbsd")]
+    {
+        let p = std::path::Path::new(path);
+        // `starts_with` compares whole components, so "/etc/remgrX" does not
+        // count as being under "/etc/remgr".
+        VISIBLE_ROOTS
+            .iter()
+            .any(|root| p.starts_with(std::path::Path::new(root)))
+    }
 }
 
 #[cfg(target_os = "openbsd")]
@@ -87,7 +135,13 @@ pub fn prepare_dirs(config_path: &std::path::Path) -> Result<()> {
         "/var/run/remgr",
     ];
     for d in dirs {
-        let _ = std::fs::create_dir_all(d);
+        // Best effort, but not silent: a directory that cannot be created is
+        // skipped by the unveil(2) call below (ENOENT on a path that does not
+        // exist) and every later write into it fails — so say so here, where the
+        // cause is still visible, instead of only in whatever breaks later.
+        if let Err(e) = std::fs::create_dir_all(d) {
+            tracing::warn!("prepare_dirs: cannot create {d}: {e}");
+        }
     }
     if let Some(parent) = config_path.parent() {
         std::fs::create_dir_all(parent).with_context(|| format!("create dir {}", parent.display()))?;

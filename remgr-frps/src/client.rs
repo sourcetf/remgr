@@ -94,10 +94,21 @@ const LOCAL_DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Cap on per-user udp sockets held by one udp work connection, so a hostile or
 /// broken upstream cannot make the client allocate unboundedly. Stateless UDP
 /// flows recover by opening a new socket on the next datagram.
-const MAX_UDP_USER_SESSIONS: usize = 1024;
+const MAX_UDP_USER_SESSIONS: usize = 512;
+/// Cap on udp user sockets across the whole client. Each one is an fd and a
+/// task, and the *upstream* decides how many appear: it forwards a datagram for
+/// whatever source address reaches the public udp port, and those are trivially
+/// spoofed. Beyond this the datagram is dropped (UDP is lossy by nature).
+const MAX_UDP_USER_SOCKETS: u64 = 1024;
 /// Sanity bound on `pool_count`: the upstream is asked to pre-issue this many
 /// work connections, and every one of them becomes a stream and a task here.
 const MAX_POOL_COUNT: u32 = 1000;
+/// Cap on work connections this client will serve at once. frps asks for one
+/// per user connection (plus its pool), so this only ever bites a hostile or
+/// broken upstream flooding `ReqWorkConn`: past the yamux stream limit (512 per
+/// session, control stream included) the mux driver could not open another
+/// stream anyway, and the excess is dropped here instead of piling up as tasks.
+const MAX_WORK_CONNS: usize = 500;
 
 fn now_secs() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64
@@ -557,6 +568,11 @@ struct Shared {
     /// Watch channel used to tell a live session that the config changed.
     cfg_tx: watch::Sender<u64>,
     cfg_gen: AtomicU64,
+    /// Permits for work connections in flight, so a `ReqWorkConn` flood cannot
+    /// grow tasks (and yamux streams) without bound — see `MAX_WORK_CONNS`.
+    work_permits: Arc<tokio::sync::Semaphore>,
+    /// udp user sockets currently open (see `MAX_UDP_USER_SOCKETS`).
+    udp_user_sockets: Arc<AtomicU64>,
 }
 
 #[derive(Default)]
@@ -582,6 +598,8 @@ impl Shared {
             last_run_id: Mutex::new(String::new()),
             cfg_tx,
             cfg_gen: AtomicU64::new(0),
+            work_permits: Arc::new(tokio::sync::Semaphore::new(MAX_WORK_CONNS)),
+            udp_user_sockets: Arc::new(AtomicU64::new(0)),
         });
         shared.rebuild_proxies(&cfg);
         shared
@@ -716,10 +734,16 @@ async fn mux_driver(
                     }
                 }
                 Poll::Ready(Err(e)) => {
+                    // A stream-level failure — in practice the yamux stream
+                    // limit, which is per connection, not fatal to it — must not
+                    // end the session: the control stream is still usable, so
+                    // fail what is queued and go back to serving it. (Ending the
+                    // session here made a `ReqWorkConn` flood tear the tunnel
+                    // down and reconnect, over and over.)
                     for req in pending.drain(..) {
                         let _ = req.send(Err(anyhow!("yamux open failed: {e}")));
                     }
-                    return;
+                    break;
                 }
                 // Only reachable with the stream limit hit; retried below.
                 Poll::Pending => break,
@@ -1246,11 +1270,27 @@ async fn run_session_inner(
                 Some(Message::ReqWorkConn(_)) => {
                     shared.total_work_conns.fetch_add(1, Ordering::Relaxed);
                     let session = session.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = serve_work_conn(session).await {
-                            tracing::debug!("frpc: work connection ended: {e:#}");
+                    // One permit per work connection in flight: an upstream that
+                    // floods ReqWorkConn (or a user connection for every datagram
+                    // of a spoofed udp flood) would otherwise spawn an unbounded
+                    // number of tasks, each holding a yamux stream or a TCP
+                    // connection. Excess requests are dropped, not queued: a real
+                    // frps asks for a work conn per user connection and keeps a
+                    // pool of a few, so this only ever truncates a flood.
+                    match shared.work_permits.clone().try_acquire_owned() {
+                        Ok(permit) => {
+                            tokio::spawn(async move {
+                                let _permit = permit;
+                                if let Err(e) = serve_work_conn(session).await {
+                                    tracing::debug!("frpc: work connection ended: {e:#}");
+                                }
+                            });
                         }
-                    });
+                        Err(_) => tracing::debug!(
+                            "frpc: ignoring ReqWorkConn, {} work connections already in flight",
+                            MAX_WORK_CONNS
+                        ),
+                    }
                 }
                 Some(Message::Pong(p)) => {
                     if p.error.is_empty() {
@@ -1662,6 +1702,7 @@ async fn serve_udp(io: BoxDuplex, rt: Arc<ProxyRuntime>, session: Arc<Session>) 
     // Writer: everything the local sockets produce, plus the keepalive. A
     // dedicated task keeps the frame boundaries correct: one writer per stream.
     let writer_token = tunnel.clone();
+    let writer_name = rt.cfg.name.clone();
     let writer = tokio::spawn(async move {
         let mut tick = tokio::time::interval(UDP_KEEPALIVE);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1691,6 +1732,21 @@ async fn serve_udp(io: BoxDuplex, rt: Arc<ProxyRuntime>, session: Arc<Session>) 
                                 continue;
                             }
                         };
+                        // A frp frame body is capped at 10 KiB and base64 grows a
+                        // datagram by 4/3, so a local service answering with more
+                        // than ~7.6 KB cannot be represented. Dropping that one
+                        // datagram (UDP is lossy) beats what used to happen: the
+                        // "too large" error ended the tunnel, and the upstream
+                        // had to fetch a fresh work connection.
+                        if body.len() > msg::MAX_MSG_LEN as usize {
+                            tracing::warn!(
+                                "frpc: {}: dropping a {}-byte udp reply from {}, too large for a frp frame",
+                                writer_name,
+                                content.len(),
+                                user
+                            );
+                            continue;
+                        }
                         if msg::write_frame(&mut work_w, msg::TYPE_UDP_PACKET, &body).await.is_err() {
                             break;
                         }
@@ -1755,12 +1811,31 @@ async fn serve_udp(io: BoxDuplex, rt: Arc<ProxyRuntime>, session: Arc<Session>) 
                     rt.cfg.name,
                     MAX_UDP_USER_SESSIONS
                 );
-                users.clear();
+                // Cancel as well as forget: a task whose token is not cancelled
+                // keeps its socket — an fd — until its 30s idle timeout fires.
+                for (_, u) in users.drain() {
+                    u.token.cancel();
+                }
             }
         }
         let alive = match users.get(&user) {
             Some(u) if u.alive.load(Ordering::Relaxed) => u.clone(),
             _ => {
+                // Whole-client cap: the remote addresses are chosen by whoever
+                // can reach the public udp port (trivially spoofable), so the
+                // upstream can ask for an arbitrary number of sockets.
+                let live = session.shared.udp_user_sockets.load(Ordering::Relaxed);
+                if live >= MAX_UDP_USER_SOCKETS {
+                    tracing::warn!(
+                        "frpc: {} already holds {} udp user sockets (limit {}), \
+                         dropping a datagram from {}",
+                        rt.cfg.name,
+                        live,
+                        MAX_UDP_USER_SOCKETS,
+                        user
+                    );
+                    continue;
+                }
                 // Break instead of `?`: the teardown below has to run, or the
                 // writer task (and with it the work connection) outlives this
                 // tunnel.
@@ -1773,12 +1848,19 @@ async fn serve_udp(io: BoxDuplex, rt: Arc<ProxyRuntime>, session: Arc<Session>) 
                 if let Err(e) = sock.connect(local_dst).await {
                     break Err(anyhow!("connecting a udp socket to {local_addr} failed: {e}"));
                 }
-                let u = Arc::new(UdpUser { sock: sock.clone(), alive: Arc::new(AtomicBool::new(true)) });
+                let user_token = tunnel.child_token();
+                let u = Arc::new(UdpUser {
+                    sock: sock.clone(),
+                    alive: Arc::new(AtomicBool::new(true)),
+                    token: user_token.clone(),
+                });
                 let tx = tx.clone();
-                let token = tunnel.clone();
+                let token = user_token;
                 let user_key = user;
                 let counter = out_counter.clone();
                 let alive_flag = u.alive.clone();
+                let session_shared = session.shared.clone();
+                session.shared.udp_user_sockets.fetch_add(1, Ordering::Relaxed);
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 64 * 1024];
                     loop {
@@ -1799,6 +1881,7 @@ async fn serve_udp(io: BoxDuplex, rt: Arc<ProxyRuntime>, session: Arc<Session>) 
                         }
                     }
                     alive_flag.store(false, Ordering::Relaxed);
+                    session_shared.udp_user_sockets.fetch_sub(1, Ordering::Relaxed);
                 });
                 users.insert(user, u.clone());
                 u
@@ -1808,6 +1891,8 @@ async fn serve_udp(io: BoxDuplex, rt: Arc<ProxyRuntime>, session: Arc<Session>) 
         if let Err(e) = alive.sock.send(&content).await {
             tracing::debug!("frpc: sending to the local service {local_addr} failed: {e}");
             alive.alive.store(false, Ordering::Relaxed);
+            // let the task drop its socket now instead of after its idle timeout
+            alive.token.cancel();
             users.remove(&user);
         }
     };
@@ -1829,6 +1914,9 @@ async fn resolve_local(addr: &str) -> Result<SocketAddr> {
 struct UdpUser {
     sock: Arc<UdpSocket>,
     alive: Arc<AtomicBool>,
+    /// Cancelled to close this user's socket at once (evicted, or its send
+    /// failed) instead of leaving the task to notice after `UDP_USER_IDLE`.
+    token: CancellationToken,
 }
 
 /// Copy until EOF or error, counting what went through, then shut the writer

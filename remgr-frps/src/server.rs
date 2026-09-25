@@ -234,8 +234,13 @@ impl ControlState {
     }
 
     /// Queue a control message, waiting for room in the writer's channel only.
+    /// Cancellation-aware: a control that is being torn down must not hold a
+    /// task on a writer that is itself blocked on a peer that stopped reading.
     async fn send(&self, m: Message) {
-        let _ = self.send_tx.send((m, None)).await;
+        tokio::select! {
+            _ = self.token.cancelled() => {}
+            _ = self.send_tx.send((m, None)) => {}
+        }
     }
 
     /// Queue a control message and wait for the writer to put it on the wire.
@@ -247,10 +252,17 @@ impl ControlState {
     /// for the rest of the session.
     async fn send_and_flush(&self, m: Message) {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        if self.send_tx.send((m, Some(tx))).await.is_ok() {
-            // The writer drops the latch when it stops, so this cannot hang.
-            let _ = rx.await;
+        tokio::select! {
+            _ = self.token.cancelled() => return,
+            r = self.send_tx.send((m, Some(tx))) => {
+                if r.is_err() {
+                    return;
+                }
+            }
         }
+        // The writer drops the latch when it stops, and its write is itself
+        // cancellable, so this cannot hang.
+        let _ = rx.await;
     }
 
     /// Take a ready work stream or request one over the control connection.
@@ -293,6 +305,14 @@ impl ControlState {
             }
             tracing::info!("frps proxy {name} closed");
         }
+    }
+
+    /// Give back a name reserved by [`handle_new_proxy`] on a path that failed
+    /// before anything was spawned with its token. Nothing is cancelled: the
+    /// token is simply dropped, and if a teardown already removed the entry
+    /// this is a no-op.
+    fn drop_reservation(&self, name: &str) {
+        self.proxies.lock().unwrap().remove(name);
     }
 
     fn teardown(&self) {
@@ -632,7 +652,17 @@ async fn handle_accepted(
         // forwards inbound streams over a channel.
         let mut conn = yamux::Connection::new(inner.compat(), yamux::Config::default(), yamux::Mode::Server);
         let (inbound_tx, mut inbound_rx) = mpsc::channel::<yamux::Stream>(16);
+        // Cancelled when the driver task ends — a yamux session error, or the
+        // peer closing the connection. The control loop watches it, so a session
+        // that dies while the control stream is open still ends through the
+        // normal path: the reader loop returns into `run_control_with_login`,
+        // which is what runs `teardown()`. Ending the control by dropping its
+        // future instead would strand the control entry, its online count and
+        // every listener it had bound.
+        let session_over = CancellationToken::new();
+        let driver_over = session_over.clone();
         let driver = tokio::spawn(async move {
+            let _guard = CancelOnDrop(driver_over);
             loop {
                 match futures_util::future::poll_fn(|cx| conn.poll_next_inbound(cx)).await {
                     Some(Ok(s)) => {
@@ -682,7 +712,7 @@ async fn handle_accepted(
             }
         });
 
-        let res = run_control(shared, Box::new(control_io.compat())).await;
+        let res = run_control(shared, Box::new(control_io.compat()), session_over).await;
         driver.abort();
         stream_fwd.abort();
         res
@@ -692,11 +722,25 @@ async fn handle_accepted(
     }
 }
 
+/// Cancels its token when dropped, so a task can signal "I am finished" on
+/// every exit path without spelling them all out.
+struct CancelOnDrop(CancellationToken);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
 /// Non-mux mode: read the first framed message and dispatch.
 async fn dispatch_first_frame(shared: Arc<ServerShared>, mut io: BoxDuplex) -> Result<()> {
     let first = tokio::time::timeout(Duration::from_secs(30), msg::read_frame(&mut io)).await??;
     match first.0 {
-        msg::TYPE_LOGIN => run_control_with_login(shared, io, first).await,
+        msg::TYPE_LOGIN => {
+            // No multiplexer here, so the session dies only with this
+            // connection: a token that is never cancelled.
+            run_control_with_login(shared, io, first, CancellationToken::new()).await
+        }
         msg::TYPE_NEW_WORK_CONN => {
             handle_work_io_with_frame(shared, io, first).await
         }
@@ -764,16 +808,17 @@ async fn handle_work_io_with_frame(
 
 // ---------------------------------------------------------------- control
 
-async fn run_control(shared: Arc<ServerShared>, io: BoxDuplex) -> Result<()> {
+async fn run_control(shared: Arc<ServerShared>, io: BoxDuplex, session_over: CancellationToken) -> Result<()> {
     let mut io = io;
     let first = tokio::time::timeout(Duration::from_secs(30), msg::read_frame(&mut io)).await??;
-    run_control_with_login(shared, io, first).await
+    run_control_with_login(shared, io, first, session_over).await
 }
 
 async fn run_control_with_login(
     shared: Arc<ServerShared>,
     mut io: BoxDuplex,
     first: msg::RawMsg,
+    session_over: CancellationToken,
 ) -> Result<()> {
     let (tb, body) = first;
     if tb != msg::TYPE_LOGIN {
@@ -879,7 +924,16 @@ async fn run_control_with_login(
                     // Dropping `written` on the error paths below releases the
                     // sender's latch, so a wait can never outlive the writer.
                     let Ok(body) = body else { continue };
-                    let sent = msg::write_frame(&mut w, m.type_byte(), &body).await.is_ok();
+                    // The write is raced against cancellation: a peer that stops
+                    // reading fills the socket buffer, and without this the
+                    // writer would sit in `write_frame` forever — a teardown
+                    // could then never finish, leaking the task, its fd and the
+                    // control entry. A frame torn in half by the cancellation is
+                    // harmless: the connection is being closed anyway.
+                    let sent = tokio::select! {
+                        _ = wtok.cancelled() => break,
+                        r = msg::write_frame(&mut w, m.type_byte(), &body) => r.is_ok(),
+                    };
                     if let Some(tx) = written {
                         let _ = tx.send(());
                     }
@@ -898,17 +952,28 @@ async fn run_control_with_login(
     }
 
     // reader loop
-    let res = control_reader_loop(state.clone(), &mut r).await;
+    let res = control_reader_loop(state.clone(), &mut r, session_over).await;
 
     state.teardown();
     let _ = writer.await;
     res
 }
 
-async fn control_reader_loop<R: AsyncRead + Unpin + Send>(state: Arc<ControlState>, r: &mut R) -> Result<()> {
+async fn control_reader_loop<R: AsyncRead + Unpin + Send>(
+    state: Arc<ControlState>,
+    r: &mut R,
+    session_over: CancellationToken,
+) -> Result<()> {
     loop {
         tokio::select! {
             _ = state.token.cancelled() => return Ok(()),
+            // The multiplexer this control runs on is gone (a yamux session
+            // error, or the peer closing the transport): read nothing more and
+            // return so the caller runs the teardown. Without this arm the loop
+            // could sit in `read_frame` forever — a connection nobody polls
+            // never delivers data *or* EOF — while the control entry, its
+            // online count and its listeners stayed behind.
+            _ = session_over.cancelled() => return Ok(()),
             frame = msg::read_frame(r) => {
                 let (tb, body) = frame.map_err(|e| anyhow!("control stream: {e}"))?;
                 state.touch();
@@ -917,13 +982,26 @@ async fn control_reader_loop<R: AsyncRead + Unpin + Send>(state: Arc<ControlStat
                         let np: msg::NewProxy = match serde_json::from_slice(&body) {
                             Ok(np) => np,
                             Err(e) => {
-                                tracing::error!("frps NewProxy parse failed: {e}; body={:02x?}", body);
+                                // A broken or hostile client can produce this as
+                                // fast as its socket allows, so keep it at debug
+                                // and print only the head of the frame: the full
+                                // 10 KiB body would flood the log.
+                                tracing::debug!(
+                                    "frps NewProxy parse failed: {e}; body={:02x?}",
+                                    &body[..body.len().min(64)]
+                                );
                                 return Err(anyhow!("NewProxy parse: {e}"));
                             }
                         };
                         tracing::debug!("frps NewProxy received: {} type {}", np.proxy_name, np.proxy_type);
-                        let st = state.clone();
-                        tokio::spawn(async move { handle_new_proxy(st, np).await; });
+                        // Awaited inline rather than spawned: registering awaits a
+                        // bind and the response write, so one task per frame would
+                        // let a client that sends NewProxy faster than the
+                        // responses drain (or one that never reads its control
+                        // socket) grow tasks without bound. frp's own server
+                        // handles the message inside its read loop, and doing the
+                        // same keeps two frames for one proxy name ordered.
+                        handle_new_proxy(state.clone(), np).await;
                     }
                     msg::TYPE_CLOSE_PROXY => {
                         let cp: msg::CloseProxy = serde_json::from_slice(&body)?;
@@ -979,21 +1057,41 @@ async fn handle_new_proxy(state: Arc<ControlState>, np: msg::NewProxy) {
     if state.token.is_cancelled() {
         return;
     }
-    // frp refuses a second proxy under a live name ("proxy name [%s] is already
-    // in use"); replacing the entry silently would drop the previous token
-    // without closing its listener.
-    if state.proxies.lock().unwrap().contains_key(&np.proxy_name) {
+    // Reserve the name under the same lock that checks it, before the first
+    // await. Every path that fails before a listener exists gives the
+    // reservation back (`drop_reservation`), so an entry in `proxies` always
+    // has a live owner: frpc retries a registration whose response it has not
+    // seen yet, and that retry has to be refused — replacing the entry
+    // silently would drop the first proxy's token and leave its listener bound
+    // with nothing left that could ever close it.
+    let ptk = state.token.child_token();
+    let already_registered = {
+        let mut proxies = state.proxies.lock().unwrap();
+        if proxies.contains_key(&np.proxy_name) {
+            true
+        } else {
+            proxies.insert(np.proxy_name.clone(), ptk.clone());
+            false
+        }
+    };
+    if already_registered {
+        // frp refuses a second proxy under a live name ("proxy name [%s] is
+        // already in use").
         proxy_error(&state, &np, format!("proxy name {} is already in use", np.proxy_name)).await;
         return;
     }
     if np.use_encryption || np.use_compression {
+        state.drop_reservation(&np.proxy_name);
         proxy_error(&state, &np, "use_encryption/use_compression not supported by remgr-frps".into()).await;
         return;
     }
     match np.proxy_type.as_str() {
-        "tcp" => start_tcp_proxy(state, np).await,
-        "udp" => start_udp_proxy(state, np).await,
-        other => proxy_error(&state, &np, format!("proxy type \"{other}\" not supported by remgr-frps")).await,
+        "tcp" => start_tcp_proxy(state, np, ptk).await,
+        "udp" => start_udp_proxy(state, np, ptk).await,
+        other => {
+            state.drop_reservation(&np.proxy_name);
+            proxy_error(&state, &np, format!("proxy type \"{other}\" not supported by remgr-frps")).await;
+        }
     }
 }
 
@@ -1010,17 +1108,20 @@ async fn proxy_error(state: &Arc<ControlState>, np: &msg::NewProxy, err: String)
         .await;
 }
 
-async fn start_tcp_proxy(state: Arc<ControlState>, np: msg::NewProxy) {
+async fn start_tcp_proxy(state: Arc<ControlState>, np: msg::NewProxy, ptk: CancellationToken) {
     let cfg = state.shared.cfg.read().await.clone();
     let Some(remote_port) = remote_port_of(&np) else {
+        state.drop_reservation(&np.proxy_name);
         proxy_error(&state, &np, format!("invalid remote port {}", np.remote_port)).await;
         return;
     };
     if !cfg.port_allowed(remote_port) {
+        state.drop_reservation(&np.proxy_name);
         proxy_error(&state, &np, format!("remote port {} not allowed", remote_port)).await;
         return;
     }
     if let Err(e) = state.shared.register_proxy_port("tcp", remote_port, &np.proxy_name) {
+        state.drop_reservation(&np.proxy_name);
         proxy_error(&state, &np, e.to_string()).await;
         return;
     }
@@ -1028,6 +1129,7 @@ async fn start_tcp_proxy(state: Arc<ControlState>, np: msg::NewProxy) {
         Ok(a) => a,
         Err(e) => {
             state.shared.release_proxy_port("tcp", remote_port, &np.proxy_name);
+            state.drop_reservation(&np.proxy_name);
             proxy_error(&state, &np, format!("invalid bind addr: {e}")).await;
             return;
         }
@@ -1036,6 +1138,7 @@ async fn start_tcp_proxy(state: Arc<ControlState>, np: msg::NewProxy) {
         Ok(l) => l,
         Err(e) => {
             state.shared.release_proxy_port("tcp", remote_port, &np.proxy_name);
+            state.drop_reservation(&np.proxy_name);
             proxy_error(&state, &np, format!("bind tcp {} failed: {e}", remote_port)).await;
             return;
         }
@@ -1049,12 +1152,11 @@ async fn start_tcp_proxy(state: Arc<ControlState>, np: msg::NewProxy) {
         }))
         .await;
 
-    let ptk = state.token.child_token();
-    state.proxies.lock().unwrap().insert(np.proxy_name.clone(), ptk.clone());
-    // The control can disappear between the bind and the response. A token that
-    // is born cancelled (or cancelled while we were binding) means teardown()
-    // has already walked the map and will not notice this late entry, so undo
-    // the reservation here instead of leaving the port taken for good.
+    // The name was reserved before the bind (see handle_new_proxy); the control
+    // can still have disappeared while this was binding, and then a token that
+    // is already cancelled means teardown() walked the map before the
+    // reservation went in, so undo it here instead of leaving the port taken
+    // for good.
     if ptk.is_cancelled() {
         state.shared.release_proxy_port("tcp", remote_port, &np.proxy_name);
         state.close_proxy(&np.proxy_name);
@@ -1161,17 +1263,20 @@ where
     let _ = w.shutdown().await;
 }
 
-async fn start_udp_proxy(state: Arc<ControlState>, np: msg::NewProxy) {
+async fn start_udp_proxy(state: Arc<ControlState>, np: msg::NewProxy, ptk: CancellationToken) {
     let cfg = state.shared.cfg.read().await.clone();
     let Some(remote_port) = remote_port_of(&np) else {
+        state.drop_reservation(&np.proxy_name);
         proxy_error(&state, &np, format!("invalid remote port {}", np.remote_port)).await;
         return;
     };
     if !cfg.port_allowed(remote_port) {
+        state.drop_reservation(&np.proxy_name);
         proxy_error(&state, &np, format!("remote port {} not allowed", remote_port)).await;
         return;
     }
     if let Err(e) = state.shared.register_proxy_port("udp", remote_port, &np.proxy_name) {
+        state.drop_reservation(&np.proxy_name);
         proxy_error(&state, &np, e.to_string()).await;
         return;
     }
@@ -1179,6 +1284,7 @@ async fn start_udp_proxy(state: Arc<ControlState>, np: msg::NewProxy) {
         Ok(a) => a,
         Err(e) => {
             state.shared.release_proxy_port("udp", remote_port, &np.proxy_name);
+            state.drop_reservation(&np.proxy_name);
             proxy_error(&state, &np, format!("invalid bind addr: {e}")).await;
             return;
         }
@@ -1187,6 +1293,7 @@ async fn start_udp_proxy(state: Arc<ControlState>, np: msg::NewProxy) {
         Ok(s) => s,
         Err(e) => {
             state.shared.release_proxy_port("udp", remote_port, &np.proxy_name);
+            state.drop_reservation(&np.proxy_name);
             proxy_error(&state, &np, format!("bind udp {} failed: {e}", remote_port)).await;
             return;
         }
@@ -1200,8 +1307,6 @@ async fn start_udp_proxy(state: Arc<ControlState>, np: msg::NewProxy) {
         }))
         .await;
 
-    let ptk = state.token.child_token();
-    state.proxies.lock().unwrap().insert(np.proxy_name.clone(), ptk.clone());
     // See start_tcp_proxy: undo a registration that outlived its control.
     if ptk.is_cancelled() {
         state.shared.release_proxy_port("udp", remote_port, &np.proxy_name);
@@ -1248,8 +1353,13 @@ async fn start_udp_proxy(state: Arc<ControlState>, np: msg::NewProxy) {
             let (mut wr, mut ww) = tokio::io::split(work);
             let sock_a = socket.clone();
             let sock_b = socket.clone();
-            let ptk2 = ptk.clone();
-            let ptk3 = ptk.clone();
+            // One token per work conn, so its two directions end together: a
+            // frame the server cannot parse ends the read half, and without
+            // this the socket→client half would stay in a write that never
+            // completes (the peer is not reading), leaving the tunnel looking
+            // alive while every datagram is dropped.
+            let wc_read = ptk.child_token();
+            let wc_send = wc_read.clone();
             let bytes_in = state.stats.bytes_in.clone();
             let bytes_out = state.stats.bytes_out.clone();
 
@@ -1257,7 +1367,7 @@ async fn start_udp_proxy(state: Arc<ControlState>, np: msg::NewProxy) {
             let t1 = tokio::spawn(async move {
                 loop {
                     tokio::select! {
-                        _ = ptk2.cancelled() => break,
+                        _ = wc_read.cancelled() => break,
                         frame = msg::read_frame(&mut wr) => {
                             let Ok((tb, body)) = frame else { break };
                             // frpc keeps a udp work conn alive with a Ping every
@@ -1294,12 +1404,15 @@ async fn start_udp_proxy(state: Arc<ControlState>, np: msg::NewProxy) {
                         }
                     }
                 }
+                // whichever reason ended the read half, the send half must stop
+                // with it and the outer loop fetch a fresh work conn
+                wc_read.cancel();
             });
             // udp socket -> work conn (user datagrams toward the client)
             let mut buf = vec![0u8; 1500];
             loop {
                 tokio::select! {
-                    _ = ptk3.cancelled() => break,
+                    _ = wc_send.cancelled() => break,
                     recvd = sock_b.recv_from(&mut buf) => {
                         let Ok((n, src)) = recvd else { break };
                         bytes_out.fetch_add(n as u64, Ordering::Relaxed);
@@ -1308,6 +1421,8 @@ async fn start_udp_proxy(state: Arc<ControlState>, np: msg::NewProxy) {
                     }
                 }
             }
+            // the send half is done too — stop the read half if it is still up
+            wc_send.cancel();
             let _ = t1.await;
             // work conn closed — fetch another
         }

@@ -1,0 +1,34 @@
+# /etc/login.conf.d/remgr — resource limits for the ReMgr service.
+#
+# Install to /etc/login.conf.d/remgr (mode 0644, root:wheel).
+#
+# Why this file is needed
+# -----------------------
+# rc.subr(8) starts the daemon through
+#     su -fl -c <login class> -s /bin/sh <user> -c "..."
+# which re-applies the login class limits, so a `ulimit -n` inside the rc.d
+# script is discarded (verified: a process started that way still hits the
+# class limit, not the script's). Without a class named after the daemon,
+# rc.subr falls back to the stock `daemon` class, whose openfiles-cur is 128
+# while kern.maxfiles is 7030 — this box is nowhere near the system limit, only
+# the per-process soft limit is low.
+#
+# Measured with the real binary on 2026-09-25 (a scratch instance started
+# exactly the way rc.subr does, so the limits were identical):
+#   * 200 connections held open -> the process stalls at 128 fds and a new
+#     console request gets no reply until a slot frees up (no error is logged);
+#   * with openfiles-cur=1024 the same 200 connections are all served.
+# ReMgr needs more than 128 anyway: every TURN allocation holds a relay socket,
+# every frps proxy connection holds two, and each console session holds one.
+#
+# rc.subr(8) picks this class up by name:
+#     getcap -f /etc/login.conf.d/${_name}:/etc/login.conf ${_name}
+# so no change to /etc/rc.d/remgr is required.
+#
+# ORDER MATTERS: login.conf(5) resolution takes the FIRST occurrence of an
+# attribute, so the override has to come *before* the `:tc=daemon:` expansion
+# (verified on 7.9: `:openfiles-cur=1024:` then `:tc=daemon:` resolves to 1024,
+# the same two lines swapped resolve to the daemon class's 128).
+remgr:\
+        :openfiles-cur=1024:\
+        :tc=daemon:

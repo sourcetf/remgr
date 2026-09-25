@@ -74,10 +74,34 @@ impl FileSink {
         if self.written >= LOG_MAX_BYTES {
             self.rotate();
         }
+        // Collect the error instead of acting inside the borrow: the handle is
+        // dropped below so the next line retries the open.
+        let mut failed: Option<std::io::Error> = None;
         if let Some(f) = self.file.as_mut() {
-            if writeln!(f, "{line}").is_ok() {
-                self.written += line.len() as u64 + 1;
+            match writeln!(f, "{line}") {
+                Ok(()) => {
+                    self.written += line.len() as u64 + 1;
+                    // a later failure is a new episode and gets reported again
+                    self.complained = false;
+                }
+                Err(e) => failed = Some(e),
             }
+        }
+        if let Some(e) = failed {
+            // A full or read-only filesystem used to stop the on-disk history
+            // *silently*: the console keeps working (its ring buffer is in
+            // memory), so an operator would only notice much later. Report it
+            // once per episode and keep retrying, so history resumes by itself
+            // when space is freed.
+            if !self.complained {
+                self.complained = true;
+                eprintln!(
+                    "remgr: cannot write the log file ({}: {e}) — on-disk history is \
+                     paused until a write succeeds; the console's in-memory log is unaffected",
+                    self.path.display()
+                );
+            }
+            self.file = None;
         }
     }
 

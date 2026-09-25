@@ -22,7 +22,11 @@ Web 控制台（axum + 内嵌 SPA）：每个服务的全部可配置项、启�
   - `route` / `wroute` 供 EasyTier 节点做接口与路由 ioctl：`SIOCGIFADDR`、`SIOCAIFADDR`、`SIOCDIFADDR`、`SIOCSIFMTU`。
   - `tun(4)` 在 `open(2)` 时已置 `IFF_UP | IFF_RUNNING`，无需 `SIOCSIFFLAGS`（该 ioctl 不被任何 promise 授权）。
 - 路由表增删通过**启动时（pledge 之前）打开的路由套接字**完成：pledge 会拒绝 `socket(AF_ROUTE)`，但已打开的 fd 仍可 `write(2)` RTM_ADD / RTM_DELETE。
-- unveil：`/etc/remgr`、`/var/lib/remgr`、`/var/db/remgr`、`/var/log/remgr`、`/var/run/remgr`（rwc）、`/etc/ssl`、`/etc/resolv.conf`、`/etc/hosts`、`/etc/services`（r）、`/dev/tun0-7`（rw，EasyTier TUN）、`/dev/urandom`（r）。
+- unveil：`/etc/remgr`、`/var/lib/remgr`、`/var/db/remgr`、`/var/log/remgr`、`/var/run/remgr`（rwc）、`/etc/ssl`、`/etc/resolv.conf`、`/etc/hosts`、`/etc/services`（r）、`/dev/tun0-15`（rw，EasyTier TUN）、`/dev/urandom`（r）。
+
+实测核对（2026-09-25，运行中的服务）：`fstat -p <pid>` 里只有这几个 unveiled 路径 —— 工作目录 `/var/lib/remgr`（inode 与 `ls -di` 一致）、`remgr.log`、`et.db`/`et.db-wal`/`et.db-shm`、`db_v2.sqlite3`、`/dev/tun0`，加上启动时打开的路由套接字（`route raw`）与各监听 socket；`pgrep -P <pid>` **无输出**（进程没有任何子进程，与「无 `exec`」一致）；`dmesg` 里从无 pledge/unveil 违例。把控制台/服务全部功能（启停、保存配置、生成与上传证书、下载日志、WebSocket 日志、frpc 隧道、STUN/TURN 分配、easytier `/et` 反代）跑一遍，日志里没有 `EPERM`、也没有新的 `ENOENT`。
+
+promise 集合与实际需要的对应关系：不需要 `prot_exec`（无 JIT）、不需要 `proc`/`exec`（无子进程）、不需要 `recvfd`（模块间没有 fd 传递，进程内的 socketpair 不受 pledge 限制）。`/dev/tun5` 在本机是个普通文件（历史遗留），`open(2)` 能成功但 ioctl 会失败 —— 如果 EasyTier 报「找不到可用 tun」，先 `ls -l /dev/tun*` 看看节点是不是设备文件。
 
 > 注意：`unveil(2)` 在调用当下即收窄可见命名空间（而非锁定之时），因此这些调用必须**无条件执行**，不能在之前用 `exists()` 之类的探测做前置判断，否则首个路径之后的条目会被静默跳过。
 
@@ -52,18 +56,29 @@ Web 控制台（axum + 内嵌 SPA）：每个服务的全部可配置项、启�
 ## 构建（OpenBSD 7.x）
 
 ```sh
-pkg_add rust llvm19    # llvm19 供 bindgen/cbakend 使用
+pkg_add rust llvm19 protobuf    # llvm19 提供 libclang（kcp-sys 的 bindgen 用），protobuf 提供 protoc
+sh scripts/openbsd-build.sh     # 需要的环境变量都在这个脚本里
 ```
 
 产物：`target/release/remgr`（单文件）。
+
+实测可用的组合：rust/cargo **1.94.1**、llvm-**19.1.7p14**、protobuf-**6.34.1**。脚本里的环境变量各有原因，删掉任何一个都会构建失败或产出错误结果：
+
+- `LIBCLANG_PATH=/usr/local/llvm19/lib` —— kcp-sys 经 bindgen 调 libclang，默认搜索路径下没有 libclang.so。
+- `RUSTC_BOOTSTRAP=1` —— vendored 的 guarden 补丁用了 `cfg_select!`，rustc 1.94 在稳定通道不接受；ReMgr 自己的代码不需要这个变量。
+- `--ignore-rust-version` —— 同一个 vendored crate 的元数据写着 `rust-version = 1.95`，代码实际能在 1.94 上编译。
+- `--locked` —— `Cargo.lock` 已入库，构建可复现；清单与锁文件漂移时会直接报错，而不是悄悄换依赖。
+- `ulimit -n 1024` —— **编译期**限制（thin LTO 链接要更多 fd），与运行期无关：服务跑在登录类里，不装 `scripts/login.conf.d/remgr` 就只有 128 个 fd，见下。
 
 ## 部署
 
 ```sh
 install -m 755 target/release/remgr /usr/local/bin/remgr
 install -m 555 scripts/rc.d/remgr /etc/rc.d/remgr
+install -m 644 scripts/login.conf.d/remgr /etc/login.conf.d/remgr   # 运行期的 fd 上限，别漏
 rcctl set remgr status on
 rcctl start remgr
+sh scripts/preflight.sh                                             # 逐项核对，只读
 ```
 
 控制台默认 **`https://<host>:9443`**：首次启动会自签一张 P-384 证书（SAN 含主机名、`localhost`、回环地址与本机出站 IP），并把 `[console] tls` 打开；自签名证书浏览器会提示不受信任，接受即可，或在控制台「系统」页上传正式证书（生成/上传后路径会自动写入配置）。登录需要**用户名 + 密码**，首次启动安装**默认账户 `admin` / `admin`**（口令写入 syslog 与 `/var/run/remgr/initial_password`，0600），登录后请在「系统」页立即修改——控制台可能暴露在公网。用户名可在「系统」页改（不允许留空）；已设置过的口令永不覆盖（仅当哈希为空时才安装默认值）。
@@ -142,7 +157,51 @@ rcctl start remgr
   （frps 的代理名来自远端 frpc 客户端，属于不可信输入）。
 - 证书路径若不在 unveiled 目录内（`/etc/remgr`、`/var/lib/remgr` 等）会在绑定阶段失败，
   此时 `/api/status` 的 `console.tls_active` 为 false（界面提示「HTTPS 未生效」）。
-- 磁盘：根分区曾因写满而被内核杀死进程。日志按 8 MB 轮转保留一代；建议为 `/` 留足余量并监控。
+- 磁盘：根分区曾因写满而被内核杀死进程（本机 `df -h /` 现在 96%，只剩约 950 MB）。日志按 8 MB 轮转保留一代，写不进去时服务不会崩、也不会报错；配置保存是原子的，不会留下半截文件。细节见「磁盘与 fd 压力下的行为」。
+
+## 生产部署检查清单
+
+```sh
+install -m 755 target/release/remgr /usr/local/bin/remgr
+install -m 555 scripts/rc.d/remgr /etc/rc.d/remgr
+install -m 644 scripts/login.conf.d/remgr /etc/login.conf.d/remgr
+rcctl enable remgr && rcctl start remgr
+sh scripts/preflight.sh        # 只读核对，任何 FAIL 都要处理
+```
+
+- **`rc_bg=YES` 不能删**（`scripts/rc.d/remgr` 里已写明原因）：remgr 不 fork，rc.subr 会在前台运行它，没有 `rc_bg` 时 `_rc_wait_for_start` 不会提前跳出轮询，于是 `rcctl start/restart remgr` **空等到 daemon_timeout 结束**，打印 `remgr(timeout)` 并返回 **1** —— 服务其实是好的，但启动序列被拖了两分钟、退出码还告诉调用方失败了。用同一份脚本改指向 scratch 实测量化：修前 `start` 2m00.5s/rc=1、`restart` 2m00.1s/rc=1；加 `rc_bg=YES` 后 `start` 0.54s/rc=0、`restart` 0.61s/rc=0。日志里从 `starting` 到最后一个 `listening` 只有 0.2–0.4 s，所以 `daemon_timeout` 保留 120 s 只是「进程压根没起来」的上界（真触发时 rc.subr 会杀掉启动任务，也就是杀掉服务，别调小）。
+- **不需要 `rc_pre`/`rc_post`**：`secure::prepare_dirs` 每次启动都会建 `/etc/remgr`、`/var/lib/remgr`、`/var/db/remgr`、`/var/log/remgr`、`/var/run/remgr`，重启后 `/var/run` 被清空也照样起来。
+- **fd 上限必须显式给**：rc.subr 通过 `su -fl -c <登录类>` 启动，脚本里写 `ulimit -n` 会被丢弃，因此默认落到系统的 `daemon` 类：`openfiles-cur=128`（`kern.maxfiles=7030`，系统天花板远不是瓶颈）。以同样方式启动真实二进制作压力测试：把 200 条连接**挂着不发请求**，进程涨到 128 个 fd 就停住，此时新的控制台请求**完全无响应**（日志里也没有任何报错），客户端断开后才恢复；换成 `openfiles-cur=1024` 同样 200 条全部服务。装 `scripts/login.conf.d/remgr` 后 rc.subr 会按名字选中 `remgr` 类（`daemon_class=remgr`）。注意 login.conf 取**首个**同名属性，覆盖项必须写在 `:tc=daemon:` **之前**（把两行交换就退回 128，实测过）。
+- 装完 `rcctl restart remgr` 应在 1 秒内返回 0；`/etc/rc.d/remgr` 与仓库副本必须逐字节一致（`preflight.sh` 用 md5 核对，这个文件曾经漂移过）。
+
+## 升级（替换二进制）
+
+```sh
+cp -p /etc/remgr/config.toml /etc/remgr/config.toml.bak.$(date +%F)   # 含口令哈希/token，先备份
+install -m 755 target/release/remgr /usr/local/bin/remgr              # 同目录替换
+rcctl restart remgr                                                   # 应立刻返回 0
+tail -5 /var/log/remgr/remgr.log      # 应看到 "starting" 与 "openbsd sandbox active"
+sh scripts/preflight.sh
+```
+
+- **配置兼容性（实测）**：
+  - 旧配置缺字段能加载：所有结构体都是 `#[serde(default)]`；没有 `[frpc]` 段、没有 `console.username` 的文件照样起，缺的字段取默认值并在下次保存时补写进文件。
+  - 新配置带未知字段也能加载：旧二进制忽略它 —— **但下一次保存就把未知字段丢掉了**，所以**回滚前必须先备份配置**，并确认要回滚到的版本认识里面的字段。
+  - 解析失败**不会**静默退回默认值：进程以退出码 1 结束，stderr 给出带行列号的 TOML 错误（`remgr: fatal: TOML parse error at line 2, column 8 … invalid type: string "not-a-number", expected u16`）。
+  - `--config <相对路径>` 可用：启动时按当时的工作目录解析成绝对路径，之后 chdir 到 `/var/lib/remgr` 也不会读错；但配置**必须落在 unveiled 目录内**（见下）。
+- 回滚：放回旧二进制 + `rcctl restart remgr`。日志时间戳是 **UTC**（本机时区是 UTC+8），`grep starting /var/log/remgr/remgr.log | tail -1` 就是新进程的起点。
+- 升级后重点看：`/api/status` 里 `console.tls_active` 是否为 true、五个模块是否 `running`、日志里有没有新的 `EPERM`/`unveil`/`ENOENT`。
+
+## 磁盘与 fd 压力下的行为（实测）
+
+- **fd 耗尽（EMFILE）**：症状是「连接挂着、请求无响应、日志无异常」，不会崩溃，客户端断开后自愈。监控 `fstat -p $(pgrep -x remgr) | wc -l`（空闲时约 55 行，含 `text`/`wd` 两行非 fd）。连接抖动本身不泄漏：200 次「连接-请求-断开」循环前后 fd 数量完全不变；1024 上限下 200 条并发全部服务、用完即还。
+- **磁盘写满**：
+  - 日志：`remgr.log` 的写入是尽力而为，写失败**不中断服务也不报错**（只有进程**首次打不开**日志文件时会在 stderr 说一次 `file logging disabled`）。所以磁盘满时控制台仍可用、内存环形缓冲（1000 行）与 WebSocket 实时日志仍正常，但**落盘历史会静默停止** —— 这是目前最需要盯的一条。
+  - 配置：`Config::save` 先写 `config.toml.tmp`、fsync、再 rename，因此**不可能**留下被截断的 `config.toml`；保存失败时内存里的配置也不提交（不会出现内存与文件不一致），API 报错、原文件 md5 不变。代价是磁盘满期间会残留半截 `config.toml.tmp`（`.gitignore` 里有这个模式，恢复后下次保存会覆盖它）。
+  - 证书：`write_service_cert` 同样先写 `.new` 再 rename，失败不破坏正在使用的那对，只留下 `.new` 垃圾文件。
+  - **首次启动**若 `password_hash` 为空，`cfg.save()?` 失败会让进程直接退出（exit 1）——这个取舍是对的：此时还没有任何生效的口令，带着默认口令继续对外服务比退出更糟。而服务**已经在跑**时（控制台保存配置失败）只让那一次请求失败、服务不退出，同样是对的。
+- **unveil 的硬约束**：配置文件与证书路径必须落在 unveiled 目录里（`/etc/remgr`、`/var/lib/remgr`、`/var/db/remgr`、`/var/log/remgr`、`/var/run/remgr`、`/etc/ssl`）。实测把控制台证书指到 `/tmp`：证书会被生成、`tls = true` 会被写进配置，但沙箱生效后读不到 → 日志报 `console settings unusable: … No such file or directory` 并**回落到明文 HTTP**（`/api/status` 的 `console.tls_active=false`，界面提示 HTTPS 未生效）。同理 `--config /tmp/x.toml` 能启动，但之后每次保存都返回 `400 {"error":"No such file or directory"}`。
+- **TUN 数量**：EasyTier 每个用 tun 的实例占一个 `/dev/tunN`（当前节点用 `tun0`）。`unveil` 放开 `tun0-15`，但真正能用的数量是机器上**存在的设备节点**数（本机只有 `tun0-3`）；要多跑网络实例先 `MAKEDEV tun4 …`。
 
 ## License
 

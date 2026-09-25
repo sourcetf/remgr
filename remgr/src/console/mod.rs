@@ -14,6 +14,7 @@ use axum::{Json, Router};
 use serde_json::json;
 
 use crate::modules::ServiceModule;
+use crate::secure;
 use crate::state::{AppState, PreparedConsole};
 
 const COOKIE: &str = "remgr_session";
@@ -972,14 +973,26 @@ async fn put_config(
             );
         }
         if console.tls {
-            // A certificate outside the sandbox's unveiled trees can only fail
-            // at bind time, and the serve loop then falls back to plain HTTP:
-            // reject it here, where the operator still sees why.
+            // A certificate the sandbox cannot see loads only at bind time, and
+            // the serve loop then falls back to *plain HTTP* — a silent downgrade
+            // the operator would have to notice from `/api/status`. Reject it
+            // here instead, where the message can say exactly which tree is
+            // readable.
             for (what, path) in [("tls_cert", &console.tls_cert), ("tls_key", &console.tls_key)] {
                 if !path.starts_with('/') || path.contains("..") {
                     return api_error(
                         StatusCode::BAD_REQUEST,
                         &format!("{what} must be an absolute path"),
+                    );
+                }
+                if !secure::path_is_visible(path) {
+                    return api_error(
+                        StatusCode::BAD_REQUEST,
+                        &format!(
+                            "{what} is outside the sandbox's readable trees ({}) — \
+                             put the certificate under /etc/remgr/ssl",
+                            secure::VISIBLE_ROOTS.join(", ")
+                        ),
                     );
                 }
             }

@@ -1,0 +1,101 @@
+# CI for ReMgr.
+#
+# What can and cannot be verified here: ReMgr itself is an OpenBSD service (it
+# need(2)s pledge/unveil, tun(4), and links the OpenBSD-ported EasyTier), and
+# GitHub has no OpenBSD runner, so the service crate is NOT built here — a
+# green run does not mean the daemon was compiled. What *is* verified on every
+# push is everything that does not need OpenBSD:
+#
+#   1. `remgr-frps` — the frp wire-protocol implementation (both directions,
+#      server and client) builds and its unit tests pass. It is deliberately
+#      platform-independent, which `scripts/check-repo.sh` enforces, because
+#      that is what makes this job possible.
+#   2. The web console — its single inline script parses, every handler used by
+#      an inline attribute exists, every declared widget kind has a renderer, and
+#      every endpoint it calls exists in the router.
+#   3. Repository hygiene — no credentials/keys/logs/build output tracked.
+#   4. Shell scripts parse.
+#
+# Deployment (build + install + rcctl) is a manual step on the OpenBSD host; see
+# the README's build/deploy sections and `scripts/preflight.sh`.
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  frp-protocol:
+    name: frp protocol crate (build + tests)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # only this crate is compiled, so cache what it needs
+          workspaces: remgr-frps
+
+      - name: The workspace resolves (Cargo.lock is in sync)
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
+      - name: Check (all targets, warnings are visible)
+        run: cargo check --locked -p remgr-frps --all-targets
+
+      - name: Build (release, as shipped)
+        run: cargo build --locked --release -p remgr-frps
+
+      - name: Tests (framing, crypto reference vectors, udp/tcp tunnels, config)
+        run: cargo test --locked --release -p remgr-frps
+
+      - name: Build the interop harness (examples/frpc_probe)
+        run: cargo build --locked --release -p remgr-frps --example frpc_probe
+
+      - name: The self-test inside the harness
+        run: ./target/release/examples/frpc_probe --self-test
+
+  console:
+    name: web console checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      # Node is preinstalled on the runners, so the script's syntax check runs
+      # (it is skipped with a warning where node is absent, e.g. a bare host).
+      - name: Console SPA (script parses, handlers, widgets, endpoints)
+        run: sh scripts/check-console.sh remgr/src/console/assets/index.html remgr/src/console/mod.rs
+
+      - name: Shell scripts parse
+        run: |
+          set -e
+          for f in scripts/*.sh scripts/rc.d/remgr; do
+            [ -f "$f" ] || continue
+            sh -n "$f"
+            echo "ok    $f"
+          done
+
+  hygiene:
+    name: repository hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - run: sh scripts/check-repo.sh
