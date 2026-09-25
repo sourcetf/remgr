@@ -205,6 +205,12 @@ sh scripts/preflight.sh        # 只读核对，任何 FAIL 都要处理
 - **不需要 `rc_pre`/`rc_post`**：`secure::prepare_dirs` 每次启动都会建 `/etc/remgr`、`/var/lib/remgr`、`/var/db/remgr`、`/var/log/remgr`、`/var/run/remgr`，重启后 `/var/run` 被清空也照样起来。
 - **fd 上限必须显式给**：rc.subr 通过 `su -fl -c <登录类>` 启动，脚本里写 `ulimit -n` 会被丢弃，因此默认落到系统的 `daemon` 类：`openfiles-cur=128`（`kern.maxfiles=7030`，系统天花板远不是瓶颈）。以同样方式启动真实二进制作压力测试：把 200 条连接**挂着不发请求**，进程涨到 128 个 fd 就停住，此时新的控制台请求**完全无响应**（日志里也没有任何报错），客户端断开后才恢复；换成 `openfiles-cur=1024` 同样 200 条全部服务。装 `scripts/login.conf.d/remgr` 后 rc.subr 会按名字选中 `remgr` 类（`daemon_class=remgr`）。注意 login.conf 取**首个**同名属性，覆盖项必须写在 `:tc=daemon:` **之前**（把两行交换就退回 128，实测过）。
 - 装完 `rcctl restart remgr` 应在 1 秒内返回 0；`/etc/rc.d/remgr` 与仓库副本必须逐字节一致（`preflight.sh` 用 md5 核对，这个文件曾经漂移过）。
+- **没有任何东西会自动拉起重挂的服务**（OpenBSD 的 rc.subr 不托管前台守护进程）。实测过一次：2026-09-26 03:08 remgr 收到外部 SIGTERM 后按设计干净退出（日志里模块逐个停止），随后**停了约 40 分钟**直到人工重启——没有人被通知。若要它自愈，可选用仓库里的 `scripts/remgr-watchdog.sh`（默认**不安装**：看门狗和运维主动停机是冲突的）：
+  ```sh
+  install -m 555 scripts/remgr-watchdog.sh /etc/remgr/remgr-watchdog.sh
+  crontab -l > /tmp/ct 2>/dev/null; echo '*/2 * * * * /etc/remgr/remgr-watchdog.sh' >> /tmp/ct; crontab /tmp/ct
+  ```
+  它只在 `rcctl ls on` 且 `rcctl check` 失败时用 `rcctl -f start` 拉起，并把「不在运行 → 已恢复」或「没起来（附 rcctl 输出）」写进 syslog；实测停掉服务后 6 秒内恢复。**经 `rcctl ls off` 禁用的服务它不会碰**。
 
 ## 升级（替换二进制）
 
