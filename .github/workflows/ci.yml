@@ -127,25 +127,34 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Install LLVM (bindgen needs libclang)
+      - name: Install build prerequisites (LLVM for bindgen, protoc for the protobuf codegen)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libclang-dev llvm
-          echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
+          # libclang: kcp-sys (EasyTier) and machine-uid (RustDesk) run bindgen
+          # protoc:   pros* crates generate EasyTier's protobuf types
+          sudo apt-get install -y --no-install-recommends libclang-dev llvm protobuf-compiler
+          libclang=$(find /usr/lib/llvm-*/lib -maxdepth 1 -name 'libclang.so*' | head -1)
+          [ -n "$libclang" ] || { echo "libclang.so not found — libclang-dev did not install"; exit 1; }
+          echo "LIBCLANG_PATH=$(dirname "$libclang")" >> "$GITHUB_ENV"
+          echo "protoc: $(protoc --version)"
 
-      - name: Install LLVM (bindgen needs libclang)
+      - name: Install build prerequisites (LLVM for bindgen, protoc for the protobuf codegen)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # windows-latest does not ship a libclang that cargo can find
-          choco install llvm --no-progress -y
+          # windows-latest ships neither a libclang cargo can find nor protoc
+          choco install llvm protoc --no-progress -y
           $llvm = "C:\Program Files\LLVM\bin"
-          if (-not (Test-Path $llvm)) { throw "LLVM not installed at $llvm" }
-          $libclang = Join-Path $llvm "libclang.dll"
-          if (-not (Test-Path $libclang)) { throw "libclang.dll missing in $llvm" }
+          if (-not (Test-Path (Join-Path $llvm "libclang.dll"))) { throw "libclang.dll missing in $llvm" }
+          $protoc = Get-ChildItem "C:\ProgramData\chocolatey\bin\protoc.exe" -ErrorAction SilentlyContinue
+          if (-not $protoc) { $protoc = Get-ChildItem "C:\ProgramData\chocolatey\lib\protoc\tools\bin\protoc.exe" -ErrorAction SilentlyContinue }
+          if (-not $protoc) { throw "protoc not found after choco install" }
           Add-Content -Path $env:GITHUB_ENV -Value "LIBCLANG_PATH=$llvm"
+          Add-Content -Path $env:GITHUB_ENV -Value "PROTOC=$($protoc.FullName)"
           Add-Content -Path $env:GITHUB_PATH -Value $llvm
+          Add-Content -Path $env:GITHUB_PATH -Value $protoc.DirectoryName
+          & $protoc.FullName --version
 
       - uses: Swatinem/rust-cache@v2
 
