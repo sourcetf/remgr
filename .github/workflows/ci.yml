@@ -131,13 +131,34 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          # libclang: kcp-sys (EasyTier) and machine-uid (RustDesk) run bindgen
-          # protoc:   pros* crates generate EasyTier's protobuf types
-          sudo apt-get install -y --no-install-recommends libclang-dev llvm protobuf-compiler
+          # libclang:      kcp-sys (EasyTier) and machine-uid (RustDesk) run bindgen
+          # protoc:        the pros* crates generate EasyTier's protobuf types
+          # libprotobuf-dev: the .proto files protoc imports, google/protobuf/*
+          sudo apt-get install -y --no-install-recommends libclang-dev llvm protobuf-compiler libprotobuf-dev
           libclang=$(find /usr/lib/llvm-*/lib -maxdepth 1 -name 'libclang.so*' | head -1)
           [ -n "$libclang" ] || { echo "libclang.so not found — libclang-dev did not install"; exit 1; }
           echo "LIBCLANG_PATH=$(dirname "$libclang")" >> "$GITHUB_ENV"
-          echo "protoc: $(protoc --version)"
+          wkt=$(dpkg -L libprotobuf-dev | grep -m1 'google/protobuf/timestamp.proto$' || true)
+          [ -n "$wkt" ] || { echo "libprotobuf-dev does not ship the well-known .proto files"; exit 1; }
+          # two levels up from google/protobuf/timestamp.proto
+          inc=$(dirname "$(dirname "$wkt")")
+          echo "PROTOC_INCLUDE=$inc" >> "$GITHUB_ENV"
+          echo "protoc: $(protoc --version), includes: $inc"
+
+      - name: Verify the prerequisites actually work
+        if: runner.os == 'Linux'
+        run: |
+          # A one-line probe: if protoc cannot resolve the well-known types here,
+          # the real build fails 20 minutes later with the same message buried in
+          # the dependency output. Fail now instead.
+          cat > /tmp/probe.proto <<'EOF'
+          syntax = "proto3";
+          package probe;
+          import "google/protobuf/timestamp.proto";
+          message Probe { google.protobuf.Timestamp at = 1; }
+          EOF
+          protoc -I /tmp -o /dev/null /tmp/probe.proto
+          echo "protoc resolves google/protobuf/timestamp.proto"
 
       - name: Install build prerequisites (LLVM for bindgen, protoc for the protobuf codegen)
         if: runner.os == 'Windows'
@@ -150,11 +171,32 @@ jobs:
           $protoc = Get-ChildItem "C:\ProgramData\chocolatey\bin\protoc.exe" -ErrorAction SilentlyContinue
           if (-not $protoc) { $protoc = Get-ChildItem "C:\ProgramData\chocolatey\lib\protoc\tools\bin\protoc.exe" -ErrorAction SilentlyContinue }
           if (-not $protoc) { throw "protoc not found after choco install" }
+          # the official release archive ships the well-known types beside bin\
+          $inc = Join-Path (Split-Path $protoc.DirectoryName -Parent) "include"
+          if (-not (Test-Path (Join-Path $inc "google\protobuf\timestamp.proto"))) { throw "well-known .proto files missing in $inc" }
           Add-Content -Path $env:GITHUB_ENV -Value "LIBCLANG_PATH=$llvm"
           Add-Content -Path $env:GITHUB_ENV -Value "PROTOC=$($protoc.FullName)"
+          Add-Content -Path $env:GITHUB_ENV -Value "PROTOC_INCLUDE=$inc"
           Add-Content -Path $env:GITHUB_PATH -Value $llvm
           Add-Content -Path $env:GITHUB_PATH -Value $protoc.DirectoryName
           & $protoc.FullName --version
+
+      - name: Verify the prerequisites actually work
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # see the Linux probe above: fail here rather than in the dependency build
+          $probe = Join-Path $env:RUNNER_TEMP "probe.proto"
+          @'
+          syntax = "proto3";
+          package probe;
+          import "google/protobuf/timestamp.proto";
+          message Probe { google.protobuf.Timestamp at = 1; }
+          '@ | Set-Content -Path $probe -Encoding ascii
+          $out = Join-Path $env:RUNNER_TEMP "probe.out"
+          & protoc -I $env:RUNNER_TEMP -o $out $probe
+          if ($LASTEXITCODE -ne 0) { throw "protoc could not resolve the well-known types" }
+          Write-Host "protoc resolves google/protobuf/timestamp.proto"
 
       - uses: Swatinem/rust-cache@v2
 
