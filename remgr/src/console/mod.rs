@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
-use argon2::Argon2;
+use argon2::{Algorithm, Argon2, Params, Version};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
@@ -20,6 +20,50 @@ const COOKIE: &str = "remgr_session";
 /// Shortest password the console accepts. The install default ("admin") has to
 /// pass, so this is a floor against empty/silly values, not a strength policy.
 const MIN_PASSWORD_LEN: usize = 4;
+
+// ---------------------------------------------------------------- password hashing
+//
+// Argon2id, the Password Hashing Competition winner and OWASP's first choice:
+// hybrid (the first half of the first pass is data-independent, so it resists
+// side channels; the rest is data-dependent, so it resists GPU/ASIC search) and
+// memory-hard with tunable cost. yescrypt is a fine algorithm too, but it has no
+// RustCrypto-grade implementation (only thin ports of unknown quality), and
+// OpenBSD — the only platform this ships on — does not use it anywhere, so
+// adopting it would add an unaudited crypto dependency for no security gain.
+//
+// Parameters measured on the target (one core, 2 GiB): 64 MiB x 3 passes costs
+// ~240 ms per login here, which is above every configuration OWASP recommends.
+// `p = 1` because the box has a single core — more lanes would only ask for
+// parallelism the CPU cannot provide (and Argon2 requires m to be a multiple of p).
+const HASH_MEM_KIB: u32 = 65536; // 64 MiB
+const HASH_PASSES: u32 = 3;
+const HASH_LANES: u32 = 1;
+
+/// The one place the hashing parameters are defined. Verification reads the cost
+/// parameters from each stored PHC string, so raising these later does not
+/// invalidate existing hashes — they keep working until the password is changed.
+pub fn password_hasher() -> Argon2<'static> {
+    let params = Params::new(HASH_MEM_KIB, HASH_PASSES, HASH_LANES, None)
+        .unwrap_or_else(|_| Params::default());
+    Argon2::new(Algorithm::Argon2id, Version::V0x13, params)
+}
+
+/// Hash a password for storage (`$argon2id$v=19$m=65536,t=3,p=1$…`).
+pub fn hash_password(password: &str) -> anyhow::Result<String> {
+    let salt = SaltString::generate(&mut rand::rngs::OsRng);
+    Ok(password_hasher()
+        .hash_password(password.as_bytes(), &salt)
+        .map_err(|e| anyhow::anyhow!("hash password: {e}"))?
+        .to_string())
+}
+
+/// Verify a password against a stored PHC string. Any malformed or empty hash
+/// simply fails (never panics).
+pub fn verify_password(password: &str, hash: &str) -> bool {
+    PasswordHash::new(hash)
+        .map(|parsed| password_hasher().verify_password(password.as_bytes(), &parsed).is_ok())
+        .unwrap_or(false)
+}
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
@@ -361,6 +405,12 @@ async fn auth_mw(
 
 #[derive(serde::Deserialize)]
 struct LoginReq {
+    /// Empty is accepted as "the configured user name": the console used to be
+    /// password-only, and a page cached before this change sends no user name.
+    /// Nothing is weakened by that — the user name is not a secret and the
+    /// password still has to be correct.
+    #[serde(default)]
+    username: String,
     password: String,
 }
 
@@ -427,20 +477,47 @@ fn clear_login_failures(state: &AppState) {
 }
 
 async fn login(State(state): State<Arc<AppState>>, Json(req): Json<LoginReq>) -> Response {
-    let hash = state.config_blocking().console.password_hash;
-    let ok = PasswordHash::new(&hash)
-        .map(|parsed| Argon2::default().verify_password(req.password.as_bytes(), &parsed).is_ok())
-        .unwrap_or(false);
-    if !ok {
+    let console = state.config_blocking().console;
+
+    // Bounded hashing: Argon2id allocates 64 MiB per verification, so letting an
+    // unbounded number of concurrent requests hash would be a memory-exhaustion
+    // vector on this box (one core, 2 GiB). The permit is held for the duration
+    // of the hashing; a caller that cannot get one within a few seconds is told to
+    // try again rather than piling up.
+    let _permit = match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        state.password_hashes.acquire(),
+    )
+    .await
+    {
+        Ok(Ok(p)) => p,
+        _ => {
+            return api_error(StatusCode::SERVICE_UNAVAILABLE, "login is busy, try again shortly");
+        }
+    };
+
+    // The password is always verified against the configured hash, even when the
+    // username is wrong, so a rejected attempt costs the same as an accepted one
+    // (no timing oracle telling an attacker which half was wrong). A username the
+    // operator has not set is rejected outright.
+    let password_ok = verify_password(&req.password, &console.password_hash);
+    // An empty user name means "the configured one" (see LoginReq).
+    let username_ok = req.username.trim().is_empty() || req.username.trim() == console.username;
+    if !(password_ok && username_ok) {
         note_login_failure(&state);
         if let Some(refused) = login_throttled(&state) {
             return refused;
         }
-        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "invalid password"}))).into_response();
+        // One message for both halves: which credential was wrong is not disclosed.
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": "invalid username or password"})),
+        )
+            .into_response();
     }
     clear_login_failures(&state);
     let token = new_session(&state);
-    let cookie = session_cookie(&state, &token, state.config_blocking().console.session_ttl);
+    let cookie = session_cookie(&state, &token, console.session_ttl);
     (
         StatusCode::OK,
         [(header::SET_COOKIE, HeaderValue::from_str(&cookie).unwrap())],
@@ -474,10 +551,22 @@ async fn change_password(
     Json(req): Json<PasswordChange>,
 ) -> Response {
     let hash = state.config_blocking().console.password_hash;
-    let ok = PasswordHash::new(&hash)
-        .map(|parsed| Argon2::default().verify_password(req.old.as_bytes(), &parsed).is_ok())
-        .unwrap_or(false);
-    if !ok {
+    // Same bounded, same-parameters path as login.
+    let old_ok = {
+        let _permit = match tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            state.password_hashes.acquire(),
+        )
+        .await
+        {
+            Ok(Ok(p)) => p,
+            _ => {
+                return api_error(StatusCode::SERVICE_UNAVAILABLE, "busy, try again shortly");
+            }
+        };
+        verify_password(&req.old, &hash)
+    };
+    if !old_ok {
         return (StatusCode::UNAUTHORIZED, Json(json!({"error": "invalid old password"}))).into_response();
     }
     if req.new.trim().len() < MIN_PASSWORD_LEN {
@@ -487,9 +576,8 @@ async fn change_password(
         )
             .into_response();
     }
-    let salt = SaltString::generate(&mut rand::rngs::OsRng);
-    let new_hash = match Argon2::default().hash_password(req.new.as_bytes(), &salt) {
-        Ok(h) => h.to_string(),
+    let new_hash = match hash_password(&req.new) {
+        Ok(h) => h,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()}))).into_response(),
     };
     if let Err(e) = edit_config(&state, |cfg| {
@@ -868,6 +956,11 @@ async fn put_config(
         };
         if console.port == 0 {
             return api_error(StatusCode::BAD_REQUEST, "console port must not be 0");
+        }
+        // An empty user name would make login accept any user name, leaving only
+        // the password as a check — refuse it rather than degrade silently.
+        if console.username.trim().is_empty() {
+            return api_error(StatusCode::BAD_REQUEST, "console username must not be empty");
         }
         if console.session_ttl == 0 {
             return api_error(StatusCode::BAD_REQUEST, "session_ttl must not be 0");

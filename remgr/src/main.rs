@@ -149,13 +149,9 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
     let mut initial_password: Option<String> = None;
     if cfg.console.password_hash.is_empty() {
         let pw = DEFAULT_CONSOLE_PASSWORD.to_string();
-        use argon2::password_hash::PasswordHasher;
-        let salt = argon2::password_hash::SaltString::generate(&mut rand::rngs::OsRng);
-        let hash = argon2::Argon2::default()
-            .hash_password(pw.as_bytes(), &salt)
-            .map_err(|e| anyhow::anyhow!("hash password: {e}"))?
-            .to_string();
-        cfg.console.password_hash = hash;
+        // One hashing implementation for the whole process: `console::hash_password`
+        // owns the Argon2id parameters.
+        cfg.console.password_hash = console::hash_password(&pw)?;
         initial_password = Some(pw.clone());
         cfg.save()?;
         let _ = std::fs::create_dir_all("/var/run/remgr");
@@ -169,8 +165,9 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
             );
         }
         tracing::warn!(
-            "console: installed the default password \"{DEFAULT_CONSOLE_PASSWORD}\" — change it on the \
-             系统 page if this console is reachable from the network"
+            "console: installed the default login {user} / \"{DEFAULT_CONSOLE_PASSWORD}\" — change it on the \
+             系统 page if this console is reachable from the network",
+            user = cfg.console.username,
         );
     }
 

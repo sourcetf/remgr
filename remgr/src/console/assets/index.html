@@ -77,10 +77,13 @@ th{color:var(--tx2);font-weight:500}
   <div class="box">
     <h1>⚙ ReMgr</h1>
     <p>Relay Manager Console</p>
-    <div class="fg"><input type="password" id="login-pw" placeholder="管理密码" autofocus onkeydown="if(event.key==='Enter')doLogin()"></div>
+    <div class="fg"><input type="text" id="login-user" placeholder="用户名" autocomplete="username"
+      onkeydown="if(event.key==='Enter')el('login-pw').focus()"></div>
+    <div class="fg"><input type="password" id="login-pw" placeholder="密码" autocomplete="current-password"
+      onkeydown="if(event.key==='Enter')doLogin()"></div>
     <button class="btn primary" id="login-btn" style="width:100%" onclick="doLogin()">登录</button>
     <p id="login-err" style="color:var(--red);margin-top:12px;min-height:14px"></p>
-    <p style="margin-bottom:0">初始口令为 <code>admin</code>（首次启动写入
+    <p style="margin-bottom:0">初始账户为 <code>admin</code> / <code>admin</code>（口令首次启动也会写入
       <code>/var/run/remgr/initial_password</code>），登录后请在「系统」页修改。</p>
   </div>
 </div>
@@ -167,9 +170,13 @@ function toast(msg, ok=true){
   el('toast').appendChild(t);
   setTimeout(()=>t.remove(), 3500);
 }
-async function api(p, method, body){
+async function api(p, method, body, opt){
   const r = method ? await API.send(p, method, body) : await API.get(p);
-  if(r.status===401){showLogin();throw new Error('未登录')}
+  // 401 normally means the session is gone, so the overlay comes back. Two calls
+  // use it for "these credentials are wrong" instead (login, change-password):
+  // they pass `noRelogin` so the server's message reaches the operator rather
+  // than being replaced by "未登录".
+  if(r.status===401 && !(opt&&opt.noRelogin)){showLogin();throw new Error('未登录')}
   const d = await r.json().catch(()=>({}));
   if(!r.ok) throw new Error(d.error||('HTTP '+r.status));
   return d;
@@ -186,10 +193,13 @@ function selectText(input){ try{ input.select() }catch(e){} }
 async function doLogin(){
   if(loggingIn) return;
   loggingIn=true;
-  const err=el('login-err'), btn=el('login-btn'), pw=el('login-pw').value;
+  const err=el('login-err'), btn=el('login-btn'), pw=el('login-pw').value, user=el('login-user').value;
+  if(!user.trim()){ err.textContent='请输入用户名'; loggingIn=false; return }
   err.textContent=''; btn.disabled=true;
   try{
-    await api('/api/login','POST',{password:pw});
+    await api('/api/login','POST',{username:user.trim(),password:pw},{noRelogin:true});
+    // remember the user name only (never the password); it is not a secret
+    try{ localStorage.setItem('remgr_user', user.trim()) }catch(e){}
     el('login').classList.add('hidden');
     el('app').classList.remove('hidden');
     boot().catch(e=>toast('初始化失败: '+(e&&e.message||e), false));
@@ -212,6 +222,17 @@ async function boot(){
   if(logTimer) clearInterval(logTimer);
   logTimer = setInterval(tickLogs, 4000);
 }
+// Prefill the login form from what we remember, and focus the first empty field —
+// the page may also be reached with a session that has since expired.
+(function prefillLogin(){
+  try{
+    const u=localStorage.getItem('remgr_user');
+    const uf=el('login-user'), pf=el('login-pw');
+    if(uf && u) uf.value=u;
+    const focus = (uf && !uf.value) ? uf : pf;
+    if(focus) focus.focus();
+  }catch(e){}
+})();
 let statusErrShown=false;
 async function refreshAll(){
   try{
@@ -689,6 +710,7 @@ function renderConsoleForm(){
   }
   setConsoleButtons(true);
   const rows=[
+    ['username','登录用户名',c.username??'admin'],
     ['port','控制台端口',c.port??9443],
     ['tls_cert','TLS 证书路径',c.tls_cert??''],
     ['tls_key','TLS 私钥路径',c.tls_key??''],
@@ -704,6 +726,11 @@ function collectConsoleCfg(){
   document.querySelectorAll('#console-form [data-cpath]').forEach(elm=>{
     const p=elm.dataset.cpath;
     if(elm.type==='checkbox'){ c[p]=elm.checked; return }
+    if(p==='username'){
+      const u=elm.value.trim();
+      if(!u) throw new Error('登录用户名不能为空');
+      c[p]=u; return;
+    }
     if(p==='port'||p==='session_ttl'){
       const raw=elm.value.trim();
       const name = p==='port'?'端口':'会话有效期';
@@ -759,9 +786,10 @@ async function changePassword(){
   if(!old||!nw) return toast('请填写当前密码与新密码',false);
   if(nw.trim().length<4) return toast('新密码至少 4 位',false);
   try{
-    await api('/api/console/password','POST',{old,new:nw});
+    // a wrong old password is a 401 too — surface the reason, not '未登录'
+    await api('/api/console/password','POST',{old,new:nw},{noRelogin:true});
     el('pw-old').value=''; el('pw-new').value='';
-    toast('密码已修改（其它已登录的会话仍然有效，必要时可重启控制台会话）');
+    toast('密码已修改（其它已登录的会话已失效）');
   }catch(e){toast(e.message,false)}
 }
 

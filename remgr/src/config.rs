@@ -30,7 +30,11 @@ pub struct Config {
 #[serde(default)]
 pub struct ConsoleConfig {
     pub port: u16,
-    /// argon2 PHC string; empty → generated on first boot and logged.
+    /// Login user name. Stored as-is (it is not a secret — the password is the
+    /// credential); change it on the 系统 page.
+    pub username: String,
+    /// argon2id PHC string (`$argon2id$v=19$m=65536,t=3,p=1$…`); empty → the
+    /// default password is installed on first boot and logged.
     pub password_hash: String,
     pub tls: bool,
     pub tls_cert: String,
@@ -43,6 +47,7 @@ impl Default for ConsoleConfig {
     fn default() -> Self {
         Self {
             port: 9443,
+            username: "admin".into(),
             password_hash: String::new(),
             tls: false,
             tls_cert: "/etc/remgr/ssl/console_cert.pem".into(),

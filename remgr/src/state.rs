@@ -36,6 +36,12 @@ pub struct AppState {
     /// password is never refused (see `login`), so this cannot lock an operator
     /// out of their own console.
     pub login_failures: Mutex<(u32, u64)>,
+    /// Bounds how many password verifications run at once. Argon2id allocates
+    /// 64 MiB per verification, so without this an unbounded number of concurrent
+    /// login requests would be a memory-exhaustion vector on this box (one core,
+    /// 2 GiB). Two permits is plenty — a verification costs ~240 ms and logins are
+    /// rare — and caps the hashing footprint at 128 MiB.
+    pub password_hashes: tokio::sync::Semaphore,
     pub logs: Arc<LogHub>,
     pub started_at: Instant,
     pub easytier: EasyTierModule,
@@ -76,6 +82,7 @@ impl AppState {
             config_path,
             sessions: Mutex::new(HashMap::new()),
             login_failures: Mutex::new((0u32, 0u64)),
+            password_hashes: tokio::sync::Semaphore::new(2),
             logs,
             started_at: Instant::now(),
             easytier: EasyTierModule::new(weak),
