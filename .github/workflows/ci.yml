@@ -41,6 +41,11 @@ env:
   CARGO_TERM_COLOR: always
   # the dependency tree is large; a cold release build is the slowest step
   CARGO_BUILD_JOBS: 4
+  # Vendored EasyTier patches use `#![feature(cfg_select)]`, which stable rustc
+  # refuses (the feature is only stable since 1.95, and the attribute is an error
+  # either way). This is the same variable the OpenBSD build documents in
+  # scripts/openbsd-build.sh; ReMgr's own code does not need it.
+  RUSTC_BOOTSTRAP: "1"
 
 jobs:
   frp-protocol:
@@ -140,8 +145,8 @@ jobs:
           echo "LIBCLANG_PATH=$(dirname "$libclang")" >> "$GITHUB_ENV"
           wkt=$(dpkg -L libprotobuf-dev | grep -m1 'google/protobuf/timestamp.proto$' || true)
           [ -n "$wkt" ] || { echo "libprotobuf-dev does not ship the well-known .proto files"; exit 1; }
-          # two levels up from google/protobuf/timestamp.proto
-          inc=$(dirname "$(dirname "$wkt")")
+          # protoc's -I root is three levels above the file (…/<inc>/google/protobuf/timestamp.proto)
+          inc=$(dirname "$(dirname "$(dirname "$wkt")")")
           echo "PROTOC_INCLUDE=$inc" >> "$GITHUB_ENV"
           echo "protoc: $(protoc --version), includes: $inc"
 
@@ -168,18 +173,28 @@ jobs:
           choco install llvm protoc --no-progress -y
           $llvm = "C:\Program Files\LLVM\bin"
           if (-not (Test-Path (Join-Path $llvm "libclang.dll"))) { throw "libclang.dll missing in $llvm" }
-          $protoc = Get-ChildItem "C:\ProgramData\chocolatey\bin\protoc.exe" -ErrorAction SilentlyContinue
-          if (-not $protoc) { $protoc = Get-ChildItem "C:\ProgramData\chocolatey\lib\protoc\tools\bin\protoc.exe" -ErrorAction SilentlyContinue }
-          if (-not $protoc) { throw "protoc not found after choco install" }
-          # the official release archive ships the well-known types beside bin\
-          $inc = Join-Path (Split-Path $protoc.DirectoryName -Parent) "include"
-          if (-not (Test-Path (Join-Path $inc "google\protobuf\timestamp.proto"))) { throw "well-known .proto files missing in $inc" }
+
+          # Find the *real* protoc, not the chocolatey shim in ...\chocolatey\bin:
+          # deriving the include directory from the shim lands in the wrong place.
+          $protoc = Get-ChildItem "C:\ProgramData\chocolatey\lib\protoc" -Recurse -Filter protoc.exe -ErrorAction SilentlyContinue |
+                      Select-Object -First 1
+          if (-not $protoc) { throw "protoc.exe not found under chocolatey\lib\protoc" }
+
+          # Derive the include root from the well-known file itself, which is what
+          # protoc has to resolve, rather than guessing a directory layout.
+          $wkt = Get-ChildItem (Join-Path $protoc.DirectoryName "..") -Recurse -Filter timestamp.proto -ErrorAction SilentlyContinue |
+                   Where-Object { $_.FullName -match 'google\\protobuf\\timestamp\.proto$' } |
+                   Select-Object -First 1
+          if (-not $wkt) { throw "google/protobuf/timestamp.proto not found beside $($protoc.FullName)" }
+          $inc = Split-Path (Split-Path (Split-Path $wkt.FullName -Parent) -Parent) -Parent
+
           Add-Content -Path $env:GITHUB_ENV -Value "LIBCLANG_PATH=$llvm"
           Add-Content -Path $env:GITHUB_ENV -Value "PROTOC=$($protoc.FullName)"
           Add-Content -Path $env:GITHUB_ENV -Value "PROTOC_INCLUDE=$inc"
           Add-Content -Path $env:GITHUB_PATH -Value $llvm
           Add-Content -Path $env:GITHUB_PATH -Value $protoc.DirectoryName
           & $protoc.FullName --version
+          Write-Host "protoc: $($protoc.FullName), includes: $inc"
 
       - name: Verify the prerequisites actually work
         if: runner.os == 'Windows'
