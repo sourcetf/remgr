@@ -176,6 +176,18 @@ sh scripts/preflight.sh                                             # 逐项核�
   此时 `/api/status` 的 `console.tls_active` 为 false（界面提示「HTTPS 未生效」）。
 - 磁盘：根分区曾因写满而被内核杀死进程（本机 `df -h /` 现在 96%，只剩约 950 MB）。日志按 8 MB 轮转保留一代，写不进去时服务不会崩、也不会报错；配置保存是原子的，不会留下半截文件。细节见「磁盘与 fd 压力下的行为」。
 
+## CI（`.github/workflows/ci.yml`）
+
+每次 push / PR 跑三个 job：
+
+1. **frp 协议 crate** —— `remgr-frps` 构建 + 16 个单元测试 + 互通自检程序（`examples/frpc_probe --self-test`）。这个 crate 是刻意保持跨平台的（`scripts/check-repo.sh` 会强制这一点），所以能在 Linux runner 上真跑。
+2. **控制台** —— 单文件脚本能解析（`node --check`）、每个 inline 属性引用的处理函数都存在、每种 widget 都有渲染分支、每个证书服务与 API 端点都在 router 里（`scripts/check-console.sh`），外加仓库卫生检查（无凭据/密钥/日志/编译产物）。
+3. **release build（矩阵：linux-x86_64 / windows-x86_64）** —— 完整服务编译成 release，各自跑该平台的 `remgr-frps` 测试，随后**实际运行**：用 scratch `REMGR_HOME` 启动、等控制台起来、校验首次启动写入了文档里的默认登录并生成了 P-384 证书、用 HTTPS 登录、确认整棵布局（`config`/`ssl`/`lib`/`log`/`run`）都落在 home 下、再用 SIGTERM 关掉。产物以 artifact 形式保留 30 天。
+
+两个平台都要装 **LLVM**（`kcp-sys` 与 `machine-uid` 在构建期跑 bindgen）和 **protoc + well-known types**（`easytier-proto` 生成 protobuf 类型）。后者容易踩：Ubuntu 上 `.proto` 文件在 `libprotobuf-dev` 里而不是 `protobuf-compiler`，所以 workflow 从实际文件反推 include 根目录，并在准备阶段用一行 protoc 探针先验证，避免等 20 分钟才在依赖输出里看到同样的报错。
+
+> **CI 绿灯不等于 OpenBSD 编译通过**：GitHub 没有 OpenBSD runner，`remgr`（服务本体）在那个平台上只能手工构建与部署——这也是为什么上面的检查清单和 `scripts/preflight.sh` 存在。做重大改动后请在目标机上跑一次 `sh scripts/preflight.sh`。
+
 ## 生产部署检查清单
 
 ```sh
