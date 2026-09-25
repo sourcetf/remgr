@@ -196,19 +196,31 @@ jobs:
           & $protoc.FullName --version
           Write-Host "protoc: $($protoc.FullName), includes: $inc"
 
-          # pnet_sys (via EasyTier's pnet_datalink) links the NDIS `Packet.lib`,
-          # which ships with the Windows Driver Kit and lives under
-          # Windows Kits\10\Lib\<ver>\km\x64 — not on the default library path,
-          # so the link fails with LNK1181 unless that directory is added.
+          # pnet_sys (via EasyTier's pnet_datalink) links the NDIS `Packet.lib`, which
+          # is not part of any toolchain the runner ships: it comes from the WDK or
+          # from the Npcap SDK, and the runner's "Driver Kit" component is only the
+          # Visual Studio integration (the km\x64 libraries are absent). Without it
+          # the link dies with `LNK1181: cannot open input file 'Packet.lib'`.
+          # Prefer the WDK when an image happens to have it (it also carries the
+          # driver-side pieces), otherwise take the 345 KB Npcap SDK, which is the
+          # alternative pnet's own documentation gives. The version is pinned so the
+          # link inputs do not change under us.
           $packet = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Lib" -Recurse -Filter Packet.lib -ErrorAction SilentlyContinue |
                       Where-Object { $_.FullName -match '\\km\\x64\\Packet\.lib$' } |
                       Select-Object -First 1
+
           if (-not $packet) {
-            throw "Packet.lib not found under Windows Kits\10\Lib\*\km\x64 — the runner image lost its WDK component (Component.Microsoft.Windows.DriverKit). pnet_sys cannot link without it; install the WDK (https://learn.microsoft.com/windows-hardware/drivers/download-the-wdk) or take Packet.lib from it."
+            $sdk = Join-Path $env:RUNNER_TEMP "npcap-sdk-1.16.zip"
+            $dest = Join-Path $env:RUNNER_TEMP "npcap-sdk"
+            Invoke-WebRequest -Uri "https://npcap.com/dist/npcap-sdk-1.16.zip" -OutFile $sdk -UseBasicParsing
+            Expand-Archive -Path $sdk -DestinationPath $dest -Force
+            $packet = Join-Path $dest "Lib\x64\Packet.lib"
+            if (-not (Test-Path $packet)) { throw "Packet.lib missing from the Npcap SDK archive" }
+            $packet = Get-Item $packet
           }
           Write-Host "Packet.lib: $($packet.FullName)"
           # RUSTFLAGS is the only way to reach a dependency's link step from here
-          # (the search path cannot be injected into pnet_sys's own build script).
+          # (its own build script cannot be injected into).
           Add-Content -Path $env:GITHUB_ENV -Value "RUSTFLAGS=-L native=$($packet.DirectoryName)"
 
       - name: Verify the prerequisites actually work

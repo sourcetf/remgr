@@ -63,10 +63,13 @@ ReMgr 以 **OpenBSD 为首要目标**（pledge/unveil 沙箱、rc.d、login.conf
 | 配置/数据/日志/运行目录 | `/etc/remgr`、`/var/lib/remgr`、`/var/log/remgr`、`/var/run/remgr` | 同左（FHS） | `%ProgramData%\ReMgr`（`config.toml`、`ssl`、`lib`、`log`、`run`） |
 | 服务管理 | `rc.d` + `login.conf.d`（随仓库提供） | 自备 systemd 单元（未随仓库提供） | 自备服务包装器（NSSM 等，未随仓库提供） |
 | EasyTier 中心节点所需的 TUN | `tun(4)`，开箱可用 | `/dev/net/tun`，需要权限 | 需要安装 **wintun 驱动** |
+| 构建期额外依赖 | `llvm19`（libclang）、`protobuf`（protoc） | 同左（libclang-dev、protobuf-compiler、libprotobuf-dev） | LLVM、protoc，以及 **WDK** 提供的 `Packet.lib`（链接期，见下） |
 | CI | 无 GitHub runner，**手动部署** | 出 release 产物 + 运行时冒烟测试 | 出 release 产物 + 运行时冒烟测试 |
 
 - **目录布局由 `remgr/src/platform.rs` 单点决定**，可用环境变量 `REMGR_HOME` 整体重定位（CI 与冒烟测试就是这么跑的：重定位后配置在根目录，`ssl`/`lib`/`log`/`run` 在其下）。运维上意味着一台机器可以放多套互不干扰的实例。
 - **`%ProgramData%\ReMgr` 与 Windows 服务**：以管理员身份运行时该目录可写；若要让服务账户也能写，给该目录授权即可。
+- **Windows 构建需要 WDK 的 `Packet.lib`**：EasyTier 依赖 `pnet_datalink`，而 `pnet_sys` 在 Windows 上必须链接 NDIS 的 `Packet.lib`（随 **Windows Driver Kit** 提供，位于 `Windows Kits\10\Lib\<版本>\km\x64\`，不在默认库搜索路径上）。CI 的做法是找到该文件并把其目录加进链接搜索路径；手工构建时若遇到 `LNK1181: cannot open input file 'Packet.lib'`，装 WDK 或把该目录加进 `LIB`/`RUSTFLAGS=-L native=<目录>` 即可。
+- **Windows 运行期还需要 Npcap**：`pnet_datalink` 通过 Npcap 枚举网卡，所以 EasyTier 在 Windows 上枚举网络接口时期望装有 Npcap。**只影响 EasyTier**；其余五个模块不使用它。
 - **除 EasyTier 中心节点外，其余模块（easytier-web 仪表盘、STUN/TURN、RustDesk、frps、frpc）在任何平台都不依赖 TUN**，所以即使没装 wintun，Windows 上仍是一个可用的中继管理器（把配置里的 `[easytier] node_enabled` 关掉即可）。
 - **未验证的部分要如实说明**：Linux/Windows 目前做到的是「能构建、能启动、控制台可用、默认登录可用、目录布局正确」，每推一次都由 CI 的 `build` job 验证。而 EasyTier 的 TUN 组网、RustDesk 客户端的真实连接这类**需要真实客户端参与**的行为，只在 OpenBSD 上实测过。
 
