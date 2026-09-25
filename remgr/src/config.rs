@@ -3,13 +3,20 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+use crate::platform;
+
+/// Re-exported so callers do not have to know about `platform`.
 pub fn default_config_path() -> PathBuf {
-    if cfg!(target_os = "openbsd") {
-        PathBuf::from("/etc/remgr/config.toml")
-    } else {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        Path::new(&home).join(".config/remgr/config.toml")
-    }
+    platform::default_config_path()
+}
+
+/// A certificate/key path inside the platform's certificate directory.
+///
+/// The defaults have to be computed rather than written out: Windows has no
+/// `/etc`, and a literal path there would be created as `C:\etc\...` — somewhere
+/// an operator would never look for it.
+fn path_in_cert_dir(name: &str) -> String {
+    platform::cert_dir().join(name).display().to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -50,8 +57,8 @@ impl Default for ConsoleConfig {
             username: "admin".into(),
             password_hash: String::new(),
             tls: false,
-            tls_cert: "/etc/remgr/ssl/console_cert.pem".into(),
-            tls_key: "/etc/remgr/ssl/console_key.pem".into(),
+            tls_cert: path_in_cert_dir("console_cert.pem"),
+            tls_key: path_in_cert_dir("console_key.pem"),
             session_ttl: 7 * 24 * 3600,
         }
     }
@@ -84,7 +91,7 @@ impl Default for EasyTierConfig {
             config_server_port: 22020,
             api_addr: "127.0.0.1".into(),
             api_port: 11211,
-            db_path: "/var/lib/remgr/easytier/et.db".into(),
+            db_path: platform::data_dir().join("easytier/et.db").display().to_string(),
             node_enabled: true,
             node_name: "remgr-node".into(),
             network_name: String::new(),
@@ -139,8 +146,8 @@ impl Default for StunTurnConfig {
             external_ip: String::new(),
             users: Vec::new(),
             realm: "remgr".into(),
-            cert_path: "/etc/remgr/ssl/turn_cert.pem".into(),
-            key_path: "/etc/remgr/ssl/turn_key.pem".into(),
+            cert_path: path_in_cert_dir("turn_cert.pem"),
+            key_path: path_in_cert_dir("turn_key.pem"),
         }
     }
 }

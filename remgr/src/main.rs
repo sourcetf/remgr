@@ -10,6 +10,7 @@ mod config;
 mod console;
 mod logging;
 mod modules;
+mod platform;
 mod secure;
 mod state;
 
@@ -36,20 +37,12 @@ fn console_cert_names() -> Vec<String> {
 
     let mut names: Vec<String> = Vec::new();
 
-    // host name (gethostname(3); HOSTNAME is not exported by default on OpenBSD)
-    #[cfg(unix)]
-    {
-        let mut buf = [0u8; 256];
-        let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
-        if rc == 0 {
-            let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
-            if let Ok(h) = std::str::from_utf8(&buf[..end]) {
-                let h = h.trim().trim_end_matches(".").to_string();
-                // a default "localhost" says nothing about how the box is reached
-                if h != "localhost" {
-                    add(&mut names, h);
-                }
-            }
+    // the machine's name, from the platform (gethostname(3) on unix,
+    // COMPUTERNAME on Windows). A default "localhost" says nothing about how the
+    // box is actually reached, so it is not worth a SAN entry.
+    if let Some(h) = platform::hostname() {
+        if h != "localhost" {
+            add(&mut names, h);
         }
     }
     add(&mut names, "localhost".to_string());
@@ -86,7 +79,18 @@ fn main() {
             }
             "--help" | "-h" => {
                 println!("remgr {} — all-in-one relay manager", env!("CARGO_PKG_VERSION"));
-                println!("usage: remgr [--config /etc/remgr/config.toml]");
+                println!("usage: remgr [--config <path>]");
+                println!();
+                // The layout is platform-dependent, so it cannot be written out
+                // as a literal in the help text — print what this build uses.
+                println!("paths on this platform ({}):", std::env::consts::OS);
+                println!("  config  {}", platform::default_config_path().display());
+                println!("  certs   {}", platform::cert_dir().display());
+                println!("  data    {}", platform::data_dir().display());
+                println!("  logs    {}", platform::log_file().display());
+                println!("  runtime {}", platform::run_dir().display());
+                println!();
+                println!("environment: REMGR_HOME relocates all of the above under one directory");
                 return;
             }
             other => {
@@ -120,6 +124,10 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
     let hub = logging::LogHub::new();
     logging::init(hub.clone());
     tracing::info!("remgr {} starting", env!("CARGO_PKG_VERSION"));
+    // Log where this instance keeps its files: the layout differs per platform,
+    // and an operator reading the log should not have to guess (or read the
+    // source) to find the config, the certificates or the log file itself.
+    tracing::info!("paths: {}", platform::layout_summary());
 
     // rustls crypto provider (process-wide, ring)
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -133,11 +141,15 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
 
     // vendored components (rustdesk key/db files) use relative paths — pin the
     // working directory to the data dir so everything lands under the unveiled
-    // /var/lib/remgr
+    // data directory. Only on OpenBSD: that is where the sandbox makes a relative
+    // path land somewhere unveiled, and where the vendored components were
+    // written with that assumption. Elsewhere the working directory is left alone
+    // (a Windows service and a Linux foreground run both expect to keep theirs).
     #[cfg(target_os = "openbsd")]
     {
-        std::env::set_current_dir("/var/lib/remgr")
-            .map_err(|e| anyhow::anyhow!("chdir /var/lib/remgr: {e}"))?;
+        let data = platform::data_dir();
+        std::env::set_current_dir(&data)
+            .map_err(|e| anyhow::anyhow!("chdir {}: {e}", data.display()))?;
     }
 
     // bootstrap console password
@@ -154,19 +166,18 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
         cfg.console.password_hash = console::hash_password(&pw)?;
         initial_password = Some(pw.clone());
         cfg.save()?;
-        let _ = std::fs::create_dir_all("/var/run/remgr");
-        let _ = std::fs::write("/var/run/remgr/initial_password", format!("{pw}\n"));
+        let pw_file = platform::run_dir().join("initial_password");
+        let _ = std::fs::create_dir_all(platform::run_dir());
+        let _ = std::fs::write(&pw_file, format!("{pw}\n"));
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(
-                "/var/run/remgr/initial_password",
-                std::fs::Permissions::from_mode(0o600),
-            );
+            let _ = std::fs::set_permissions(&pw_file, std::fs::Permissions::from_mode(0o600));
         }
         tracing::warn!(
             "console: installed the default login {user} / \"{DEFAULT_CONSOLE_PASSWORD}\" — change it on the \
-             系统 page if this console is reachable from the network",
+             系统 page if this console is reachable from the network (also written to {})",
+            pw_file.display(),
             user = cfg.console.username,
         );
     }
@@ -179,12 +190,13 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
     if !cfg.console.tls && !Path::new(&cfg.console.tls_cert).exists() {
         let names = console_cert_names();
         let cn = names.first().cloned().unwrap_or_else(|| "remgr.local".into());
-        let dir = cfg
-            .console
-            .tls_cert
-            .rsplit_once('/')
-            .map(|(d, _)| PathBuf::from(d))
-            .unwrap_or_else(|| PathBuf::from("/etc/remgr/ssl"));
+        // write beside the configured certificate; fall back to the platform's
+        // certificate directory when the configured path has no parent at all
+        let dir = Path::new(&cfg.console.tls_cert)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(platform::cert_dir);
         match certs::generate_service_cert_names(&dir, "console", &names, &cn, 825) {
             Ok((cert_path, key_path)) => {
                 cfg.console.tls = true;

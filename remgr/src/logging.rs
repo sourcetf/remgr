@@ -10,7 +10,6 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
 
 const RING_SIZE: usize = 1000;
-const LOG_FILE: &str = "/var/log/remgr/remgr.log";
 /// Rotate to `<file>.1` once the file passes this size (one generation kept).
 const LOG_MAX_BYTES: u64 = 8 * 1024 * 1024;
 /// Longest unterminated fragment held while reassembling a log line.
@@ -27,8 +26,8 @@ struct FileSink {
 }
 
 impl FileSink {
-    fn new(path: &str) -> Self {
-        Self { path: PathBuf::from(path), file: None, written: 0, complained: false }
+    fn new(path: PathBuf) -> Self {
+        Self { path, file: None, written: 0, complained: false }
     }
 
     fn open(&mut self) {
@@ -131,7 +130,7 @@ impl LogHub {
             entries: Mutex::new(VecDeque::with_capacity(RING_SIZE)),
             partial: Mutex::new(String::new()),
             tx,
-            file: Mutex::new(FileSink::new(LOG_FILE)),
+            file: Mutex::new(FileSink::new(crate::platform::log_file())),
         })
     }
 

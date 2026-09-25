@@ -849,16 +849,17 @@ async fn logs(State(state): State<Arc<AppState>>, Query(q): Query<LogsQuery>) ->
 /// Tail the persisted log. The ring buffer covers the running process only, so a
 /// restart otherwise wipes the history an operator needs to read afterwards.
 fn read_log_file(n: usize) -> anyhow::Result<Vec<String>> {
-    // one generation back is enough: remgr.log.1 is the previous file
-    for path in ["/var/log/remgr/remgr.log", "/var/log/remgr/remgr.log.1"] {
-        match std::fs::read_to_string(path) {
+    // one generation back is enough: remgr.log.1 is the previous file.
+    // The paths come from the platform layout (Windows has no /var/log).
+    for path in [crate::platform::log_file(), crate::platform::log_file_previous()] {
+        match std::fs::read_to_string(&path) {
             Ok(text) => {
                 let lines: Vec<&str> = text.lines().collect();
                 let skip = lines.len().saturating_sub(n);
                 return Ok(lines[skip..].iter().map(|l| l.to_string()).collect());
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => anyhow::bail!("{path}: {e}"),
+            Err(e) => anyhow::bail!("{}: {e}", path.display()),
         }
     }
     anyhow::bail!("no log file written yet")

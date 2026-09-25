@@ -127,20 +127,26 @@ pub fn apply() -> Result<()> {
 
 /// Create runtime directories (before unveil/pledge).
 pub fn prepare_dirs(config_path: &std::path::Path) -> Result<()> {
-    let dirs = [
-        "/etc/remgr",
-        "/var/lib/remgr",
-        "/var/db/remgr",
-        "/var/log/remgr",
-        "/var/run/remgr",
-    ];
-    for d in dirs {
+    // The layout is platform-dependent, so it comes from one place. On OpenBSD
+    // this is the same five directories it always was.
+    for d in crate::platform::required_dirs() {
         // Best effort, but not silent: a directory that cannot be created is
         // skipped by the unveil(2) call below (ENOENT on a path that does not
         // exist) and every later write into it fails — so say so here, where the
         // cause is still visible, instead of only in whatever breaks later.
-        if let Err(e) = std::fs::create_dir_all(d) {
-            tracing::warn!("prepare_dirs: cannot create {d}: {e}");
+        if let Err(e) = std::fs::create_dir_all(&d) {
+            tracing::warn!("prepare_dirs: cannot create {}: {e}", d.display());
+        }
+    }
+    // /var/db/remgr is not part of the layout any more but older installs have
+    // data there; keep creating it on unix so an upgrade does not break them.
+    #[cfg(unix)]
+    {
+        let legacy = std::path::Path::new("/var/db/remgr");
+        if !legacy.exists() {
+            if let Err(e) = std::fs::create_dir_all(legacy) {
+                tracing::debug!("prepare_dirs: cannot create {}: {e}", legacy.display());
+            }
         }
     }
     if let Some(parent) = config_path.parent() {

@@ -291,7 +291,11 @@ impl super::ServiceModule for EasyTierModule {
         // dashboard permanently unreachable.
         {
             let db = web.db.clone();
-            const PW_FILE: &str = "/var/run/remgr/easytier_dashboard_password";
+            // The platform decides where runtime files live (Windows has no /var).
+            let pw_file = crate::platform::run_dir()
+                .join("easytier_dashboard_password")
+                .display()
+                .to_string();
 
             // md5 hex of the password, exactly what the dashboard frontend sends
             fn dashboard_credential(password: &str) -> String {
@@ -301,7 +305,7 @@ impl super::ServiceModule for EasyTierModule {
                 format!("{:x}", h.finalize())
             }
 
-            let existing = std::fs::read_to_string(PW_FILE)
+            let existing = std::fs::read_to_string(&pw_file)
                 .ok()
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty());
@@ -348,18 +352,18 @@ impl super::ServiceModule for EasyTierModule {
                         };
                         match installed {
                             Ok(()) => {
-                                let _ = std::fs::write(PW_FILE, format!("{password}\n"));
+                                let _ = std::fs::write(&pw_file, format!("{password}\n"));
                                 #[cfg(unix)]
                                 {
                                     use std::os::unix::fs::PermissionsExt;
                                     let _ = std::fs::set_permissions(
-                                        PW_FILE,
+                                        &pw_file,
                                         std::fs::Permissions::from_mode(0o600),
                                     );
                                 }
                                 tracing::warn!(
                                     "easytier dashboard password: {password}  \
-                                     (user admin, also in {PW_FILE}; API clients must send \
+                                     (user admin, also in {pw_file}; API clients must send \
                                      md5(password) — the dashboard does this itself)"
                                 );
                             }
@@ -376,7 +380,10 @@ impl super::ServiceModule for EasyTierModule {
             // "user", i.e. a working default credential on every fresh install.
             // Rotate it as well, but only while it still carries that default —
             // an operator who set something else keeps their choice.
-            const DEMO_FILE: &str = "/var/run/remgr/easytier_dashboard_password_user";
+            let demo_file = crate::platform::run_dir()
+                .join("easytier_dashboard_password_user")
+                .display()
+                .to_string();
             let demo_default = {
                 let digest = dashboard_credential("user");
                 match db.get_user_password_hash("user").await {
@@ -402,19 +409,19 @@ impl super::ServiceModule for EasyTierModule {
                 {
                     Ok(hash) => match db.set_user_password("user", hash).await {
                         Ok(_) => {
-                            let _ = std::fs::write(DEMO_FILE, format!("{password}\n"));
+                            let _ = std::fs::write(&demo_file, format!("{password}\n"));
                             #[cfg(unix)]
                             {
                                 use std::os::unix::fs::PermissionsExt;
                                 let _ = std::fs::set_permissions(
-                                    DEMO_FILE,
+                                    &demo_file,
                                     std::fs::Permissions::from_mode(0o600),
                                 );
                             }
                             tracing::warn!(
                                 "easytier: the seeded demo account \"user\" had the default \
                                  password — replaced with a random one (user: {password}, also in \
-                                 {DEMO_FILE}); use the admin account for the dashboard"
+                                 {demo_file}); use the admin account for the dashboard"
                             );
                         }
                         Err(e) => tracing::warn!("easytier: could not rotate the demo account: {e}"),

@@ -28,7 +28,6 @@ pub struct AppState {
     pub config: RwLock<Config>,
     /// Last configuration successfully observed (see `config_blocking`).
     snapshot: Mutex<Config>,
-    pub config_path: PathBuf,
     pub sessions: Mutex<HashMap<String, u64>>,
     /// Failed console logins in the current window: (count, window start).
     /// The console is meant to be reachable from the network and ships a short
@@ -71,7 +70,9 @@ impl AppState {
     /// (as this used to) left the log view and its stream permanently empty
     /// while every line went to the other instance's ring and file.
     pub fn new(config: Config, logs: Arc<LogHub>) -> Arc<Self> {
-        let config_path = config.config_path.clone();
+        // The configuration carries its own path (`Config::save` writes there);
+        // this struct deliberately keeps no second copy, which would be one more
+        // thing to keep in sync.
         let et_http = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
             .build()
@@ -79,7 +80,6 @@ impl AppState {
         Arc::new_cyclic(|weak: &Weak<AppState>| Self {
             snapshot: Mutex::new(config.clone()),
             config: RwLock::new(config),
-            config_path,
             sessions: Mutex::new(HashMap::new()),
             login_failures: Mutex::new((0u32, 0u64)),
             password_hashes: tokio::sync::Semaphore::new(2),
@@ -148,11 +148,9 @@ impl AppState {
         }
     }
 
+    /// Certificates live beside the configuration on every platform; the
+    /// layout is decided in one place (`platform`).
     pub fn cert_dir(&self) -> PathBuf {
-        if cfg!(target_os = "openbsd") {
-            PathBuf::from("/etc/remgr/ssl")
-        } else {
-            self.config_path.parent().unwrap_or(&PathBuf::from(".")).join("ssl")
-        }
+        crate::platform::cert_dir()
     }
 }

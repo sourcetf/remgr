@@ -1,23 +1,27 @@
 # CI for ReMgr.
 #
-# What can and cannot be verified here: ReMgr itself is an OpenBSD service (it
-# need(2)s pledge/unveil, tun(4), and links the OpenBSD-ported EasyTier), and
-# GitHub has no OpenBSD runner, so the service crate is NOT built here — a
-# green run does not mean the daemon was compiled. What *is* verified on every
-# push is everything that does not need OpenBSD:
+# ReMgr is developed for OpenBSD (it need(2)s pledge/unveil), and GitHub has no
+# OpenBSD runner, so the *sanctioned* platform cannot be built here — a green run
+# does not mean the OpenBSD daemon compiled. Everything that can be verified on
+# Linux/Windows is:
 #
-#   1. `remgr-frps` — the frp wire-protocol implementation (both directions,
-#      server and client) builds and its unit tests pass. It is deliberately
-#      platform-independent, which `scripts/check-repo.sh` enforces, because
-#      that is what makes this job possible.
-#   2. The web console — its single inline script parses, every handler used by
-#      an inline attribute exists, every declared widget kind has a renderer, and
-#      every endpoint it calls exists in the router.
+#   1. `remgr-frps` — the frp wire-protocol implementation (server + client) —
+#      builds and its unit tests pass. Deliberately platform-independent, which
+#      `scripts/check-repo.sh` enforces, because that is what makes this possible.
+#   2. The web console — its one inline script parses, every handler used by an
+#      inline attribute exists, every widget kind has a renderer, and every
+#      endpoint it calls exists in the router.
 #   3. Repository hygiene — no credentials/keys/logs/build output tracked.
-#   4. Shell scripts parse.
+#   4. **Linux and Windows release builds of the whole service**, plus a runtime
+#      smoke test on Linux: start it against a scratch `REMGR_HOME`, fetch the
+#      console over HTTP, and shut it down with SIGTERM. That is what proves the
+#      portability layer actually works rather than merely compiling.
 #
-# Deployment (build + install + rcctl) is a manual step on the OpenBSD host; see
-# the README's build/deploy sections and `scripts/preflight.sh`.
+# Both platform builds need LLVM: `kcp-sys` (via EasyTier) and `machine-uid` (via
+# the RustDesk server) run bindgen at build time, which loads libclang.
+#
+# Deployment on OpenBSD (build + install + rcctl) stays manual; see the README
+# and `scripts/preflight.sh`.
 name: CI
 
 on:
@@ -35,6 +39,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # the dependency tree is large; a cold release build is the slowest step
+  CARGO_BUILD_JOBS: 4
 
 jobs:
   frp-protocol:
@@ -99,3 +105,190 @@ jobs:
         with:
           fetch-depth: 0
       - run: sh scripts/check-repo.sh
+
+  build:
+    name: release build (${{ matrix.name }})
+    needs: [frp-protocol]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            binary: remgr
+          - name: windows-x86_64
+            os: windows-latest
+            binary: remgr.exe
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install LLVM (bindgen needs libclang)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libclang-dev llvm
+          echo "LIBCLANG_PATH=$(llvm-config --libdir)" >> "$GITHUB_ENV"
+
+      - name: Install LLVM (bindgen needs libclang)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # windows-latest does not ship a libclang that cargo can find
+          choco install llvm --no-progress -y
+          $llvm = "C:\Program Files\LLVM\bin"
+          if (-not (Test-Path $llvm)) { throw "LLVM not installed at $llvm" }
+          $libclang = Join-Path $llvm "libclang.dll"
+          if (-not (Test-Path $libclang)) { throw "libclang.dll missing in $llvm" }
+          Add-Content -Path $env:GITHUB_ENV -Value "LIBCLANG_PATH=$llvm"
+          Add-Content -Path $env:GITHUB_PATH -Value $llvm
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build the service (release, as shipped)
+        run: cargo build --locked --release -p remgr
+
+      - name: The frp crate's tests, on this platform
+        run: cargo test --locked --release -p remgr-frps
+
+      - name: Smoke test — start, serve the console, shut down cleanly
+        if: runner.os == 'Linux'
+        run: |
+          set -eu
+          home=$(mktemp -d)
+          # every module off, so this test is only about the process coming up,
+          # generating its first-boot certificate, finding its directories and
+          # stopping on SIGTERM. The console is left at the default 9443 so the
+          # port check matches what the docs promise; -k is used for its
+          # self-signed first-boot certificate (which this also exercises —
+          # certificate generation is filesystem work that the port has to get right).
+          cat > "$home/config.toml" <<EOF
+          [console]
+          port = 9443
+          username = "admin"
+          password_hash = ""
+          session_ttl = 604800
+
+          [easytier]
+          enabled = false
+
+          [stun_turn]
+          enabled = false
+
+          [rustdesk]
+          enabled = false
+
+          [frps]
+          enabled = false
+
+          [frpc]
+          enabled = false
+          EOF
+          REMGR_HOME="$home" ./target/release/remgr --config "$home/config.toml" > "$home/out.log" 2>&1 &
+          pid=$!
+          for i in $(seq 1 60); do
+            if curl -kfs -o /dev/null "https://127.0.0.1:9443/"; then break; fi
+            if ! kill -0 $pid 2>/dev/null; then echo "process died early:"; cat "$home/out.log"; exit 1; fi
+            sleep 0.5
+          done
+          curl -kfs -o /dev/null "https://127.0.0.1:9443/" || { echo "console did not serve"; cat "$home/out.log"; exit 1; }
+          code=$(curl -ks -o /dev/null -w '%{http_code}' -X POST "https://127.0.0.1:9443/api/login" \
+                   -H 'content-type: application/json' -d '{"username":"admin","password":"admin"}')
+          [ "$code" = "200" ] || { echo "login returned $code"; cat "$home/out.log"; exit 1; }
+          grep -q "installed the default login admin" "$home/out.log" || { echo "no default login in the log"; cat "$home/out.log"; exit 1; }
+          grep -q "generated a P-384 self-signed certificate" "$home/out.log" || { echo "no first-boot certificate"; cat "$home/out.log"; exit 1; }
+          # the whole layout must be under REMGR_HOME, certificates included
+          for d in "" /ssl /log /run; do
+            [ -d "$home$d" ] || { echo "missing $home$d"; find "$home"; exit 1; }
+          done
+          [ -s "$home/run/initial_password" ] || { echo "no bootstrap password file"; find "$home"; exit 1; }
+          [ -s "$home/ssl/console_cert.pem" ] || { echo "certificate not under the home"; find "$home"; exit 1; }
+          kill -TERM $pid
+          for i in $(seq 1 20); do kill -0 $pid 2>/dev/null || break; sleep 0.5; done
+          if kill -0 $pid 2>/dev/null; then echo "did not exit on SIGTERM"; exit 1; fi
+          echo "smoke test: started, generated its certificate, served the console, logged in, exited on SIGTERM"
+          echo "--- layout ---"; find "$home" -maxdepth 2 | sed "s|$home|REMGR_HOME|"
+
+      - name: Smoke test — it starts, serves the console and reports its layout
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # The first boot mints a self-signed certificate and switches the
+          # console to HTTPS, so curl -k is used. Windows ships curl.exe.
+          # REMGR_HOME pins the whole layout to a scratch tree, which is what
+          # proves the ported paths (ProgramData/lib, run, log) work here.
+          $home = Join-Path $env:RUNNER_TEMP "remgr-win"
+          New-Item -ItemType Directory -Force -Path $home | Out-Null
+          $env:REMGR_HOME = $home
+
+          .\target\release\remgr.exe --version
+
+          @"
+          [console]
+          port = 9443
+          username = "admin"
+          password_hash = ""
+          session_ttl = 604800
+
+          [easytier]
+          enabled = false
+
+          [stun_turn]
+          enabled = false
+
+          [rustdesk]
+          enabled = false
+
+          [frps]
+          enabled = false
+
+          [frpc]
+          enabled = false
+          "@ | Set-Content -Path (Join-Path $home 'config.toml') -Encoding ascii
+
+          $p = Start-Process -FilePath .\target\release\remgr.exe `
+                 -ArgumentList '--config', (Join-Path $home 'config.toml') `
+                 -PassThru -RedirectStandardOutput (Join-Path $home 'out.log') `
+                 -RedirectStandardError (Join-Path $home 'err.log')
+          try {
+            $ok = $false
+            for ($i = 0; $i -lt 60; $i++) {
+              if ($p.HasExited) { throw "process died early (exit $($p.ExitCode))" }
+              & curl.exe -kfs -o $null 'https://127.0.0.1:9443/' 2>$null
+              if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+              Start-Sleep -Milliseconds 500
+            }
+            if (-not $ok) { throw "console never came up" }
+
+            $body = '{"username":"admin","password":"admin"}'
+            $code = & curl.exe -ks -o $null -w '%{http_code}' -X POST 'https://127.0.0.1:9443/api/login' `
+                      -H 'content-type: application/json' -d $body
+            if ($code -ne '200') { throw "login returned $code" }
+
+            $log = Get-Content -Raw (Join-Path $home 'out.log')
+            if ($log -notmatch 'installed the default login admin') { throw "no default login in the log" }
+            if ($log -notmatch 'generated a P-384 self-signed certificate') { throw "no first-boot certificate" }
+            foreach ($d in @('', 'ssl', 'log', 'run')) {
+              $p2 = Join-Path $home $d
+              if (-not (Test-Path $p2)) { throw "missing $p2" }
+            }
+            if (-not (Test-Path (Join-Path $home 'run\initial_password'))) { throw "no bootstrap password file" }
+            if (-not (Test-Path (Join-Path $home 'ssl\console_cert.pem'))) { throw "certificate not under the home" }
+
+            Write-Host "windows smoke test: started, generated its certificate, served the console, logged in"
+            Get-ChildItem -Recurse $home | Select-Object -First 12 FullName | Format-Table -AutoSize
+          } finally {
+            if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
+          }
+
+      - name: Upload the binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: remgr-${{ matrix.name }}
+          path: target/release/${{ matrix.binary }}
+          if-no-files-found: error
+          retention-days: 30
