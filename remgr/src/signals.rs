@@ -211,7 +211,7 @@ mod imp {
     /// Render one record: "signal <sig> from pid=<pid> uid=<uid> code=<code>\n".
     /// Plain integer formatting and buffer copies only — this runs in the signal
     /// handler, where allocation, locks and the clock are all off limits.
-    fn record_bytes(sig: i32, pid: i32, uid: u32, code: i32) -> ([u8; 80], usize) {
+    pub(super) fn record_bytes(sig: i32, pid: i32, uid: u32, code: i32) -> ([u8; 80], usize) {
         let mut buf = [0u8; 80];
         let mut n = 0;
         n = put(&mut buf, n, REC_SIGNAL.as_bytes());
