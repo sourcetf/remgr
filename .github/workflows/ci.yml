@@ -223,6 +223,22 @@ jobs:
           # (its own build script cannot be injected into).
           Add-Content -Path $env:GITHUB_ENV -Value "RUSTFLAGS=-L native=$($packet.DirectoryName)"
 
+          # Packet.lib is Npcap's *import* library, so the built binary needs the
+          # Npcap runtime (Packet.dll) to load at all: without it the process dies
+          # immediately with 0xC0000135 (STATUS_DLL_NOT_FOUND), which is exactly
+          # what the first smoke-test run reported as "process died early (exit
+          # -1073741515)". Installing the driver is what a Windows operator has to
+          # do as well — the README says so, and this is the same step.
+          choco install npcap --no-progress -y
+          $packetDll = Join-Path $env:SystemRoot "System32\Npcap\Packet.dll"
+          if (-not (Test-Path $packetDll)) {
+            # 32-bit installs put it under SysWOW64; either way, say what is missing
+            $alt = Join-Path $env:SystemRoot "SysWOW64\Npcap\Packet.dll"
+            if (-not (Test-Path $alt)) { throw "Npcap did not install Packet.dll (checked System32 and SysWOW64)" }
+            $packetDll = $alt
+          }
+          Write-Host "Npcap runtime: $packetDll"
+
       - name: Verify the prerequisites actually work
         if: runner.os == 'Windows'
         shell: pwsh
