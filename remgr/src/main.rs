@@ -4,6 +4,7 @@
 //! STUN/TURN, RustDesk relay, frps — all supervised as in-process task trees,
 //! managed through a web console, sandboxed with pledge/unveil.
 
+mod acct;
 mod certs;
 
 mod config;
@@ -12,13 +13,12 @@ mod logging;
 mod modules;
 mod platform;
 mod secure;
+mod signals;
 mod state;
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-#[cfg(not(unix))]
-use std::time::Duration;
 
 use state::AppState;
 
@@ -94,7 +94,7 @@ fn main() {
                 return;
             }
             other => {
-                eprintln!("unknown argument: {other}");
+                logging::say_err(&format!("unknown argument: {other}"));
                 std::process::exit(2);
             }
         }
@@ -114,7 +114,7 @@ fn main() {
         .build()
         .expect("tokio runtime");
     if let Err(e) = runtime.block_on(run(config_path)) {
-        eprintln!("remgr: fatal: {e:#}");
+        logging::say_err(&format!("remgr: fatal: {e:#}"));
         std::process::exit(1);
     }
 }
@@ -128,6 +128,14 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
     // and an operator reading the log should not have to guess (or read the
     // source) to find the config, the certificates or the log file itself.
     tracing::info!("paths: {}", platform::layout_summary());
+
+    // Signals first, before anything that can take a while (config load, the
+    // database, the modules): a SIGTERM that arrives during start-up is recorded
+    // and obeyed from here on, instead of leaving the process running until
+    // rc.subr gives up and escalates to SIGKILL. The second install below is the
+    // one that decides, because start-up is also when the embedded servers
+    // install handlers of their own.
+    signals::install().map_err(|e| anyhow::anyhow!("installing the signal handler: {e}"))?;
 
     // rustls crypto provider (process-wide, ring)
     let _ = rustls::crypto::ring::default_provider().install_default();
@@ -228,7 +236,9 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
     let state = AppState::new(cfg, hub.clone());
     if let Some(pw) = &initial_password {
         tracing::warn!("initial console password: {pw}  (also written to /var/run/remgr/initial_password)");
-        println!("initial console password: {pw}");
+        // say, not println!: as a service stdout is rc.subr's logger pipe, and
+        // a logger that stopped reading must not panic the daemon (see logging).
+        logging::say(&format!("initial console password: {pw}"));
     }
 
     // auto-start enabled modules
@@ -253,18 +263,42 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
         }
     }
 
-    // graceful shutdown on SIGTERM/SIGINT (rc.d sends SIGTERM)
+    // Graceful shutdown on SIGTERM/SIGINT (rc.d sends SIGTERM), and a record of
+    // who sent it — see `signals.rs`. Installed again here, after the modules
+    // are up: the embedded servers register signal listeners of their own while
+    // they start, and the last disposition installed is the one that runs.
+    signals::install().map_err(|e| anyhow::anyhow!("installing the signal handler: {e}"))?;
     let stop_state = state.clone();
     tokio::spawn(async move {
-        wait_for_shutdown_signal().await;
-        tracing::info!("shutdown signal received, stopping modules");
-        let snapshot = stop_state.config_blocking();
-        let _ = snapshot;
+        // SIGHUP is logged and ignored (nothing to reload); the first signal that
+        // stops the process leaves the loop, a second one exits from the handler.
+        loop {
+            let signal: signals::Termination = signals::next().await;
+            tracing::warn!("{}", signal.describe());
+            if signal.stops() {
+                break;
+            }
+        }
+        // Who sent it, as far as this platform can say. On OpenBSD that is not
+        // the siginfo (kill(2) reports no sender — see signals.rs), so the tail of
+        // the kernel's accounting file is what names the commands that ran just
+        // before. Logged before the modules stop, so a module hanging on its way
+        // out cannot cost us the record.
+        trace_recent_commands(12, "before the shutdown");
         for name in ["frpc", "frps", "rustdesk", "stun_turn", "easytier"] {
             if let Some(module) = stop_state.module(name) {
                 module.stop().await.ok();
             }
         }
+        // Read the accounting tail once more, a moment later: a sender that is
+        // still running when it signals (a shell, a script) only gets its record
+        // written when it exits. For a signal sent by `kill` in a session that
+        // then closes, that is a fraction of a second — this wait is what puts
+        // "the command that did it" in the log, and it costs the shutdown 1.2s of
+        // its 120s rc.subr budget.
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        trace_recent_commands(6, "while the shutdown completed");
+        tracing::info!("stopped; exiting");
         std::process::exit(0);
     });
 
@@ -275,19 +309,29 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
     Ok(())
 }
 
-async fn wait_for_shutdown_signal() {    #[cfg(unix)]
-    {
-        use tokio::signal::unix::{signal, SignalKind};
-        let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
-        let mut int = signal(SignalKind::interrupt()).expect("SIGINT handler");
-        tokio::select! {
-            _ = term.recv() => {}
-            _ = int.recv() => {}
+/// Log the last commands the kernel recorded before a termination signal.
+///
+/// This is the daemon's answer to "who stopped me" on a platform whose signals do
+/// not carry a sender (`acct.rs` has the details). It is best-effort by design: a
+/// missing or unreadable accounting file is reported in one line and never stops
+/// the shutdown — the signal itself is already recorded by then.
+fn trace_recent_commands(wanted: usize, when: &str) {
+    let path = Path::new(acct::ACCT_PATH);
+    match acct::recent(path, wanted) {
+        Ok(entries) if entries.is_empty() => tracing::warn!(
+            "accounting: {} has no records yet — enable accounting (accounting=YES in              rc.conf.local, then accton(8)) to have the commands before a signal recorded",
+            path.display()
+        ),
+        Ok(entries) => {
+            tracing::warn!(
+                "accounting ({when}): the last {} commands the kernel recorded:",
+                entries.len()
+            );
+            for entry in entries {
+                tracing::warn!("accounting: {}", entry.describe());
+            }
         }
-    }
-    #[cfg(not(unix))]
-    {
-        tokio::time::sleep(Duration::from_secs(3600 * 24 * 365)).await;
+        Err(e) => tracing::warn!("accounting ({when}): cannot read {}: {e}", path.display()),
     }
 }
 

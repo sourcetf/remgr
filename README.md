@@ -22,7 +22,7 @@ Web 控制台（axum + 内嵌 SPA）：每个服务的全部可配置项、启�
   - `route` / `wroute` 供 EasyTier 节点做接口与路由 ioctl：`SIOCGIFADDR`、`SIOCAIFADDR`、`SIOCDIFADDR`、`SIOCSIFMTU`。
   - `tun(4)` 在 `open(2)` 时已置 `IFF_UP | IFF_RUNNING`，无需 `SIOCSIFFLAGS`（该 ioctl 不被任何 promise 授权）。
 - 路由表增删通过**启动时（pledge 之前）打开的路由套接字**完成：pledge 会拒绝 `socket(AF_ROUTE)`，但已打开的 fd 仍可 `write(2)` RTM_ADD / RTM_DELETE。
-- unveil：`/etc/remgr`、`/var/lib/remgr`、`/var/db/remgr`、`/var/log/remgr`、`/var/run/remgr`（rwc）、`/etc/ssl`、`/etc/resolv.conf`、`/etc/hosts`、`/etc/services`（r）、`/dev/tun0-15`（rw，EasyTier TUN）、`/dev/urandom`（r）。
+- unveil：`/etc/remgr`、`/var/lib/remgr`、`/var/db/remgr`、`/var/log/remgr`、`/var/run/remgr`（rwc）、`/etc/ssl`、`/etc/resolv.conf`、`/etc/hosts`、`/etc/services`、`/var/account`（r，内核记账尾巴：终止信号的取证依据，见「安全与运维约束」）、`/dev/tun0-15`（rw，EasyTier TUN）、`/dev/urandom`（r）。
 
 实测核对（2026-09-25，运行中的服务）：`fstat -p <pid>` 里只有这几个 unveiled 路径 —— 工作目录 `/var/lib/remgr`（inode 与 `ls -di` 一致）、`remgr.log`、`et.db`/`et.db-wal`/`et.db-shm`、`db_v2.sqlite3`、`/dev/tun0`，加上启动时打开的路由套接字（`route raw`）与各监听 socket；`pgrep -P <pid>` **无输出**（进程没有任何子进程，与「无 `exec`」一致）；`dmesg` 里从无 pledge/unveil 违例。把控制台/服务全部功能（启停、保存配置、生成与上传证书、下载日志、WebSocket 日志、frpc 隧道、STUN/TURN 分配、easytier `/et` 反代）跑一遍，日志里没有 `EPERM`、也没有新的 `ENOENT`。
 
@@ -180,7 +180,38 @@ sh scripts/preflight.sh                                             # 逐项核�
   （frps 的代理名来自远端 frpc 客户端，属于不可信输入）。
 - 证书路径若不在 unveiled 目录内（`/etc/remgr`、`/var/lib/remgr` 等）会在绑定阶段失败，
   此时 `/api/status` 的 `console.tls_active` 为 false（界面提示「HTTPS 未生效」）。
-- 磁盘：根分区曾因写满而被内核杀死进程（本机 `df -h /` 现在 96%，只剩约 950 MB）。日志按 8 MB 轮转保留一代，写不进去时服务不会崩、也不会报错；配置保存是原子的，不会留下半截文件。细节见「磁盘与 fd 压力下的行为」。
+- **终止信号会记录来源（能记多少记多少）**：`SIGTERM`/`SIGINT` 触发优雅停机（逐模块停止后退出），日志写明信号种类与内核给出的原因
+  （`si_code`，用来区分「某个进程发了 kill(2)」还是「内核发的」）。**但实测结论：OpenBSD 的 `kill(2)` 不填发送者** ——
+  `si_code=SI_USER(0)` 而 `si_pid`/`si_uid` 恒为 0（C 探针在「别的进程发」「shell 发」「自己 raise」三种情况下都验证过），
+  OpenBSD 也没有 `sigqueue(3)`。因此这一行在 OpenBSD 上是
+  `SIGTERM received with no sender reported by the kernel (sent by a process: kill(2)/raise(3))`，
+  在会报告发送者的平台（Linux 等）上则是 `… from pid N (uid M) …`。
+  **真正的取证靠内核记账**：收到终止信号时读取 `/var/account/acct` 尾部 12 条，把「信号前刚执行过的命令」写进日志 ——
+  命令名、uid、pid、起始时间、结束方式（被信号杀死 / pledge 违规 / core dump …），例如
+  `accounting: 2026-09-26T01:53:11Z ksh uid=0 pid=4711 (normal exit)`。前提是开启记账：
+  `echo 'accounting=YES' >> /etc/rc.conf.local; accton /var/account/acct`（本机已开启；账本 64 字节/条，
+  实测约 2.7 MB/小时）。**注意轮转陷阱**：OpenBSD 的 `daily(8)` 对记账文件是 `cp`（复制）而**不截断**正在写入的文件，所以它既会无限增长、又会每天把当时的大小冻成一份新世代（4 份）——磁盘紧张时这是会填满磁盘的隐患。因此 `scripts/remgr-watchdog.sh` 里加了上限（16 MiB）与规范轮转（`accton` 关 → `mv` 成 `.0` → 再开）；关掉记账用 `accton`（不带参数即停用）。未开启记账时，日志会明确写一行说明，而不是假装有记录。
+  处理器另外把一条原始记录（`signal <n> from pid=<pid> uid=<uid> code=<code>`）**直写日志文件描述符**：
+  即使紧随其后的第二个终止信号立刻结束进程（第二个终止信号不再等优雅停机，直接 `_exit`），证据也已经落盘。
+  **`SIGHUP` 只记录、不退出**：本服务没有需要重新读取的磁盘配置（控制台的改动是写配置文件并自行重绑监听），
+  而 `rcctl reload`（rc.subr 默认 reload 信号就是 HUP；`scripts/rc.d/remgr` 已声明 `rc_reload=NO`）
+  或终端挂断把中继服务静默杀掉，比"在日志里说一句"糟糕得多。
+  实现上用 `SA_SIGINFO` 自装处理器（tokio 的 signal API 拿不到 siginfo），并且**故意不转发**给依赖自己注册的处理器：
+  RustDesk 的 hbbs 在 `tokio::select!` 里等 TERM，收到后直接 `process::exit(0)`（`rendezvous_server.rs`），
+  转发等于把退出权交给它 —— 实测症状正是停机日志在 EasyTier 的 `I/O error: socket closed` 处断掉、没有收尾行。
+  现在退出只由一个地方决定：本处理器 → `main` 里的模块逐个停止 → `exit(0)`。
+  顺带：libc crate 给 OpenBSD 的 `siginfo_t` 定义有误（声明 128 字节、`si_pid()` 读偏移 128；实际 136 字节、字段在 16/20），
+  所以这里按实测偏移自行读取。
+- **日志不会阻塞服务**：作为服务启动时 stdout 是 rc.subr 的 `logger -isp` 管道（`-s` 让 logger 把每行再回显到自己的 stderr，
+  而对「从 SSH 会话里 `rcctl start` 的实例」来说后者就是那条会话通道，会话一结束就断）。
+  本机实测存在卡死数小时的 `logger` 进程：64 KiB 管道一旦填满，**阻塞式**写日志会把整个守护进程（连控制台一起）冻住。
+  因此非终端场景下 stdout 被设为非阻塞，日志写入改为直接 `write(2)`（不经过 Rust 的 `BufWriter`——它会把写不出去的字节
+  留在缓冲区里无限增长），管道满或已关闭时丢弃该行而不是报错；服务路径上的 `println!`/`eprintln!` 也换成不会 panic 的写法。
+- **进程组由 rc.subr 隔离（实测）**：`rc_bg=YES` 让 rc.subr 用 `set -o monitor` 启动守护进程；从 SSH 会话里
+  `rcctl restart remgr` 后实测新实例的 `PGID` 等于它自己的 pid（`PPID=1`），**不会**留在该会话的进程组里。
+  这点值得实测而不是假设：同一台机器上别的服务（另一项目的 `ksh -c` 子进程）就留在了早已退出的会话进程组中，
+  一旦那个 pgid 被后续会话复用，任何 `killpg` 都会误伤它们。
+- 磁盘：根分区曾因写满而被内核杀死进程（本机长期在 90% 以上，目前约 1.4 GiB 空闲）。日志按 8 MB 轮转保留一代，写不进去时服务不会崩、也不会报错（但会在 stderr/日志里报一次）；配置保存是原子的，不会留下半截文件。细节见「磁盘与 fd 压力下的行为」。
 
 ## CI（`.github/workflows/ci.yml`）
 
@@ -188,7 +219,7 @@ sh scripts/preflight.sh                                             # 逐项核�
 
 1. **frp 协议 crate** —— `remgr-frps` 构建 + 16 个单元测试 + 互通自检程序（`examples/frpc_probe --self-test`）。这个 crate 是刻意保持跨平台的（`scripts/check-repo.sh` 会强制这一点），所以能在 Linux runner 上真跑。
 2. **控制台** —— 单文件脚本能解析（`node --check`）、每个 inline 属性引用的处理函数都存在、每种 widget 都有渲染分支、每个证书服务与 API 端点都在 router 里（`scripts/check-console.sh`），外加仓库卫生检查（无凭据/密钥/日志/编译产物）。
-3. **release build（矩阵：linux-x86_64 / windows-x86_64）** —— 完整服务编译成 release，各自跑该平台的 `remgr-frps` 测试，产物以 artifact 形式保留 30 天。随后按平台做力所能及的运行期验证：
+3. **release build（矩阵：linux-x86_64 / windows-x86_64）** —— 完整服务编译成 release，各自跑该平台的 `remgr-frps` 测试**和服务本体（`remgr`）的单元测试**（信号来源记录、路径布局），产物以 artifact 形式保留 30 天。随后按平台做力所能及的运行期验证：
    - **Linux：真实运行**（用 scratch `REMGR_HOME` 启动、等控制台起来、校验首次启动写入了文档里的默认登录并生成 P-384 证书、用 HTTPS 登录、确认整棵布局 `config`/`ssl`/`lib`/`log`/`run` 都落在 home 下、再用 SIGTERM 关掉）。
    - **Windows：导入校验**（扫描 `remgr.exe` 的导入表确认 `Packet.dll` 在其中，把「需要 Npcap」变成可测事实）；真正的运行期冒烟测试脚本也写好了，但它**只在机器已装 Npcap 时才执行**，否则明确报告「未运行」及原因——因为免费版 Npcap 无法静默安装（`/S` 仅 OEM），CI 不能替操作者接受许可协议。
 
@@ -210,7 +241,8 @@ sh scripts/preflight.sh        # 只读核对，任何 FAIL 都要处理
 - **不需要 `rc_pre`/`rc_post`**：`secure::prepare_dirs` 每次启动都会建 `/etc/remgr`、`/var/lib/remgr`、`/var/db/remgr`、`/var/log/remgr`、`/var/run/remgr`，重启后 `/var/run` 被清空也照样起来。
 - **fd 上限必须显式给**：rc.subr 通过 `su -fl -c <登录类>` 启动，脚本里写 `ulimit -n` 会被丢弃，因此默认落到系统的 `daemon` 类：`openfiles-cur=128`（`kern.maxfiles=7030`，系统天花板远不是瓶颈）。以同样方式启动真实二进制作压力测试：把 200 条连接**挂着不发请求**，进程涨到 128 个 fd 就停住，此时新的控制台请求**完全无响应**（日志里也没有任何报错），客户端断开后才恢复；换成 `openfiles-cur=1024` 同样 200 条全部服务。装 `scripts/login.conf.d/remgr` 后 rc.subr 会按名字选中 `remgr` 类（`daemon_class=remgr`）。注意 login.conf 取**首个**同名属性，覆盖项必须写在 `:tc=daemon:` **之前**（把两行交换就退回 128，实测过）。
 - 装完 `rcctl restart remgr` 应在 1 秒内返回 0；`/etc/rc.d/remgr` 与仓库副本必须逐字节一致（`preflight.sh` 用 md5 核对，这个文件曾经漂移过）。
-- **没有任何东西会自动拉起重挂的服务**（OpenBSD 的 rc.subr 不托管前台守护进程）。实测过一次：2026-09-26 03:08 remgr 收到外部 SIGTERM 后按设计干净退出（日志里模块逐个停止），随后**停了约 40 分钟**直到人工重启——没有人被通知。若要它自愈，可选用仓库里的 `scripts/remgr-watchdog.sh`（默认**不安装**：看门狗和运维主动停机是冲突的）：
+- **没有任何东西会自动拉起重挂的服务**（OpenBSD 的 rc.subr 不托管前台守护进程）。实测过：2026-09-26 remgr 三次收到外部 SIGTERM 后都按设计干净退出（日志里模块逐个停止），此后前两次分别**停了 4 小时 31 分、1 小时 43 分**才被人工拉起，第三次（看门狗装好后）49 秒就被拉回——前两次的停机期间没有任何通知。
+  若要它自愈，用仓库里的 `scripts/remgr-watchdog.sh`（默认**不安装**：看门狗和运维主动停机是冲突的）。它的动作写进 `/var/log/remgr/watchdog.log`（外加 syslog），一行一次，便于回答「多久重启一次、从什么时候开始不对劲」：
   ```sh
   install -m 555 scripts/remgr-watchdog.sh /etc/remgr/remgr-watchdog.sh
   crontab -l > /tmp/ct 2>/dev/null; echo '*/2 * * * * /etc/remgr/remgr-watchdog.sh' >> /tmp/ct; crontab /tmp/ct
@@ -221,11 +253,16 @@ sh scripts/preflight.sh        # 只读核对，任何 FAIL 都要处理
 
 ```sh
 cp -p /etc/remgr/config.toml /etc/remgr/config.toml.bak.$(date +%F)   # 含口令哈希/token，先备份
-install -m 755 target/release/remgr /usr/local/bin/remgr              # 同目录替换
+install -m 755 target/release/remgr /usr/local/bin/remgr.new           # 先写到旁边的临时名
+mv -f /usr/local/bin/remgr.new /usr/local/bin/remgr                    # 再 rename 覆盖（见下）
 rcctl restart remgr                                                   # 应立刻返回 0
 tail -5 /var/log/remgr/remgr.log      # 应看到 "starting" 与 "openbsd sandbox active"
 sh scripts/preflight.sh
 ```
+
+- **不要用 `cp`/`install` 直接覆盖正在运行的二进制**：内核会拒绝写入被作为可执行文件打开的文件，报 `Text file busy`（ETXTBSY）。实测踩过：`cp target/release/remgr /usr/local/bin/remgr` 失败，而当时的部署脚本是「先 `rcctl stop`、再 `cp`」——
+  一旦 `cp` 失败（`set -e`）脚本就在 `start` 之前中止，**服务留在停止状态，日志里只有一次干净的停机、没有任何启动记录**，正是本仓库里三次「不明原因死亡」的记录特征。
+  正确做法是 `mv`（rename）覆盖：运行中的进程继续持有旧 inode，重启后自然用上新二进制。若确实要先停后装，请在 `start` 之前显式校验二进制（大小/`--version`），失败就立刻拉起旧的。
 
 - **配置兼容性（实测）**：
   - 旧配置缺字段能加载：所有结构体都是 `#[serde(default)]`；没有 `[frpc]` 段、没有 `console.username` 的文件照样起，缺的字段取默认值并在下次保存时补写进文件。

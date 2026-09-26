@@ -28,6 +28,13 @@ fn unveil_paths() -> Vec<(String, &'static str)> {
         ("/etc/resolv.conf".to_string(), "r"),
         ("/etc/hosts".to_string(), "r"),
         ("/etc/services".to_string(), "r"),
+        // The kernel's process accounting file, read-only, for one purpose: when
+        // a termination signal arrives, the tail of this file names the commands
+        // that ran just before it. OpenBSD does not report the sender of kill(2)
+        // (see signals.rs), so this is the only record of the actor the daemon
+        // has. Readers are already root-only in practice; "r" adds nothing
+        // writable, and the file stays invisible when accounting is off.
+        ("/var/account".to_string(), "r"),
     ];
     // TUN devices for the EasyTier node + entropy.
     //

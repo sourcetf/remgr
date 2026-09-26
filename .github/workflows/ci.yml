@@ -250,6 +250,12 @@ jobs:
       - name: The frp crate's tests, on this platform
         run: cargo test --locked --release -p remgr-frps
 
+      # The signal-provenance tests (cfg(unix), so they compile out on Windows)
+      # and the path-layout test live in the service crate itself. --release
+      # reuses the dependency artefacts the build above just made.
+      - name: The service crate's unit tests
+        run: cargo test --locked --release -p remgr
+
       - name: Smoke test — start, serve the console, shut down cleanly
         if: runner.os == 'Linux'
         run: |

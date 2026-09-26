@@ -122,8 +122,3 @@ fn write_mode(path: &Path, data: &[u8], mode: u32) -> std::io::Result<()> {
         std::fs::write(path, data)
     }
 }
-
-pub fn cert_exists(dir: &Path, service: &str) -> bool {
-    let (cert_path, _) = cert_paths(dir, service);
-    matches!(std::fs::metadata(&cert_path), Ok(m) if m.len() > 0)
-}

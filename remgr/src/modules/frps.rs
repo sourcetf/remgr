@@ -3,19 +3,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 
 use crate::state::AppState;
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct FrpsRuntimeStats {
-    pub clients_online: u64,
-    pub total_logins: u64,
-    pub total_user_conns: u64,
-    pub bytes_in: u64,
-    pub bytes_out: u64,
-    pub proxies: Vec<serde_json::Value>,
-}
 
 pub struct FrpsModule {
     state: std::sync::Weak<AppState>,

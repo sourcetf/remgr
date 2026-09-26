@@ -37,6 +37,11 @@ if grep -q '^rc_bg=YES' /etc/rc.d/remgr 2>/dev/null; then
 else
 	bad "rc_bg=YES missing: rcctl start/restart waits the whole daemon_timeout and exits 1"
 fi
+if grep -q '^rc_reload=NO' /etc/rc.d/remgr 2>/dev/null; then
+	ok "rc_reload=NO present (reload is reported unsupported, not turned into a signal)"
+else
+	warn "rc_reload=NO missing: rc.subr's default reload signal is HUP; remgr logs and ignores HUP, so rcctl reload silently does nothing"
+fi
 rcctl ls on 2>/dev/null | grep -qx remgr && ok "enabled (rcctl ls on)" || warn "not enabled: rcctl enable remgr"
 if rcctl check remgr >/dev/null 2>&1; then
 	ok "running"
@@ -51,6 +56,21 @@ case "$cur" in
 *) if [ "$cur" -ge 1024 ]; then ok "openfiles-cur=$cur (class remgr)"; else warn "openfiles-cur=$cur (class remgr), want >= 1024"; fi ;;
 esac
 [ -f /etc/login.conf.d/remgr ] && ok "/etc/login.conf.d/remgr installed" || warn "/etc/login.conf.d/remgr not installed"
+echo "== disk space =="
+avail=$(df -k / | awk 'NR==2{print $4}')
+case "$avail" in
+''|*[!0-9]*) info "cannot read free space for /" ;;
+*)
+	if [ "$avail" -lt 524288 ]; then
+		bad "$((avail/1024)) MiB free on / — the kernel kills processes when a filesystem fills up; free space before continuing"
+	elif [ "$avail" -lt 2097152 ]; then
+		warn "$((avail/1024)) MiB free on / — want >= 2 GiB (logs rotate at 8 MiB, but a release build needs ~1 GiB more)"
+	else
+		ok "$((avail/1024)) MiB free on /"
+	fi
+	;;
+esac
+
 sysmax=$(sysctl -n kern.maxfiles 2>/dev/null)
 [ -n "$sysmax" ] && info "kern.maxfiles=$sysmax (system-wide ceiling, shared with pf/relayd/…)"
 
