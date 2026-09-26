@@ -64,14 +64,17 @@ ReMgr 以 **OpenBSD 为首要目标**（pledge/unveil 沙箱、rc.d、login.conf
 | 服务管理 | `rc.d` + `login.conf.d`（随仓库提供） | 自备 systemd 单元（未随仓库提供） | 自备服务包装器（NSSM 等，未随仓库提供） |
 | EasyTier 中心节点所需的 TUN | `tun(4)`，开箱可用 | `/dev/net/tun`，需要权限 | 需要安装 **wintun 驱动** |
 | 构建期额外依赖 | `llvm19`（libclang）、`protobuf`（protoc） | 同左（libclang-dev、protobuf-compiler、libprotobuf-dev） | LLVM、protoc，以及 **WDK** 提供的 `Packet.lib`（链接期，见下） |
-| CI | 无 GitHub runner，**手动部署** | 出 release 产物 + 运行时冒烟测试 | 出 release 产物 + 运行时冒烟测试 |
+| CI | 无 GitHub runner，**手动部署** | 出 release 产物 + **真实运行**冒烟测试 | 出 release 产物 + 导入校验（运行期冒烟测试需 Npcap，见下） |
 
 - **目录布局由 `remgr/src/platform.rs` 单点决定**，可用环境变量 `REMGR_HOME` 整体重定位（CI 与冒烟测试就是这么跑的：重定位后配置在根目录，`ssl`/`lib`/`log`/`run` 在其下）。运维上意味着一台机器可以放多套互不干扰的实例。
 - **`%ProgramData%\ReMgr` 与 Windows 服务**：以管理员身份运行时该目录可写；若要让服务账户也能写，给该目录授权即可。
-- **Windows 构建需要 WDK 的 `Packet.lib`**：EasyTier 依赖 `pnet_datalink`，而 `pnet_sys` 在 Windows 上必须链接 NDIS 的 `Packet.lib`（随 **Windows Driver Kit** 提供，位于 `Windows Kits\10\Lib\<版本>\km\x64\`，不在默认库搜索路径上）。CI 的做法是找到该文件并把其目录加进链接搜索路径；手工构建时若遇到 `LNK1181: cannot open input file 'Packet.lib'`，装 WDK 或把该目录加进 `LIB`/`RUSTFLAGS=-L native=<目录>` 即可。
-- **Windows 运行期还需要 Npcap**：`pnet_datalink` 通过 Npcap 枚举网卡，所以 EasyTier 在 Windows 上枚举网络接口时期望装有 Npcap。**只影响 EasyTier**；其余五个模块不使用它。
+- **Windows 上必须安装 Npcap，且这是启动前提（不只是 EasyTier）**：`remgr.exe` 在链接时用了 Npcap 的**导入库** `Packet.lib`，而 Windows 的加载器在 `main()` 之前就解析普通导入，因此**没有 `Packet.dll` 时整个二进制无法启动**——连 `remgr --version` 都会立刻以 `0xC0000135`（STATUS_DLL_NOT_FOUND）退出，与是否使用 EasyTier 无关。依赖链是：EasyTier 的 faketcp netfilter 用 `pnet`（`PnetTun` 是各平台的回退实现，见 `netfilter/mod.rs`），`pnet_sys` → Npcap。请从 <https://npcap.com/#download> 安装（Wireshark 用的也是它）。
+  - 这一点在 CI 里是**机器校验**的：Windows job 会扫描 `remgr.exe` 的导入表确认 `Packet.dll` 在其中；若上游某天不再需要它，该步骤会失败并提示可以启用运行期冒烟测试。
+  - **免费版 Npcap 没有静默安装**（其文档写明 `/S` 仅 Npcap OEM 可用），所以这是人工步骤；因此 CI 在装有 Npcap 的机器上才能跑 Windows 运行期冒烟测试，否则会明确报告「未运行」并说明原因，**不会假装通过**。
+- **Windows 构建期还需要 `Packet.lib`**：它随 **Windows Driver Kit** 提供（`Windows Kits\10\Lib\<版本>\km\x64\`，不在默认库搜索路径上），或从 **Npcap SDK**（`Lib\x64\Packet.lib`，约 345 KB）获取。CI 优先用前者、否则下载官方 SDK，并把目录加进链接搜索路径；手工构建遇到 `LNK1181: cannot open input file 'Packet.lib'` 时同样处理（`RUSTFLAGS=-L native=<目录>`）。
+- **Linux 不需要额外运行期依赖**：CI 在 Ubuntu 上构建并**真实运行**（启动 → 自签证书 → HTTPS 登录 → 目录布局 → SIGTERM 退出）全绿。
 - **除 EasyTier 中心节点外，其余模块（easytier-web 仪表盘、STUN/TURN、RustDesk、frps、frpc）在任何平台都不依赖 TUN**，所以即使没装 wintun，Windows 上仍是一个可用的中继管理器（把配置里的 `[easytier] node_enabled` 关掉即可）。
-- **未验证的部分要如实说明**：Linux/Windows 目前做到的是「能构建、能启动、控制台可用、默认登录可用、目录布局正确」，每推一次都由 CI 的 `build` job 验证。而 EasyTier 的 TUN 组网、RustDesk 客户端的真实连接这类**需要真实客户端参与**的行为，只在 OpenBSD 上实测过。
+- **未验证的部分要如实说明**：Linux 上「能构建 + 能真实运行」已由 CI 每次 push 验证；Windows 上验证到「能构建、能链接、导入校验通过、产物可下载」，**运行期**那一环需要 Npcap（免费版无法静默安装），因此由操作者在装了 Npcap 的机器上执行同样步骤 —— CI 会明确报告该步骤未运行。而 EasyTier 的 TUN 组网、RustDesk 客户端的真实连接这类**需要真实客户端参与**的行为，只在 OpenBSD 上实测过。
 
 ## 构建（OpenBSD 7.x）
 
@@ -185,7 +188,9 @@ sh scripts/preflight.sh                                             # 逐项核�
 
 1. **frp 协议 crate** —— `remgr-frps` 构建 + 16 个单元测试 + 互通自检程序（`examples/frpc_probe --self-test`）。这个 crate 是刻意保持跨平台的（`scripts/check-repo.sh` 会强制这一点），所以能在 Linux runner 上真跑。
 2. **控制台** —— 单文件脚本能解析（`node --check`）、每个 inline 属性引用的处理函数都存在、每种 widget 都有渲染分支、每个证书服务与 API 端点都在 router 里（`scripts/check-console.sh`），外加仓库卫生检查（无凭据/密钥/日志/编译产物）。
-3. **release build（矩阵：linux-x86_64 / windows-x86_64）** —— 完整服务编译成 release，各自跑该平台的 `remgr-frps` 测试，随后**实际运行**：用 scratch `REMGR_HOME` 启动、等控制台起来、校验首次启动写入了文档里的默认登录并生成了 P-384 证书、用 HTTPS 登录、确认整棵布局（`config`/`ssl`/`lib`/`log`/`run`）都落在 home 下、再用 SIGTERM 关掉。产物以 artifact 形式保留 30 天。
+3. **release build（矩阵：linux-x86_64 / windows-x86_64）** —— 完整服务编译成 release，各自跑该平台的 `remgr-frps` 测试，产物以 artifact 形式保留 30 天。随后按平台做力所能及的运行期验证：
+   - **Linux：真实运行**（用 scratch `REMGR_HOME` 启动、等控制台起来、校验首次启动写入了文档里的默认登录并生成 P-384 证书、用 HTTPS 登录、确认整棵布局 `config`/`ssl`/`lib`/`log`/`run` 都落在 home 下、再用 SIGTERM 关掉）。
+   - **Windows：导入校验**（扫描 `remgr.exe` 的导入表确认 `Packet.dll` 在其中，把「需要 Npcap」变成可测事实）；真正的运行期冒烟测试脚本也写好了，但它**只在机器已装 Npcap 时才执行**，否则明确报告「未运行」及原因——因为免费版 Npcap 无法静默安装（`/S` 仅 OEM），CI 不能替操作者接受许可协议。
 
 两个平台都要装 **LLVM**（`kcp-sys` 与 `machine-uid` 在构建期跑 bindgen）和 **protoc + well-known types**（`easytier-proto` 生成 protobuf 类型）。后者容易踩：Ubuntu 上 `.proto` 文件在 `libprotobuf-dev` 里而不是 `protobuf-compiler`，所以 workflow 从实际文件反推 include 根目录，并在准备阶段用一行 protoc 探针先验证，避免等 20 分钟才在依赖输出里看到同样的报错。
 
