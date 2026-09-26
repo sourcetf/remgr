@@ -249,6 +249,10 @@ sh scripts/preflight.sh        # 只读核对，任何 FAIL 都要处理
   ```
   它只在 `rcctl ls on` 且 `rcctl check` 失败时用 `rcctl -f start` 拉起，并把「不在运行 → 已恢复」或「没起来（附 rcctl 输出）」写进 syslog；实测停掉服务后 6 秒内恢复。**经 `rcctl ls off` 禁用的服务它不会碰**。
 
+> 两个可复跑的现网验证脚本（都是有意的**手工**步骤，不进 CI）：
+> `scripts/verify-signals.sh` —— 验证信号取证（SIGHUP 记录且不退出、SIGTERM 记录来源、记账尾巴点名发送者、停机走完整）；
+> `scripts/verify-frp-interop.sh` —— 用**官方 frp 发行版**里的 frpc 打本机 frps（TCP 打到控制台、UDP 打到 STUN），改动 `remgr-frps/src/server.rs` 后应当跑一次：仓库内的测试和探针只能证明它和自己一致。
+
 ## 升级（替换二进制）
 
 ```sh
