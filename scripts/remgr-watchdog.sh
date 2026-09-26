@@ -129,6 +129,22 @@ if [ -f "$REMLOG" ]; then
         tail -6 | while IFS= read -r line; do
             log "  ran before it: ${line##*accounting: }" warning
         done
+    # The case the daemon cannot report itself: killed outright (SIGKILL is not
+    # catchable) or crashed — then its log has a start with no "stopped; exiting"
+    # after it, and the kernel's own accounting record for the process is the only
+    # trace. A full filesystem is what has done this here before.
+    if awk '/0\.1\.0 starting/{start=NR} /stopped; exiting/{stop=NR} END{ exit (start && (!stop || stop < start)) ? 0 : 1 }' "$REMLOG" 2>/dev/null; then
+        log "  it did not get to shut down (no 'stopped; exiting' after its last start): killed outright or crashed" warning
+        rec=$(lastcomm -f /var/account/acct 2>/dev/null | awk '$1 ~ /^remgr/ {print; exit}')
+        if [ -n "$rec" ]; then
+            log "  the kernel's record for it: $rec" warning
+            flags=$(printf '%s\n' "$rec" | awk '{print $2}')
+            case "$flags" in
+            *X*) log "  (flags contain X: terminated by a signal — a SIGKILL cannot be caught, so nothing inside could log it)" warning ;;
+            esac
+        fi
+        log "  check the disk first: a full filesystem has killed processes on this box before" warning
+    fi
 fi
 out=$("$rcctl" -f start "$name" 2>&1)
 rc=$?
