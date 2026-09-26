@@ -202,12 +202,19 @@ mod tests {
             log_file_previous(),
         ];
         let dirs = required_dirs();
+        // Read every path the assertions need *before* dropping the override:
+        // calling a platform function afterwards returns the unrelocated default,
+        // and comparing that against the relocated list is what made this test fail
+        // the first time it ever ran (CI only started running this crate's tests
+        // with the signal-provenance work).
+        let cert = cert_dir();
+        let config = default_config_path();
         std::env::remove_var("REMGR_HOME");
 
         for p in paths.iter().chain(dirs.iter()) {
             assert!(p.starts_with(&root), "{p:?} escaped REMGR_HOME ({root:?})");
         }
-        assert!(default_config_path().ends_with("config.toml"));
+        assert!(config.ends_with("config.toml"));
         assert!(log_file().ends_with("remgr.log"));
         assert!(log_file_previous().ends_with("remgr.log.1"));
 
@@ -216,7 +223,7 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), dirs.len(), "duplicate directory in {dirs:?}");
-        assert!(dirs.contains(&cert_dir()), "cert dir is not prepared");
-        assert!(!default_config_path().starts_with(cert_dir()));
+        assert!(dirs.contains(&cert), "cert dir is not prepared: {cert:?} not in {dirs:?}");
+        assert!(!config.starts_with(&cert), "the config file lives inside the cert dir");
     }
 }
