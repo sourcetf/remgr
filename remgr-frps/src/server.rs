@@ -1134,7 +1134,7 @@ async fn start_tcp_proxy(state: Arc<ControlState>, np: msg::NewProxy, ptk: Cance
             return;
         }
     };
-    let listener = match tokio::net::TcpListener::bind(addr).await {
+    let listener = match retry_while_port_busy(addr, "tcp", || tokio::net::TcpListener::bind(addr)).await {
         Ok(l) => l,
         Err(e) => {
             state.shared.release_proxy_port("tcp", remote_port, &np.proxy_name);
@@ -1263,6 +1263,51 @@ where
     let _ = w.shutdown().await;
 }
 
+/// Bind a proxy port, retrying briefly while the port is merely busy.
+///
+/// A client that reconnects re-registers its proxies while the old ones are still
+/// being torn down, and the old listener can hold the port for a few milliseconds
+/// past its own "closed" log line (the listener task, its work connections and the
+/// tunnel each hold a clone). Binding once rejected the proxy permanently —
+/// neither side retries — so the proxy stayed dead after any reconnect.
+/// `examples/frpc_probe --self-test` caught it as a flake, one run in several,
+/// which is what it looks like in the field too: the proxy comes back for TCP and
+/// not for UDP, or the other way round.
+///
+/// Only `AddrInUse` is retried: a port held by something else, or an address this
+/// host does not have, is a real error and is reported at once.
+async fn retry_while_port_busy<T, F, Fut>(
+    addr: std::net::SocketAddr,
+    what: &str,
+    bind: F,
+) -> std::io::Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<T>>,
+{
+    const ATTEMPTS: usize = 20;
+    const STEP: std::time::Duration = std::time::Duration::from_millis(50);
+    let mut last: Option<std::io::Error> = None;
+    for attempt in 0..ATTEMPTS {
+        match bind().await {
+            Ok(bound) => {
+                if attempt > 0 {
+                    tracing::debug!(
+                        "frps {what} {addr}: bound after {attempt} retries (the previous registration was still releasing the port)"
+                    );
+                }
+                return Ok(bound);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                last = Some(e);
+                tokio::time::sleep(STEP).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("bind: no attempt made")))
+}
+
 async fn start_udp_proxy(state: Arc<ControlState>, np: msg::NewProxy, ptk: CancellationToken) {
     let cfg = state.shared.cfg.read().await.clone();
     let Some(remote_port) = remote_port_of(&np) else {
@@ -1289,7 +1334,7 @@ async fn start_udp_proxy(state: Arc<ControlState>, np: msg::NewProxy, ptk: Cance
             return;
         }
     };
-    let socket = Arc::new(match tokio::net::UdpSocket::bind(addr).await {
+    let socket = Arc::new(match retry_while_port_busy(addr, "udp", || tokio::net::UdpSocket::bind(addr)).await {
         Ok(s) => s,
         Err(e) => {
             state.shared.release_proxy_port("udp", remote_port, &np.proxy_name);
