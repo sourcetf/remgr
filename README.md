@@ -242,7 +242,7 @@ sh scripts/preflight.sh        # 只读核对，任何 FAIL 都要处理
 - **fd 上限必须显式给**：rc.subr 通过 `su -fl -c <登录类>` 启动，脚本里写 `ulimit -n` 会被丢弃，因此默认落到系统的 `daemon` 类：`openfiles-cur=128`（`kern.maxfiles=7030`，系统天花板远不是瓶颈）。以同样方式启动真实二进制作压力测试：把 200 条连接**挂着不发请求**，进程涨到 128 个 fd 就停住，此时新的控制台请求**完全无响应**（日志里也没有任何报错），客户端断开后才恢复；换成 `openfiles-cur=1024` 同样 200 条全部服务。装 `scripts/login.conf.d/remgr` 后 rc.subr 会按名字选中 `remgr` 类（`daemon_class=remgr`）。注意 login.conf 取**首个**同名属性，覆盖项必须写在 `:tc=daemon:` **之前**（把两行交换就退回 128，实测过）。
 - 装完 `rcctl restart remgr` 应在 1 秒内返回 0；`/etc/rc.d/remgr` 与仓库副本必须逐字节一致（`preflight.sh` 用 md5 核对，这个文件曾经漂移过）。
 - **没有任何东西会自动拉起重挂的服务**（OpenBSD 的 rc.subr 不托管前台守护进程）。实测过：2026-09-26 remgr 三次收到外部 SIGTERM 后都按设计干净退出（日志里模块逐个停止），此后前两次分别**停了 4 小时 31 分、1 小时 43 分**才被人工拉起，第三次（看门狗装好后）49 秒就被拉回——前两次的停机期间没有任何通知。
-  若要它自愈，用仓库里的 `scripts/remgr-watchdog.sh`（默认**不安装**：看门狗和运维主动停机是冲突的）。它的动作写进 `/var/log/remgr/watchdog.log`（外加 syslog），一行一次，便于回答「多久重启一次、从什么时候开始不对劲」：
+  若要它自愈，用仓库里的 `scripts/remgr-watchdog.sh`（默认**不安装**：看门狗和运维主动停机是冲突的）。它的动作写进 `/var/log/remgr/watchdog.log`（外加 syslog），一行一次，便于回答「多久重启一次、从什么时候开始不对劲」；发现服务不在时，它还会把停机前的证据行（信号来源 + 记账尾巴）**抄进同一个文件**，所以「谁杀了服务」在看门狗日志里就能看到：
   ```sh
   install -m 555 scripts/remgr-watchdog.sh /etc/remgr/remgr-watchdog.sh
   crontab -l > /tmp/ct 2>/dev/null; echo '*/2 * * * * /etc/remgr/remgr-watchdog.sh' >> /tmp/ct; crontab /tmp/ct

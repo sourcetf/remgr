@@ -38,6 +38,9 @@
 #     operator who disabled the service at boot meant it.
 #   * it also bounds /var/account/acct (16 MiB), because remgr reads that file's
 #     tail when it is signalled and OpenBSD's daily(8) never truncates it.
+#   * when it finds the service down, it copies the last signal/accounting lines of
+#     remgr's log into its own: nothing is logged while the service is down, so
+#     those lines *are* the shutdown, and they name what killed it.
 set -u
 umask 077
 
@@ -91,6 +94,23 @@ if "$rcctl" check "$name" > /dev/null 2>&1; then
 fi
 
 log "$name is not running — starting it" warning
+# Why it stopped, in this file, before anything else is written to remgr's log:
+# nothing is logged while the service is down, so the last lines of its log *are*
+# the shutdown. When it was killed by a signal they name the signal, and (through
+# the kernel's accounting tail) the commands that ran around it — the two things an
+# operator has to see without going hunting. Two separate reads on purpose: the
+# accounting block is long enough to push the signal line out of a single tail.
+REMLOG=/var/log/remgr/remgr.log
+if [ -f "$REMLOG" ]; then
+    tail -120 "$REMLOG" 2>/dev/null | grep -aE "received with no sender|received from pid" | tail -2 |
+        while IFS= read -r line; do log "  how it ended: $line" warning; done
+    # dedupe: the daemon reads the accounting file twice on purpose (the sender's
+    # own record is only written when it exits), so a record can appear in both
+    tail -120 "$REMLOG" 2>/dev/null | grep -a "accounting: " | awk -F"accounting: " 'NF>1 && !seen[$2]++' |
+        tail -6 | while IFS= read -r line; do
+            log "  ran before it: ${line##*accounting: }" warning
+        done
+fi
 out=$("$rcctl" -f start "$name" 2>&1)
 rc=$?
 sleep 5
