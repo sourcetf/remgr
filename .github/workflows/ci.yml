@@ -314,9 +314,10 @@ jobs:
           # console to HTTPS, so curl -k is used. Windows ships curl.exe.
           # REMGR_HOME pins the whole layout to a scratch tree, which is what
           # proves the ported paths (ProgramData/lib, run, log) work here.
-          $home = Join-Path $env:RUNNER_TEMP "remgr-win"
-          New-Item -ItemType Directory -Force -Path $home | Out-Null
-          $env:REMGR_HOME = $home
+          # NB: not `$home` — PowerShell's $HOME is a read-only automatic variable.
+          $runRoot = Join-Path $env:RUNNER_TEMP "remgr-win"
+          New-Item -ItemType Directory -Force -Path $runRoot | Out-Null
+          $env:REMGR_HOME = $runRoot
 
           .\target\release\remgr.exe --version
 
@@ -341,12 +342,12 @@ jobs:
 
           [frpc]
           enabled = false
-          "@ | Set-Content -Path (Join-Path $home 'config.toml') -Encoding ascii
+          "@ | Set-Content -Path (Join-Path $runRoot 'config.toml') -Encoding ascii
 
           $p = Start-Process -FilePath .\target\release\remgr.exe `
-                 -ArgumentList '--config', (Join-Path $home 'config.toml') `
-                 -PassThru -RedirectStandardOutput (Join-Path $home 'out.log') `
-                 -RedirectStandardError (Join-Path $home 'err.log')
+                 -ArgumentList '--config', (Join-Path $runRoot 'config.toml') `
+                 -PassThru -RedirectStandardOutput (Join-Path $runRoot 'out.log') `
+                 -RedirectStandardError (Join-Path $runRoot 'err.log')
           try {
             $ok = $false
             for ($i = 0; $i -lt 60; $i++) {
@@ -362,18 +363,18 @@ jobs:
                       -H 'content-type: application/json' -d $body
             if ($code -ne '200') { throw "login returned $code" }
 
-            $log = Get-Content -Raw (Join-Path $home 'out.log')
+            $log = Get-Content -Raw (Join-Path $runRoot 'out.log')
             if ($log -notmatch 'installed the default login admin') { throw "no default login in the log" }
             if ($log -notmatch 'generated a P-384 self-signed certificate') { throw "no first-boot certificate" }
             foreach ($d in @('', 'ssl', 'log', 'run')) {
-              $p2 = Join-Path $home $d
-              if (-not (Test-Path $p2)) { throw "missing $p2" }
+              $sub = Join-Path $runRoot $d
+              if (-not (Test-Path $sub)) { throw "missing $sub" }
             }
-            if (-not (Test-Path (Join-Path $home 'run\initial_password'))) { throw "no bootstrap password file" }
-            if (-not (Test-Path (Join-Path $home 'ssl\console_cert.pem'))) { throw "certificate not under the home" }
+            if (-not (Test-Path (Join-Path $runRoot 'run\initial_password'))) { throw "no bootstrap password file" }
+            if (-not (Test-Path (Join-Path $runRoot 'ssl\console_cert.pem'))) { throw "certificate not under the run root" }
 
             Write-Host "windows smoke test: started, generated its certificate, served the console, logged in"
-            Get-ChildItem -Recurse $home | Select-Object -First 12 FullName | Format-Table -AutoSize
+            Get-ChildItem -Recurse $runRoot | Select-Object -First 12 FullName | Format-Table -AutoSize
           } finally {
             if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
           }
