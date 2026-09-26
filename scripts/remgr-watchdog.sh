@@ -41,6 +41,10 @@
 #   * when it finds the service down, it copies the last signal/accounting lines of
 #     remgr's log into its own: nothing is logged while the service is down, so
 #     those lines *are* the shutdown, and they name what killed it.
+#   * it raises one box-level alarm: under 256 MiB free on / — the condition that
+#     has killed processes here before, and that also makes the kernel stop writing
+#     accounting records. That alarm fires even when the service is disabled at
+#     boot, because a full filesystem is not the service's private problem.
 set -u
 umask 077
 
@@ -58,6 +62,21 @@ log() {
     "$logger" -t "$tag" -p "daemon.$prio" "$msg"
     printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$msg" >> "$logfile" 2>/dev/null || true
 }
+
+# Loudly if the filesystem the service writes to is nearly full. This box has been
+# killed by a full root filesystem before, and a full one also makes the kernel
+# stop writing accounting records (so the forensics go stale silently) — the one
+# condition worth waking an operator up for, and cheap to check here.
+DISK_WARN_MIB=256
+avail_kib=$(df -k / | awk 'NR==2{print $4}')
+case "$avail_kib" in
+''|*[!0-9]*) : ;;
+*)
+    if [ "$avail_kib" -lt $((DISK_WARN_MIB * 1024)) ]; then
+        log "only $((avail_kib / 1024)) MiB free on / — the kernel kills processes and stops writing accounting records when it fills" err
+    fi
+    ;;
+esac
 
 # Bound the kernel's accounting file.
 #
