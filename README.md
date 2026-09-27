@@ -147,6 +147,10 @@ sh scripts/preflight.sh                                             # 逐项核�
 
 ## 控制台可配置项（控制台自身）
 
+> `/var/run/remgr/initial_password` 只在**首次启动写入一次**（那时口令哈希还是空的），它记录的是**引导口令**；
+> 在控制台里改过密码之后这个文件就过时了（这也是为什么 `scripts/verify-signals.sh` 用 `REMRG_PASSWORD` 或该文件、并且在 401 时明确说明而不是报失败）。
+
+
 系统页可直接修改控制台端口、TLS 开关与证书路径、会话有效期，并支持：
 改控制台密码、生成/上传控制台与各服务证书、下载日志（优先取 `/var/log/remgr/remgr.log`，含重启前历史）。
 

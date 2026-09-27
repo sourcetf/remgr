@@ -84,19 +84,39 @@ rcctl check remgr && echo "  running: OK" || { echo "  FAILED to restart"; exit 
 
 echo
 echo "== 5. the console still serves, and logs =="
+# Never assume the documented default password: a deployment is expected to change
+# it, and the bootstrap file is only current until the first change in the console.
+# REMRG_PASSWORD wins; otherwise fall back to that file; otherwise skip the
+# authenticated checks rather than failing the whole verification.
+PW=${REMRG_PASSWORD:-$(cat /var/run/remgr/initial_password 2>/dev/null || true)}
 curl -ks -o /dev/null -w "  GET /       -> %{http_code}\n" --max-time 10 https://127.0.0.1:9443/
-curl -ks -o /dev/null -w "  POST login  -> %{http_code}\n" --max-time 10 \
-	-X POST https://127.0.0.1:9443/api/login \
-	-H 'content-type: application/json' -d '{"username":"admin","password":"admin"}'
+if [ -n "$PW" ]; then
+	code=$(curl -ks -o /dev/null -w '%{http_code}' --max-time 10 \
+		-X POST https://127.0.0.1:9443/api/login \
+		-H 'content-type: application/json' -d "{\"username\":\"admin\",\"password\":\"$PW\"}")
+	echo "  POST login  -> $code"
+	if [ "$code" = 401 ]; then
+		echo "     (401 is not a failure here: the console password was changed since"
+		echo "      this box was installed, so pass REMRG_PASSWORD to check that view)"
+	fi
+else
+	echo "  POST login  -> skipped (no REMRG_PASSWORD and no bootstrap file)"
+fi
 echo "  listeners:"
 netstat -na -f inet 2>/dev/null | grep -E 'LISTEN' | grep -E '3478|5349|9443|7000|11010|21115|21116|21117' | awk '{print "   ", $4}' | sort -u
 
 echo
 echo "== 6. modules after the round trip (needs a session: /api/status is not public) =="
-J=/tmp/vs.cookies
-rm -f "$J"
-curl -ks --max-time 10 -c "$J" -o /dev/null 	-X POST https://127.0.0.1:9443/api/login 	-H 'content-type: application/json' -d '{"username":"admin","password":"admin"}'
-curl -ks --max-time 10 -b "$J" https://127.0.0.1:9443/api/status | cut -c1-800
-rm -f "$J"
+if [ -z "$PW" ]; then
+	echo "  skipped: no password available (set REMRG_PASSWORD)"
+else
+	J=/tmp/vs.cookies
+	rm -f "$J"
+	curl -ks --max-time 10 -c "$J" -o /dev/null \
+		-X POST https://127.0.0.1:9443/api/login \
+		-H 'content-type: application/json' -d "{\"username\":\"admin\",\"password\":\"$PW\"}"
+	curl -ks --max-time 10 -b "$J" https://127.0.0.1:9443/api/status | cut -c1-800
+	rm -f "$J"
+fi
 echo
 echo "== done =="
