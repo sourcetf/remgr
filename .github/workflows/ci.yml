@@ -314,50 +314,63 @@ jobs:
           echo "smoke test: started, generated its certificate, served the console, logged in, exited on SIGTERM"
           echo "--- layout ---"; find "$home" -maxdepth 2 | sed "s|$home|REMGR_HOME|"
 
-      - name: Verify the Npcap dependency is real (the binary needs it to load)
+      - name: The systemd unit is valid (Linux service glue)
+        if: runner.os == 'Linux'
+        run: |
+          # The Linux counterpart of rc.d + login.conf.d, shipped in the repo so a
+          # deployment does not have to invent it: the unit carries Restart=always
+          # (the watchdog's job on OpenBSD, native here), LimitNOFILE=1024 (the
+          # login-class lesson) and the filesystem hardening that stands in for
+          # unveil. `systemd-analyze verify` parses it and checks that ExecStart is
+          # an existing executable, so the built binary is installed first — that is
+          # also what a real deployment does.
+          sudo install -m 755 target/release/remgr /usr/local/bin/remgr
+          sudo install -m 644 scripts/systemd/remgr.service /etc/systemd/system/remgr.service
+          systemd-analyze verify /etc/systemd/system/remgr.service
+          echo "systemd unit: parsed and verified"
+          systemctl cat remgr >/dev/null 2>&1 || true
+          # the properties the unit promises, checked against systemd's own view
+          systemd-analyze security --offline=true /etc/systemd/system/remgr.service 2>/dev/null | tail -3 || true
+
+      - name: The Npcap imports are delay-loaded (so the binary starts without it)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # pnet_sys (which EasyTier's faketcp netfilter needs on Windows) links
-          # Npcap's *import* library, so Packet.dll is resolved by the loader
-          # before main() runs: without it the process dies with 0xC0000135 and
-          # cannot even print --version. That is a real prerequisite for the
-          # Windows build, and this check turns it from a claim into a test —
-          # the import name lives in the PE import table as plain ASCII.
+          # The dependency is real — pnet_sys links Npcap's import library for
+          # EasyTier's faketcp netfilter — but remgr/build.rs marks Packet.dll and
+          # wpcap.dll as delay-loaded, so the Windows loader does NOT resolve them
+          # before main() runs.
+          #
+          # This runner has no Npcap installed, which makes `--version` the decisive
+          # test: before delay-loading it exited with 0xC0000135
+          # (STATUS_DLL_NOT_FOUND); now it has to print a version. That property is
+          # what lets the relay manager run on Windows without a packet driver —
+          # only the EasyTier *node* needs one, and the module says so in words if
+          # it is missing.
           $exe = "target\release\remgr.exe"
           if (-not (Test-Path $exe)) { throw "$exe was not produced" }
-          $text = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($exe))
-          if ($text -notmatch 'Packet\.dll') {
-            throw "remgr.exe does not import Packet.dll — either the faketcp/PnetTun path changed upstream (in which case Windows no longer needs Npcap: update the docs and enable the runtime smoke test below) or the link silently dropped it"
+          & $exe --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "remgr.exe --version exited $LASTEXITCODE — the Npcap import is not delay-loaded any more (see remgr/build.rs)"
           }
-          Write-Host "remgr.exe imports Packet.dll -> Npcap is required at load time on Windows"
-          Write-Host "(syscall: the loader resolves normal imports before main(), so this holds for --help too)"
+          $text = [System.Text.Encoding]::ASCII.GetString([System.IO.File]::ReadAllBytes($exe))
+          if ($text -match 'Packet\.dll') {
+            Write-Host "Packet.dll is still referenced (delay-load table) and --version ran on a runner without Npcap"
+          } else {
+            Write-Host "::notice::remgr.exe no longer references Packet.dll at all — upstream dropped the dependency, so the delay-load lines in remgr/build.rs can go"
+          }
 
-      - name: Smoke test — it starts, serves the console and reports its layout
+      - name: Smoke test — starts, serves the console, stops on request
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # This runs only when Npcap is actually present. It is NOT installed
-          # here on purpose: the free Npcap installer has no unattended mode —
-          # Npcap's own user guide says "/S (Silent install, Npcap OEM only)" —
-          # so a CI step cannot install the driver without accepting a licence on
-          # the operator's behalf. Rather than pretend, the step reports that it
-          # could not run; install Npcap (https://npcap.com/#download) on a
-          # machine and this same sequence works there.
-          $packetDll = @(
-            (Join-Path $env:SystemRoot "System32\Npcap\Packet.dll"),
-            (Join-Path $env:SystemRoot "SysWOW64\Npcap\Packet.dll"),
-            (Join-Path $env:SystemRoot "System32\Packet.dll")
-          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
-
-          if (-not $packetDll) {
-            $msg = "runtime smoke test NOT RUN: Npcap is absent and its free installer cannot be run unattended (silent mode is OEM-only). The build, link, unit tests and the import check above all passed; install Npcap and re-run this job to exercise the service itself."
-            Write-Host "::notice title=Windows runtime smoke test skipped::$msg"
-            Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "### Windows runtime smoke test: skipped`n`n$msg"
-            exit 0
-          }
-          Write-Host "Npcap found: $packetDll"
-
+          # This runs unconditionally now: the Npcap imports are delay-loaded (see
+          # remgr/build.rs), so the binary starts on a runner without Npcap and
+          # this is a real runtime check rather than a conditional one. It ends by
+          # asking the daemon to stop the way a service wrapper that cannot send
+          # Ctrl-C would — a `stop` file in the run directory — and asserts that
+          # the graceful shutdown ran, which is the Windows half of the
+          # cross-platform work (the unix half is SIGTERM).
           # The first boot mints a self-signed certificate and switches the
           # console to HTTPS, so curl -k is used. Windows ships curl.exe.
           # REMGR_HOME pins the whole layout to a scratch tree, which is what
@@ -422,6 +435,21 @@ jobs:
             if (-not (Test-Path (Join-Path $runRoot 'ssl\console_cert.pem'))) { throw "certificate not under the run root" }
 
             Write-Host "windows smoke test: started, generated its certificate, served the console, logged in"
+
+            # Graceful stop on request: the same thing Ctrl-C (or NSSM's "Console"
+            # stop method) asks for, spelled as a file so any wrapper can do it.
+            New-Item -ItemType File -Force -Path (Join-Path $runRoot 'run\stop') | Out-Null
+            $stopped = $false
+            for ($i = 0; $i -lt 40; $i++) {
+              if ($p.HasExited) { $stopped = $true; break }
+              Start-Sleep -Milliseconds 250
+            }
+            if (-not $stopped) { throw "the stop file did not stop the daemon within 10s" }
+            $log = Get-Content -Raw (Join-Path $runRoot 'out.log')
+            if ($log -notmatch 'stop file .* found and removed') { throw "no stop-file line in the log" }
+            if ($log -notmatch 'stopped; exiting') { throw "the daemon exited without running its shutdown (exit code $($p.ExitCode))" }
+            Write-Host "graceful stop on request: the daemon stopped itself, logged it and exited cleanly"
+
             Get-ChildItem -Recurse $runRoot | Select-Object -First 12 FullName | Format-Table -AutoSize
           } finally {
             if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }

@@ -365,35 +365,175 @@ mod imp {
 
 #[cfg(not(unix))]
 mod imp {
-    /// Never produced: signals are a unix concept, and on Windows this daemon is
-    /// stopped through the service manager instead.
+    //! Shutdown requests on Windows.
+    //!
+    //! Windows has no signals. A console application is asked to stop with a
+    //! *console control event* (Ctrl-C, Ctrl-Break, the console window closing, a
+    //! logoff or a shutdown), and a Windows service is asked through its service
+    //! control handler. ReMgr is started by a wrapper — NSSM and friends — and the
+    //! wrapper's "Console" stop method sends exactly Ctrl-C, so handling these
+    //! events is what gives Windows the same graceful, module-by-module shutdown
+    //! the unix side has. Returning TRUE from the handler means "handled": the
+    //! default action for Ctrl-C is to terminate the process on the spot.
+    //!
+    //! A wrapper that can only kill the process is still workable: dropping an
+    //! empty file named `stop` into the run directory (see `platform::run_dir`,
+    //! `%ProgramData%\ReMgr\run` by default) asks for the same graceful stop. That
+    //! is polled once a second and deliberately the last resort spelled out in the
+    //! README.
+    //!
+    //! The two kernel32 symbols and one handler signature are declared here rather
+    //! than pulled in with a crate; this is all that is needed.
+
+    use std::io;
+    use std::sync::OnceLock;
+
+    use tokio::sync::mpsc;
+
+    type Bool = i32;
+    type Dword = u32;
+    const TRUE: Bool = 1;
+    // i32 rather than Dword: these are used as match patterns, and a cast
+    // expression is not a pattern in Rust — the handler casts the event once.
+    const CTRL_C_EVENT: i32 = 0;
+    const CTRL_BREAK_EVENT: i32 = 1;
+    const CTRL_CLOSE_EVENT: i32 = 2;
+    const CTRL_LOGOFF_EVENT: i32 = 5;
+    const CTRL_SHUTDOWN_EVENT: i32 = 6;
+    /// How often the stop file is looked for. One second is plenty for a request
+    /// that a human or a service wrapper makes, and costs a `stat` per second.
+    const STOP_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetConsoleCtrlHandler(
+            handler: Option<extern "system" fn(Dword) -> Bool>,
+            add: Bool,
+        ) -> Bool;
+    }
+
+    /// One shutdown request, from either mechanism.
     #[derive(Debug, Clone, Copy)]
     pub struct Termination {
+        /// The console control event, or 0 for the stop file.
         pub signal: i32,
         pub sender_pid: i32,
         pub sender_uid: u32,
+        /// Doubles as the event kind for the console path (`signal` and `code` are
+        /// the same number there, like `si_signo`/`si_code` on the unix side).
         pub code: i32,
     }
 
     impl Termination {
         pub fn name(&self) -> &'static str {
-            "signal"
+            match self.code {
+                CTRL_C_EVENT => "CTRL_C_EVENT",
+                CTRL_BREAK_EVENT => "CTRL_BREAK_EVENT",
+                CTRL_CLOSE_EVENT => "CTRL_CLOSE_EVENT",
+                CTRL_LOGOFF_EVENT => "CTRL_LOGOFF_EVENT",
+                CTRL_SHUTDOWN_EVENT => "CTRL_SHUTDOWN_EVENT",
+                _ => "stop request",
+            }
         }
+
+        /// Everything this platform can deliver means "stop": there is no reload
+        /// signal to distinguish, and a console closing is not a reason to keep
+        /// running headless.
         pub fn stops(&self) -> bool {
-            false
+            true
         }
+
         pub fn describe(&self) -> String {
-            String::new()
+            match self.signal {
+                0 => "stop file found in the run directory: stopping the modules".to_string(),
+                _ => format!(
+                    "{} received (Windows console control): stopping the modules",
+                    self.name()
+                ),
+            }
         }
     }
 
-    pub fn install() -> std::io::Result<()> {
+    static CHANNEL: OnceLock<tokio::sync::Mutex<mpsc::UnboundedReceiver<Termination>>> =
+        OnceLock::new();
+    static NOTIFY: OnceLock<mpsc::UnboundedSender<Termination>> = OnceLock::new();
+
+    extern "system" fn console_control(event: Dword) -> Bool {
+        // Runs on a thread the system creates. Keep it to a channel send.
+        if let Some(tx) = NOTIFY.get() {
+            let code = event as i32;
+            let _ = tx.send(Termination { signal: code, sender_pid: 0, sender_uid: 0, code });
+        }
+        TRUE
+    }
+
+    /// The stop file, if someone dropped one in the run directory. Removing it is
+    /// part of answering it, so a later start is not stopped immediately.
+    fn take_stop_file() -> bool {
+        let path = crate::platform::run_dir().join("stop");
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                tracing::warn!("stop file {} found and removed", path.display());
+                true
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+            Err(e) => {
+                tracing::debug!("stop file {} could not be removed: {e}", path.display());
+                false
+            }
+        }
+    }
+
+    /// Install the console control handler and start watching for the stop file.
+    /// Safe to call more than once, as `main` does (before start-up and again once
+    /// the modules are up).
+    pub fn install() -> io::Result<()> {
+        if CHANNEL.get().is_some() {
+            return Ok(());
+        }
+        let (tx, rx) = mpsc::unbounded_channel();
+        let _ = CHANNEL.set(tokio::sync::Mutex::new(rx));
+        let sender = tx.clone();
+        let _ = NOTIFY.set(tx);
+
+        // SAFETY: the handler is a plain `extern "system" fn` that stays alive for
+        // the process, and adding it twice is prevented by the guard above.
+        if unsafe { SetConsoleCtrlHandler(Some(console_control), TRUE) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        tracing::debug!(
+            "windows: console control handler installed (Ctrl-C/Ctrl-Break/close stop cleanly; \
+             a `stop` file in the run directory does the same)"
+        );
+
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(STOP_POLL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                if take_stop_file() {
+                    let _ = sender.send(Termination {
+                        signal: 0,
+                        sender_pid: 0,
+                        sender_uid: 0,
+                        code: 0,
+                    });
+                    return;
+                }
+            }
+        });
         Ok(())
     }
 
-    /// Never resolves: nothing sends this process a signal on this platform.
+    /// The next shutdown request, from the console handler or the stop file.
     pub async fn next() -> Termination {
-        std::future::pending().await
+        let channel = CHANNEL
+            .get()
+            .expect("signals::install() must run before signals::next()");
+        let mut rx = channel.lock().await;
+        rx.recv()
+            .await
+            .unwrap_or(Termination { signal: 0, sender_pid: 0, sender_uid: 0, code: 0 })
     }
 }
 

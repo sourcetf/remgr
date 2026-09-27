@@ -316,6 +316,12 @@ async fn run(config_path: std::path::PathBuf) -> Result<()> {
 /// missing or unreadable accounting file is reported in one line and never stops
 /// the shutdown — the signal itself is already recorded by then.
 fn trace_recent_commands(wanted: usize, when: &str) {
+    // Only OpenBSD has an accounting file to read (and it is the point of the
+    // exercise there); saying "cannot read /var/account/acct" on Windows would be
+    // noise in the shutdown log.
+    if !cfg!(unix) {
+        return;
+    }
     let path = Path::new(acct::ACCT_PATH);
     match acct::recent(path, wanted) {
         Ok(entries) if entries.is_empty() => tracing::warn!(

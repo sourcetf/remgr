@@ -499,6 +499,20 @@ impl super::ServiceModule for EasyTierModule {
         //    (and shows up in the dashboard's node events).
         let mut node_instance = None;
         if let Some(loader) = node_loader {
+            // Windows first: the node is the one part of ReMgr that needs a packet
+            // driver (Npcap's Packet.dll through pnet, plus wintun for the
+            // interface). Those imports are delay-loaded so the service starts
+            // without them — which means a missing driver would otherwise surface
+            // as a structured exception inside pnet, i.e. a crashed daemon. Say it
+            // in words instead, and let the relay modules keep running.
+            #[cfg(windows)]
+            if let Some(missing) = missing_windows_driver() {
+                anyhow::bail!(
+                    "{missing}: the EasyTier node needs Npcap (https://npcap.com) for its \
+                     packet path and wintun for the interface. Install both, or turn off \
+                     「启用本地节点」 — every other module works without them."
+                );
+            }
             match manager.run_network_instance(loader, easytier::common::config::ConfigFileControl::STATIC_CONFIG) {
                 Ok(id) => {
                     tracing::info!("easytier node instance started: {id}");
@@ -544,4 +558,29 @@ impl super::ServiceModule for EasyTierModule {
     async fn apply_config(&self) -> anyhow::Result<()> {
         super::restart_if_running(self).await
     }
+}
+
+/// Which driver the EasyTier node is missing on Windows, if any.
+///
+/// `Packet.dll` and `wpcap.dll` come from Npcap; `wintun.dll` from the driver
+/// EasyTier uses for the interface. The imports are delay-loaded (see the crate's
+/// `build.rs`), so the service starts without them and this is what turns "would
+/// crash inside pnet" into a sentence an operator can act on.
+#[cfg(windows)]
+fn missing_windows_driver() -> Option<String> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LoadLibraryA(name: *const u8) -> *mut core::ffi::c_void;
+    }
+    for dll in ["Packet.dll", "wpcap.dll", "wintun.dll"] {
+        let mut name: Vec<u8> = dll.as_bytes().to_vec();
+        name.push(0);
+        // SAFETY: a NUL-terminated name. The handle is deliberately not freed:
+        // the library stays loaded for the process, which is what pnet wants.
+        let handle = unsafe { LoadLibraryA(name.as_ptr()) };
+        if handle.is_null() {
+            return Some(format!("{dll} is not installed"));
+        }
+    }
+    None
 }

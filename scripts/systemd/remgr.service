@@ -1,0 +1,59 @@
+# ReMgr as a systemd service (Linux).
+#
+#     install -m 644 scripts/systemd/remgr.service /etc/systemd/system/remgr.service
+#     systemctl daemon-reload && systemctl enable --now remgr
+#
+# This unit carries the same operational decisions the OpenBSD deployment makes in
+# rc.d + login.conf.d, because the lessons behind them were not platform-specific:
+#
+#   * Restart=always is what rc.subr does *not* do. On OpenBSD the optional
+#     scripts/remgr-watchdog.sh fills that gap; here systemd does it natively.
+#   * LimitNOFILE=1024 is the counterpart of scripts/login.conf.d/remgr: the Linux
+#     default soft limit is 1024 for root but 1024 is also what this daemon needs
+#     at a minimum — measured on the OpenBSD box, 200 concurrent console
+#     connections stall the daemon when the soft limit is 128, while it serves all
+#     200 with 1024. Every TURN allocation holds a relay socket, every frps proxy
+#     connection two, and every console session one.
+#   * the hardening block is the closest Linux equivalent of unveil: the service
+#     sees the network and its own directories, and the rest of the filesystem is
+#     read-only. pledge has no counterpart — a seccomp allowlist would have to
+#     cover every syscall the vendored EasyTier/RustDesk code makes, which is a
+#     promise nobody can keep across upstream upgrades. That is why the OpenBSD
+#     sandbox is described as a platform capability, not a feature ported here.
+[Unit]
+Description=ReMgr relay manager (EasyTier center, STUN/TURN, RustDesk relay, frp)
+Documentation=https://github.com/sourcetf/remgr
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/remgr --config /etc/remgr/config.toml
+Restart=always
+RestartSec=5
+
+# file descriptors: see the comment above
+LimitNOFILE=1024
+
+# the daemon writes and rotates its own log; stderr goes to the journal, which is
+# where `remgr: fatal: ...` from a failed start shows up
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=remgr
+
+# --- filesystem and privilege hardening (the unveil analogue) ---
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/etc/remgr /var/lib/remgr /var/log/remgr /var/run/remgr /var/db/remgr
+
+# The EasyTier center node brings up a TUN interface, which needs CAP_NET_ADMIN;
+# its faketcp netfilter uses AF_PACKET, which needs CAP_NET_RAW. The relay modules
+# (STUN/TURN, RustDesk, frps/frpc, easytier-web) need neither — if you run with
+# `[easytier] node_enabled = false`, both lines can be removed.
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target
