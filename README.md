@@ -59,22 +59,23 @@ ReMgr 以 **OpenBSD 为首要目标**（pledge/unveil 沙箱、rc.d、login.conf
 
 | | OpenBSD | Linux | Windows |
 |---|---|---|---|
-| 沙箱 | `pledge` + `unveil`（见下节） | 无（代码里已 `#[cfg]` 关掉） | 无 |
+| 沙箱 | `pledge` + `unveil`（见下节） | 无 pledge（平台没有）；systemd 单元提供文件系统等价物（见下） | 无 |
 | 配置/数据/日志/运行目录 | `/etc/remgr`、`/var/lib/remgr`、`/var/log/remgr`、`/var/run/remgr` | 同左（FHS） | `%ProgramData%\ReMgr`（`config.toml`、`ssl`、`lib`、`log`、`run`） |
-| 服务管理 | `rc.d` + `login.conf.d`（随仓库提供） | 自备 systemd 单元（未随仓库提供） | 自备服务包装器（NSSM 等，未随仓库提供） |
-| EasyTier 中心节点所需的 TUN | `tun(4)`，开箱可用 | `/dev/net/tun`，需要权限 | 需要安装 **wintun 驱动** |
-| 构建期额外依赖 | `llvm19`（libclang）、`protobuf`（protoc） | 同左（libclang-dev、protobuf-compiler、libprotobuf-dev） | LLVM、protoc，以及 **WDK** 提供的 `Packet.lib`（链接期，见下） |
-| CI | 无 GitHub runner，**手动部署** | 出 release 产物 + **真实运行**冒烟测试 | 出 release 产物 + 导入校验（运行期冒烟测试需 Npcap，见下） |
+| 服务管理 | `rc.d` + `login.conf.d`（随仓库提供） | **`scripts/systemd/remgr.service`（随仓库提供，CI 校验）** | 自备服务包装器（NSSM 等），优雅停机见下 |
+| 优雅停机 | SIGTERM / SIGINT | 同左（SIGTERM） | 控制台控制事件（Ctrl-C/Ctrl-Break/关窗）**或** `run\stop` 文件 |
+| EasyTier 中心节点所需的 TUN | `tun(4)`，开箱可用 | `/dev/net/tun`，需要权限（单元已给 `CAP_NET_ADMIN`） | 需要 **wintun + Npcap**（仅节点需要） |
+| 构建期额外依赖 | `llvm19`（libclang）、`protobuf`（protoc） | 同左（libclang-dev、protobuf-compiler、libprotobuf-dev） | LLVM、protoc，以及 `Packet.lib`（WDK 或 Npcap SDK，见下） |
+| CI | 无 GitHub runner，**手动部署** | 出 release 产物 + **真实运行**冒烟测试 + systemd 单元校验 | 出 release 产物 + **真实运行**冒烟测试（延迟加载，无需 Npcap；含优雅停机断言） |
 
 - **目录布局由 `remgr/src/platform.rs` 单点决定**，可用环境变量 `REMGR_HOME` 整体重定位（CI 与冒烟测试就是这么跑的：重定位后配置在根目录，`ssl`/`lib`/`log`/`run` 在其下）。运维上意味着一台机器可以放多套互不干扰的实例。
 - **`%ProgramData%\ReMgr` 与 Windows 服务**：以管理员身份运行时该目录可写；若要让服务账户也能写，给该目录授权即可。
-- **Windows 上必须安装 Npcap，且这是启动前提（不只是 EasyTier）**：`remgr.exe` 在链接时用了 Npcap 的**导入库** `Packet.lib`，而 Windows 的加载器在 `main()` 之前就解析普通导入，因此**没有 `Packet.dll` 时整个二进制无法启动**——连 `remgr --version` 都会立刻以 `0xC0000135`（STATUS_DLL_NOT_FOUND）退出，与是否使用 EasyTier 无关。依赖链是：EasyTier 的 faketcp netfilter 用 `pnet`（`PnetTun` 是各平台的回退实现，见 `netfilter/mod.rs`），`pnet_sys` → Npcap。请从 <https://npcap.com/#download> 安装（Wireshark 用的也是它）。
-  - 这一点在 CI 里是**机器校验**的：Windows job 会扫描 `remgr.exe` 的导入表确认 `Packet.dll` 在其中；若上游某天不再需要它，该步骤会失败并提示可以启用运行期冒烟测试。
-  - **免费版 Npcap 没有静默安装**（其文档写明 `/S` 仅 Npcap OEM 可用），所以这是人工步骤；因此 CI 在装有 Npcap 的机器上才能跑 Windows 运行期冒烟测试，否则会明确报告「未运行」并说明原因，**不会假装通过**。
+- **Windows 的优雅停机**：Windows 没有信号，所以 `signals.rs` 在那边接的是**控制台控制事件**（Ctrl-C / Ctrl-Break / 控制台窗口关闭 / 注销 / 关机）——NSSM 的 “Console” 停止方式发的正是 Ctrl-C；处理器返回 `TRUE` 表示已接管，因此默认的"立刻终止"不会发生，停机会走和 unix 一样的**逐模块 `stop()` → `exit`**。**若包装器只会强杀进程**，还有一个兜底：往运行目录放一个名为 `stop` 的空文件（默认 `%ProgramData%\ReMgr\run\stop`），守护进程每秒检查并同样优雅停机（文件会被消费掉，不影响下次启动）。两条路径由 CI 的 Windows 冒烟测试断言：创建 `run\stop` → 进程自行退出 → 日志出现 `stop file ... found and removed` 与 `stopped; exiting`。
+- **Windows 上 Npcap 不再是启动前提**（改动在 `remgr/build.rs`）：`pnet_sys` 仍链接 Npcap 的导入库（EasyTier 的 faketcp netfilter 需要），但 `Packet.dll`/`wpcap.dll` 现在是**延迟加载**的 —— 加载器不再在 `main()` 之前解析它们，所以没装 Npcap 时**二进制照常启动**，五个模块里除 EasyTier 本地节点外都能用。CI 在**没有 Npcap 的 runner** 上用 `remgr --version` 加完整冒烟测试机器校验这一点（改动前那里以 `0xC0000135` 直接退出）。
+  - 真正需要驱动的是 EasyTier **节点**：启动节点前 `modules/easytier.rs` 会探测 `Packet.dll`/`wpcap.dll`/`wintun.dll`，缺哪个就用一句人话报错（而不是让延迟加载在 pnet 里抛异常把守护进程带崩），其余模块继续运行。驱动来源：<https://npcap.com/#download>、<https://www.wintun.net/>。
 - **Windows 构建期还需要 `Packet.lib`**：它随 **Windows Driver Kit** 提供（`Windows Kits\10\Lib\<版本>\km\x64\`，不在默认库搜索路径上），或从 **Npcap SDK**（`Lib\x64\Packet.lib`，约 345 KB）获取。CI 优先用前者、否则下载官方 SDK，并把目录加进链接搜索路径；手工构建遇到 `LNK1181: cannot open input file 'Packet.lib'` 时同样处理（`RUSTFLAGS=-L native=<目录>`）。
-- **Linux 不需要额外运行期依赖**：CI 在 Ubuntu 上构建并**真实运行**（启动 → 自签证书 → HTTPS 登录 → 目录布局 → SIGTERM 退出）全绿。
+- **Linux 不需要额外运行期依赖**，服务管理也随仓库提供：`scripts/systemd/remgr.service` 把三条跨平台经验写成声明 —— `Restart=always`（OpenBSD 上由 `remgr-watchdog.sh` 承担，这里由 systemd 原生承担）、`LimitNOFILE=1024`（等价于 `login.conf.d/remgr` 的 openfiles-cur：实测 128 时 200 个并发连接会让守护进程停摆）、以及 `ProtectSystem=strict` + `ReadWritePaths=` 这套**文件系统等价物**。pledge 在 Linux 上没有对应物（seccomp 白名单要覆盖 vendored 组件的每个系统调用，跨上游版本无法维护），所以这里只做能声明清楚的那部分；CI 会用 `systemd-analyze verify` 校验该单元。
 - **除 EasyTier 中心节点外，其余模块（easytier-web 仪表盘、STUN/TURN、RustDesk、frps、frpc）在任何平台都不依赖 TUN**，所以即使没装 wintun，Windows 上仍是一个可用的中继管理器（把配置里的 `[easytier] node_enabled` 关掉即可）。
-- **未验证的部分要如实说明**：Linux 上「能构建 + 能真实运行」已由 CI 每次 push 验证；Windows 上验证到「能构建、能链接、导入校验通过、产物可下载」，**运行期**那一环需要 Npcap（免费版无法静默安装），因此由操作者在装了 Npcap 的机器上执行同样步骤 —— CI 会明确报告该步骤未运行。而 EasyTier 的 TUN 组网、RustDesk 客户端的真实连接这类**需要真实客户端参与**的行为，只在 OpenBSD 上实测过。
+- **未验证的部分要如实说明**：三个平台现在都由 CI 每次 push 验证「能构建 + 单元测试 + **真实运行**」（启动 → 自签证书 → HTTPS 登录 → 目录布局 → 请求停机并干净退出）。仍然**只在 OpenBSD 上实测过**的是需要真实客户端参与的行为：EasyTier 的 TUN 组网、RustDesk 客户端连接，以及**上游 frpc** 的互通（Linux/Windows 上目前只验证过 ReMgr 自己的 frpc↔frps）。
 
 ## 构建（OpenBSD 7.x）
 
@@ -220,17 +221,37 @@ sh scripts/preflight.sh                                             # 逐项核�
 
 ## CI（`.github/workflows/ci.yml`）
 
-每次 push / PR 跑三个 job：
+每次 push / PR 跑四个 job：
 
 1. **frp 协议 crate** —— `remgr-frps` 构建 + 16 个单元测试 + 互通自检程序（`examples/frpc_probe --self-test`）。这个 crate 是刻意保持跨平台的（`scripts/check-repo.sh` 会强制这一点），所以能在 Linux runner 上真跑。
 2. **控制台** —— 单文件脚本能解析（`node --check`）、每个 inline 属性引用的处理函数都存在、每种 widget 都有渲染分支、每个证书服务与 API 端点都在 router 里（`scripts/check-console.sh`），外加仓库卫生检查（无凭据/密钥/日志/编译产物）。
-3. **release build（矩阵：linux-x86_64 / windows-x86_64）** —— 完整服务编译成 release，各自跑该平台的 `remgr-frps` 测试**和服务本体（`remgr`）的单元测试**（信号来源记录、路径布局），产物以 artifact 形式保留 30 天。随后按平台做力所能及的运行期验证：
-   - **Linux：真实运行**（用 scratch `REMGR_HOME` 启动、等控制台起来、校验首次启动写入了文档里的默认登录并生成 P-384 证书、用 HTTPS 登录、确认整棵布局 `config`/`ssl`/`lib`/`log`/`run` 都落在 home 下、再用 SIGTERM 关掉）。
-   - **Windows：导入校验**（扫描 `remgr.exe` 的导入表确认 `Packet.dll` 在其中，把「需要 Npcap」变成可测事实）；真正的运行期冒烟测试脚本也写好了，但它**只在机器已装 Npcap 时才执行**，否则明确报告「未运行」及原因——因为免费版 Npcap 无法静默安装（`/S` 仅 OEM），CI 不能替操作者接受许可协议。
+3. **release build（矩阵：linux-x86_64 / windows-x86_64）** —— 完整服务编译成 release，各自跑该平台的 `remgr-frps` 测试**和服务本体（`remgr`）的单元测试**（信号来源记录、路径布局、记账镜像），产物以 artifact 形式保留 30 天。随后按平台做运行期验证：
+   - **Linux：真实运行 + systemd 校验** —— 用 scratch `REMGR_HOME` 启动、等控制台起来、校验首次启动写入默认登录并生成 P-384 证书、HTTPS 登录、确认整棵布局落在 home 下、SIGTERM 干净退出；再用 `systemd-analyze verify` 校验随仓库提供的 `scripts/systemd/remgr.service`。
+   - **Windows：真实运行（不需要 Npcap）+ 优雅停机断言** —— 先验证 `Packet.dll`/`wpcap.dll` 是**延迟加载**的（在没装 Npcap 的 runner 上 `remgr --version` 必须成功，这是改动前会以 `0xC0000135` 退出的那一步），然后完整冒烟：启动 → 自签证书 → HTTPS 登录 → 目录布局，最后写 `run\stop`，断言守护进程**自己**优雅停机（日志出现 `stop file ... found and removed` 与 `stopped; exiting`）。
+4. **publish the release**（仅 master/`v*` tag 且前三个 job 全绿）—— 见下节。
 
 两个平台都要装 **LLVM**（`kcp-sys` 与 `machine-uid` 在构建期跑 bindgen）和 **protoc + well-known types**（`easytier-proto` 生成 protobuf 类型）。后者容易踩：Ubuntu 上 `.proto` 文件在 `libprotobuf-dev` 里而不是 `protobuf-compiler`，所以 workflow 从实际文件反推 include 根目录，并在准备阶段用一行 protoc 探针先验证，避免等 20 分钟才在依赖输出里看到同样的报错。
 
 > **CI 绿灯不等于 OpenBSD 编译通过**：GitHub 没有 OpenBSD runner，`remgr`（服务本体）在那个平台上只能手工构建与部署——这也是为什么上面的检查清单和 `scripts/preflight.sh` 存在。做重大改动后请在目标机上跑一次 `sh scripts/preflight.sh`。
+
+## 发布（Releases）
+
+**CI 全绿之后自动发布**，规则有两个：
+
+- 推到 `master` → 更新一个**滚动发布**，tag 固定为 `latest`（名字写作 "ReMgr — latest master build"）；
+- 推一个 `v*` tag（如 `v0.1.0`）→ 发一个**正式版本**，tag 就是它。
+
+两种情况由 CI 的 `release` job 处理：它下载刚才构建的两个平台产物、按平台重命名（`remgr-linux-x86_64`、`remgr-windows-x86_64.exe`）、生成 `SHA256SUMS`、清掉上一次发布留下的资产（**避免旧二进制和新提交混在一起**），然后上传。发布说明里写着这个 build 对应的提交、每个产物是什么、以及**哪些行为在 CI 里验证过、哪些没有**。
+
+**OpenBSD 的产物是事后附加的**（GitHub 没有 OpenBSD runner，这一条改不了）。在目标机上：
+
+```sh
+sh scripts/openbsd-build.sh                                  # 同一份源码
+GH_TOKEN=<contents:write 的 token> ksh scripts/publish-openbsd-release.sh
+# 正式版本： ksh scripts/publish-openbsd-release.sh v0.1.0
+```
+
+该脚本会把 `remgr-openbsd-amd64` 上传到 CI 刚建的那个发布、重写 `SHA256SUMS` 让它**一次覆盖三个平台**，并在 HEAD 与发布说明里的提交不一致时**警告**（挂一个不匹配的二进制比不挂更糟）。发布说明里明确写着 OpenBSD 资产是事后附加的——如果这次发布里没有它，就说明还没附加，而不是它不存在。
 
 ## 生产部署检查清单
 

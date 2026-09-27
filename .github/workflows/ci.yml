@@ -471,3 +471,93 @@ jobs:
           path: target/release/${{ matrix.binary }}
           if-no-files-found: error
           retention-days: 30
+
+  # Publish a release from a green run: a rolling `latest` from master, a versioned
+  # release from a `v*` tag. The assets are the binaries CI just built and verified.
+  #
+  # OpenBSD is the sanctioned platform and GitHub has no runner for it, so its
+  # binary cannot come from here: it is built on a real OpenBSD machine with
+  # scripts/openbsd-build.sh and attached to this same release by
+  # scripts/publish-openbsd-release.sh. The release body says exactly that, because
+  # a release that quietly ships two of three platforms would be a lie of omission.
+  release:
+    name: publish the release
+    needs: [build, console, hygiene]
+    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Collect the binaries CI built
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Name them, checksum them, describe them
+        id: pack
+        run: |
+          set -eu
+          ver=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+          sha=$(git rev-parse --short HEAD)
+          subject=$(git log -1 --pretty=%s)
+          mkdir -p out
+          cp dist/remgr-linux-x86_64/remgr       out/remgr-linux-x86_64
+          cp dist/remgr-windows-x86_64/remgr.exe out/remgr-windows-x86_64.exe
+          (cd out && sha256sum remgr-* > SHA256SUMS)
+          {
+            echo "ReMgr $ver — build $sha"
+            echo
+            echo "$subject"
+            echo
+            echo "| platform | asset | notes |"
+            echo "|---|---|---|"
+            echo "| Linux x86_64 | remgr-linux-x86_64 | service unit: scripts/systemd/remgr.service |"
+            echo "| Windows x86_64 | remgr-windows-x86_64.exe | starts without Npcap; only the EasyTier node needs wintun + Npcap |"
+            echo "| OpenBSD amd64 | remgr-openbsd-amd64 | built on the target, attached afterwards (scripts/publish-openbsd-release.sh) |"
+            echo
+            echo "Built and verified by CI on GitHub-hosted runners: both platforms compile,"
+            echo "run their unit tests, and a runtime smoke test starts the service, serves the"
+            echo "console over HTTPS, then stops it again — on Windows through the stop file,"
+            echo "which is the graceful-stop path when no console control event is available."
+            echo
+            echo "The OpenBSD asset is the same binary scripts/openbsd-build.sh produces on the"
+            echo "sanctioned platform, with scripts/preflight.sh run against it. If it is missing"
+            echo "from this release, it has not been attached yet — the other two are unaffected."
+            echo
+            echo "Not verified here: behaviour that needs a real client on the far end (EasyTier"
+            echo "TUN networking, RustDesk clients, upstream frpc interop) is measured on OpenBSD"
+            echo "only. See the support table in the README."
+          } > body.md
+          echo "ver=$ver" >> "$GITHUB_OUTPUT"
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          ls -l out
+
+      - name: Clear the previous publish's assets (nothing stale may survive)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          tag="${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'latest' }}"
+          ids=$(gh api "repos/${{ github.repository }}/releases/tags/$tag" --jq '.assets[].id' 2>/dev/null || true)
+          for id in $ids; do
+            gh api -X DELETE "repos/${{ github.repository }}/releases/assets/$id" >/dev/null || true
+          done
+          echo "cleared: ${ids:-none}"
+          # the OpenBSD binary, if it was attached, is named in the body — say so
+          echo "note: remgr-openbsd-amd64 (if present before) must be re-attached"
+
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'latest' }}
+          name: ${{ startsWith(github.ref, 'refs/tags/v') && format('ReMgr {0}', github.ref_name) || 'ReMgr — latest master build' }}
+          body_path: body.md
+          files: |
+            out/remgr-linux-x86_64
+            out/remgr-windows-x86_64.exe
+            out/SHA256SUMS
+          fail_on_unmatched_files: true
