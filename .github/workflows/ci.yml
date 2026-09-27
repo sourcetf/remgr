@@ -413,14 +413,23 @@ jobs:
             $ok = $false
             for ($i = 0; $i -lt 60; $i++) {
               if ($p.HasExited) { throw "process died early (exit $($p.ExitCode))" }
-              & curl.exe -kfs -o $null 'https://127.0.0.1:9443/' 2>$null
+              # NUL, not $null: PowerShell 7 passes $null to a native command as an
+              # EMPTY argument, so `curl.exe -o $null` fails with "Failed to open
+              # the file ''" and this loop would never see a working console.
+              & curl.exe -kfs -o NUL 'https://127.0.0.1:9443/' 2>$null
               if ($LASTEXITCODE -eq 0) { $ok = $true; break }
               Start-Sleep -Milliseconds 500
             }
-            if (-not $ok) { throw "console never came up" }
+            if (-not $ok) {
+              Write-Host "--- the daemon's log ---"
+              Get-Content (Join-Path $runRoot 'out.log') -ErrorAction SilentlyContinue | Select-Object -Last 25
+              Write-Host "--- its stderr ---"
+              Get-Content (Join-Path $runRoot 'err.log') -ErrorAction SilentlyContinue | Select-Object -Last 25
+              throw "console never came up"
+            }
 
             $body = '{"username":"admin","password":"admin"}'
-            $code = & curl.exe -ks -o $null -w '%{http_code}' -X POST 'https://127.0.0.1:9443/api/login' `
+            $code = & curl.exe -ks -o NUL -w '%{http_code}' -X POST 'https://127.0.0.1:9443/api/login' `
                       -H 'content-type: application/json' -d $body
             if ($code -ne '200') { throw "login returned $code" }
 
