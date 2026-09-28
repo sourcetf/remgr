@@ -4,6 +4,14 @@
 #
 #   ksh scripts/reclaim-build-artifacts.sh
 #
+# NEVER run this while a build is running. Cargo resolves a crate by the exact
+# file its fingerprint names, and "superseded" is only true for a finished build:
+# removing a copy that an in-flight compilation has already been handed produces
+#     error: extern location for quote does not exist: .../deps/libquote-<hash>.rlib
+# and the build dies mid-way (learned the hard way, twice in one evening — the
+# first time it merely wasted the run, the 511 MiB it freed were gone again by the
+# time the rebuild reached the same point).
+#
 # Cargo keeps every superseded copy of a compiled crate in target/release/deps:
 # after a few rebuilds the same crate appears several times with different hashes,
 # and only the newest one is ever linked. Removing the older copies is safe (cargo
