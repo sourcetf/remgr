@@ -234,6 +234,34 @@ sh scripts/preflight.sh                                             # 逐项核�
 
 > **CI 绿灯不等于 OpenBSD 编译通过**：GitHub 没有 OpenBSD runner，`remgr`（服务本体）在那个平台上只能手工构建与部署——这也是为什么上面的检查清单和 `scripts/preflight.sh` 存在。做重大改动后请在目标机上跑一次 `sh scripts/preflight.sh`。
 
+## 部署（Windows）
+
+一台 Windows 机器（本机实测：Windows 10 19045）从零到可用只要一条命令，脚本随仓库提供：
+
+```powershell
+# 管理员 PowerShell，仓库根目录；二进制取发布里的 remgr-windows-x86_64.exe
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows\install-service.ps1 `
+  -Source .emgr-windows-x86_64.exe -PublicIp <你的公网/NAT 出口 IP>
+```
+
+脚本做的事，以及每件事的理由：
+
+- 二进制装到 `C:\Program Files\ReMgremgr.exe`（单文件，没有 MSI），数据/配置/日志/证书在 `C:\ProgramData\ReMgr`（`platform.rs` 定义的 Windows 布局）；
+- **首次**启动一次以生成 `config.toml`、控制台口令与 P-384 证书，然后停掉——之后由服务方式启动的是同一份安装（已有配置时这一步会跳过，脚本可重复执行）；
+- 注册计划任务 `ReMgr`：**SYSTEM 身份、开机启动、退出后每分钟重启**（等价于 Linux 单元的 `Restart=always`、OpenBSD 的 `remgr-watchdog.sh`）；
+- 按需开防火墙端口，**只开模块真正用的**：`9443/tcp` 控制台、`3478/udp` STUN/TURN、`5349/tcp` TURN over TLS、`7000/tcp` frps、`21115-21119/tcp` RustDesk、`49200-49300/udp` TURN 中继段；
+- `-PublicIp` 会写进 `external_ip`/`domain` 并把 **TURN 中继段收窄到 49200-49300**：默认的 49152-65535 没有任何 NAT 设备愿意整段转发，收窄之后路由器上一条规则就够；同时提醒你 `[stun_turn].users` **默认为空**，而 RFC 5766 在没有凭据时会拒绝所有请求。
+
+**优雅停机（Windows 没有信号）**：控制台控制事件（Ctrl-C / Ctrl-Break / 关窗 / 注销 / 关机；NSSM 的 “Console” 停止方式发的正是 Ctrl-C）会让它逐模块 `stop()` 后退出；**若包装器只会强杀**，往 `C:\ProgramData\ReMgrun\stop` 放一个空文件即可（守护进程每秒检查、消费该文件并同样优雅停机）。
+
+**升级**：再跑一次同一个脚本。它会先用 `stop` 文件**优雅地**让在跑的实例退出，再把旧二进制 `rename` 到 `.old` 后放进新的——Windows **不允许覆盖正在运行的映像**（“文件正由另一进程使用”，与 unix 的 `Text file busy` 是同一类约束），而改名是允许的；旧文件在下次重装时清掉。
+
+**NAT**：这些端口要在路由器上转发到本机，否则外面到不了；`-PublicIp` 只是让证书与 TURN 对外公布正确的地址，它不会（也无法）替你改路由器。
+
+**EasyTier 本地节点**需要 **wintun 驱动 + Npcap**，缺任一个会在日志里给出人话并只让节点不启动（其余模块照常）；不需要 TUN 组网时把 `[easytier] node_enabled` 留成 `false` 即可。
+
+> 用 Windows PowerShell 5.1 调控制台 API 时有两个坑（pwsh 7 没有）：把 JSON 内联传给原生命令会被**吃掉双引号**（改用 `--data-binary @file`）；把响应管道给 `ConvertFrom-Json` 会按控制台代码页解码，而状态里的中文注释会让它不是合法 JSON（改用 `curl -o file` + `Get-Content -Encoding UTF8`）。随仓库的 `scripts/verify-signals.sh` 是 OpenBSD/Linux 上的对应检查。
+
 ## 发布（Releases）
 
 **CI 全绿之后自动发布**，规则有两个：
