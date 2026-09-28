@@ -241,18 +241,18 @@ sh scripts/preflight.sh                                             # 逐项核�
 ```powershell
 # 管理员 PowerShell，仓库根目录；二进制取发布里的 remgr-windows-x86_64.exe
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows\install-service.ps1 `
-  -Source .emgr-windows-x86_64.exe -PublicIp <你的公网/NAT 出口 IP>
+  -Source .\emgr-windows-x86_64.exe -PublicIp <你的公网/NAT 出口 IP>
 ```
 
 脚本做的事，以及每件事的理由：
 
-- 二进制装到 `C:\Program Files\ReMgremgr.exe`（单文件，没有 MSI），数据/配置/日志/证书在 `C:\ProgramData\ReMgr`（`platform.rs` 定义的 Windows 布局）；
+- 二进制装到 `C:\Program Files\ReMgr\emgr.exe`（单文件，没有 MSI），数据/配置/日志/证书在 `C:\ProgramData\ReMgr`（`platform.rs` 定义的 Windows 布局）；
 - **首次**启动一次以生成 `config.toml`、控制台口令与 P-384 证书，然后停掉——之后由服务方式启动的是同一份安装（已有配置时这一步会跳过，脚本可重复执行）；
 - 注册计划任务 `ReMgr`：**SYSTEM 身份、开机启动、退出后每分钟重启**（等价于 Linux 单元的 `Restart=always`、OpenBSD 的 `remgr-watchdog.sh`）；
 - 按需开防火墙端口，**只开模块真正用的**：`9443/tcp` 控制台、`3478/udp` STUN/TURN、`5349/tcp` TURN over TLS、`7000/tcp` frps、`21115-21119/tcp` RustDesk、`49200-49300/udp` TURN 中继段；
 - `-PublicIp` 会写进 `external_ip`/`domain` 并把 **TURN 中继段收窄到 49200-49300**：默认的 49152-65535 没有任何 NAT 设备愿意整段转发，收窄之后路由器上一条规则就够；同时提醒你 `[stun_turn].users` **默认为空**，而 RFC 5766 在没有凭据时会拒绝所有请求。
 
-**优雅停机（Windows 没有信号）**：控制台控制事件（Ctrl-C / Ctrl-Break / 关窗 / 注销 / 关机；NSSM 的 “Console” 停止方式发的正是 Ctrl-C）会让它逐模块 `stop()` 后退出；**若包装器只会强杀**，往 `C:\ProgramData\ReMgrun\stop` 放一个空文件即可（守护进程每秒检查、消费该文件并同样优雅停机）。
+**优雅停机（Windows 没有信号）**：控制台控制事件（Ctrl-C / Ctrl-Break / 关窗 / 注销 / 关机；NSSM 的 “Console” 停止方式发的正是 Ctrl-C）会让它逐模块 `stop()` 后退出；**若包装器只会强杀**，往 `C:\ProgramData\ReMgr\un\stop` 放一个空文件即可（守护进程每秒检查、消费该文件并同样优雅停机）。
 
 **升级**：再跑一次同一个脚本。它会先用 `stop` 文件**优雅地**让在跑的实例退出，再把旧二进制 `rename` 到 `.old` 后放进新的——Windows **不允许覆盖正在运行的映像**（“文件正由另一进程使用”，与 unix 的 `Text file busy` 是同一类约束），而改名是允许的；旧文件在下次重装时清掉。
 
