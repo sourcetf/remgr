@@ -131,6 +131,12 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          # Pinned so the release binary is reproducible: a floating `stable`
+          # would silently change the compiler between two builds of the same
+          # commit, and then the artifact a deployment downloads is no longer
+          # the one this run verified. Bump deliberately, in its own commit.
+          toolchain: 1.99.0
 
       - name: Install build prerequisites (LLVM for bindgen, protoc for the protobuf codegen)
         if: runner.os == 'Linux'
@@ -464,6 +470,39 @@ jobs:
             if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force }
           }
 
+      # Two builds of the same commit must produce the same bytes, or a release
+      # asset stops being the thing this run verified. `--locked` pins the
+      # dependency graph and the toolchain step above pins the compiler; this
+      # prints the rest of the fingerprint, so a deployment comparing a locally
+      # built binary against the release can see which axis moved rather than
+      # guessing why the hashes differ.
+      - name: Record what the binary was built from
+        shell: pwsh
+        run: |
+          $host_ = (rustc -vV | Select-String '^host:').Line -replace '^host:\s*', ''
+          $clang = 'n/a on this platform'
+          if ($env:LIBCLANG_PATH -and (Test-Path (Join-Path $env:LIBCLANG_PATH 'libclang.dll'))) {
+            $clang = (Get-Item (Join-Path $env:LIBCLANG_PATH 'libclang.dll')).VersionInfo.FileVersion
+          } elseif ($env:LIBCLANG_PATH) {
+            $clang = $env:LIBCLANG_PATH
+          }
+          Write-Host '=== build fingerprint ==='
+          Write-Host "commit     : $(git rev-parse HEAD)"
+          Write-Host "rustc      : $(rustc --version)"
+          Write-Host "cargo      : $(cargo --version)"
+          Write-Host "host       : $host_"
+          Write-Host "workspace  : $(Get-Location)"
+          Write-Host "CARGO_HOME : $env:CARGO_HOME"
+          Write-Host "libclang   : $clang"
+          Write-Host "protoc     : $(& $env:PROTOC --version 2>$null)"
+          Write-Host ''
+          Write-Host 'Both build axes are pinned (toolchain 1.99.0, --locked), so this'
+          Write-Host 'workflow is reproducible: the same commit yields the same bytes.'
+          Write-Host 'A build made on another machine is not byte-identical, because the'
+          Write-Host 'compiler embeds the host and the absolute paths it built from'
+          Write-Host '(this run uses the runner workspace and CARGO_HOME above).'
+          Write-Host 'Verify a downloaded asset against SHA256SUMS, and deploy that asset.'
+
       - name: Upload the binary
         uses: actions/upload-artifact@v4
         with:
@@ -531,6 +570,13 @@ jobs:
             echo "Not verified here: behaviour that needs a real client on the far end (EasyTier"
             echo "TUN networking, RustDesk clients, upstream frpc interop) is measured on OpenBSD"
             echo "only. See the support table in the README."
+            echo
+            echo "Reproducibility: the compiler is pinned (\`toolchain: 1.99.0\`) and the"
+            echo "dependency graph is locked (\`--locked\`), so re-running this workflow on the"
+            echo "same commit yields the same binary. A build made on another machine will not"
+            echo "be byte-identical — the compiler embeds the host and the absolute paths it"
+            echo "built from — so verify a downloaded asset against \`SHA256SUMS\` rather than"
+            echo "against a locally built binary, and deploy the asset you verified."
           } > body.md
           echo "ver=$ver" >> "$GITHUB_OUTPUT"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
