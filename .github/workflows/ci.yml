@@ -476,16 +476,29 @@ jobs:
       # prints the rest of the fingerprint, so a deployment comparing a locally
       # built binary against the release can see which axis moved rather than
       # guessing why the hashes differ.
+      #
+      # Nice-to-have provenance only: every lookup is optional and must never
+      # fail the build. The prerequisite variables differ per platform (PROTOC
+      # is set by the Windows step alone), so nothing here may assume one is
+      # present -- `& $env:PROTOC` with an empty variable is a hard error in
+      # PowerShell, which is exactly how this step broke the Linux job once.
       - name: Record what the binary was built from
         shell: pwsh
         run: |
-          $host_ = (rustc -vV | Select-String '^host:').Line -replace '^host:\s*', ''
-          $clang = 'n/a on this platform'
-          if ($env:LIBCLANG_PATH -and (Test-Path (Join-Path $env:LIBCLANG_PATH 'libclang.dll'))) {
-            $clang = (Get-Item (Join-Path $env:LIBCLANG_PATH 'libclang.dll')).VersionInfo.FileVersion
-          } elseif ($env:LIBCLANG_PATH) {
-            $clang = $env:LIBCLANG_PATH
+          function Try-Version([string]$exe, [string]$fallback = 'not set') {
+            if (-not $exe) { return $fallback }
+            if (-not (Test-Path $exe)) { return "$fallback ($exe)" }
+            try { return (& $exe --version 2>$null | Select-Object -First 1) } catch { return "$fallback ($exe)" }
           }
+
+          $host_ = (rustc -vV | Select-String '^host:').Line -replace '^host:\s*', ''
+
+          $clang = 'not set'
+          if ($env:LIBCLANG_PATH) {
+            $dll = Join-Path $env:LIBCLANG_PATH 'libclang.dll'
+            $clang = if (Test-Path $dll) { (Get-Item $dll).VersionInfo.FileVersion } else { $env:LIBCLANG_PATH }
+          }
+
           Write-Host '=== build fingerprint ==='
           Write-Host "commit     : $(git rev-parse HEAD)"
           Write-Host "rustc      : $(rustc --version)"
@@ -494,7 +507,7 @@ jobs:
           Write-Host "workspace  : $(Get-Location)"
           Write-Host "CARGO_HOME : $env:CARGO_HOME"
           Write-Host "libclang   : $clang"
-          Write-Host "protoc     : $(& $env:PROTOC --version 2>$null)"
+          Write-Host "protoc     : $(Try-Version $env:PROTOC)"
           Write-Host ''
           Write-Host 'Both build axes are pinned (toolchain 1.99.0, --locked), so this'
           Write-Host 'workflow is reproducible: the same commit yields the same bytes.'
