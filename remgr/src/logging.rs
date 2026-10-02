@@ -163,6 +163,15 @@ impl FileSink {
     }
 
     fn open(&mut self) {
+        // The sink is built before `secure::prepare_dirs` runs, so on a platform
+        // whose log directory is not created at install time (Windows'
+        // %ProgramData%\ReMgr\log) the first line would be dropped with ENOENT and
+        // file logging would stay off for the whole run. Create the parent here:
+        // the sink opens lazily on the first write, which is after the layout is
+        // known.
+        if let Some(parent) = self.path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
         // The very first start-up lines carry the bootstrap console password,
         // so the file is created root-only rather than with the process umask.
         #[cfg(unix)]

@@ -40,13 +40,63 @@ const MIN_SECRET_KEY_LEN: usize = 60;
 
 /// The on-disk pair as `(public, secret)`; either is empty when the file is
 /// missing or unreadable.
+///
+/// The vendored hbbs reads/writes `id_ed25519` relative to the process working
+/// directory, and `main` only pins that directory to the data dir on OpenBSD (a
+/// Windows service and a Linux foreground run keep theirs). Point this at the
+/// data dir explicitly instead of relying on the cwd. `prepare_dirs` has already
+/// created the directory by the time the module starts.
+fn key_path(name: &str) -> std::path::PathBuf {
+    crate::platform::data_dir().join(name)
+}
+
 fn disk_keys() -> (String, String) {
     let read = |name: &str| {
-        std::fs::read_to_string(name)
+        std::fs::read_to_string(key_path(name))
             .map(|s| s.trim().to_string())
             .unwrap_or_default()
     };
     (read(PUBLIC_FILE), read(SECRET_FILE))
+}
+
+/// Generate the key pair into the data dir.
+///
+/// `hbbs::common::gen_sk` has the relative filename `id_ed25519` compiled in and
+/// offers no way to redirect it, so it writes into the process working directory.
+/// On Windows (and on a Linux foreground run) that is wherever the process was
+/// started from, which is not the data dir: the pair would land next to the
+/// operator's shell, and a restart from a different directory would silently mint
+/// a *different* pair — every client's configured key would then be wrong.
+fn generate_key_pair() {
+    // The vendored helper is the only thing that must see the relative name, and it
+    // never yields, so the directory is restored before this returns.
+    let _cwd = CwdGuard::enter(crate::platform::data_dir());
+    let (pk, _sk) = hbbs::common::gen_sk(0);
+    if pk.is_empty() {
+        tracing::warn!("rustdesk: key generation produced nothing — id_ed25519 is missing or corrupt");
+    }
+}
+
+/// Restores the previous working directory on drop, including on an early return.
+struct CwdGuard(Option<std::path::PathBuf>);
+
+impl CwdGuard {
+    fn enter(dir: std::path::PathBuf) -> Self {
+        let previous = std::env::current_dir().ok();
+        if let Err(e) = std::env::set_current_dir(&dir) {
+            tracing::warn!("rustdesk: cannot enter {} to generate the key pair: {e}", dir.display());
+            return Self(None);
+        }
+        Self(previous)
+    }
+}
+
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        if let Some(prev) = self.0.take() {
+            let _ = std::env::set_current_dir(prev);
+        }
+    }
 }
 
 /// The key argument to start hbbs/hbbr with.
@@ -57,18 +107,32 @@ fn resolve_key(cfg: &crate::config::RustDeskConfig) -> anyhow::Result<String> {
         // Both halves read `id_ed25519`; make sure it exists before either starts,
         // otherwise they race on first boot and generate different keys. gen_sk
         // returns the existing pair when the file is present.
-        let (pk, _sk) = hbbs::common::gen_sk(0);
-        if pk.is_empty() {
+        generate_key_pair();
+        // Re-read the files rather than trusting the helper's return value: what
+        // hbbs needs is the pair on disk, and if the write went somewhere else the
+        // relay would start without a signing key (every client then fails with an
+        // unverifiable-server error).
+        let (pub_after, sk_after) = disk_keys();
+        if pub_after.is_empty() || sk_after.is_empty() {
             anyhow::bail!(
-                "rustdesk: no usable server key — id_ed25519 is missing or corrupt \
-                 (fix or remove it and try again)"
+                "rustdesk: no usable server key — {} is missing or corrupt (expected it in {})",
+                SECRET_FILE,
+                crate::platform::data_dir().display()
             );
         }
         if !key.is_empty() {
             tracing::info!("rustdesk: configured key is the on-disk pair, using id_ed25519");
         }
-        // "_" = "use the key on disk": hbbs then keeps the secret half too.
-        return Ok("_".to_string());
+        // Hand hbbs the *secret* key rather than the "_" sentinel.
+        //
+        // "_" makes the vendored code open the relative path `id_ed25519`, i.e. the
+        // process working directory — which is not the data dir off OpenBSD, so the
+        // servers would look for the pair somewhere it was never written and start
+        // without a signing key. Passing the secret removes the working-directory
+        // dependency entirely; both servers derive the public half themselves and
+        // log only that (see `get_server_sk`), so nothing secret is printed, and
+        // the console still shows the public half read from `id_ed25519.pub`.
+        return Ok(sk_after);
     }
     if key.len() < MIN_SECRET_KEY_LEN {
         // A public key here is not a valid configuration: hbbs would start (and

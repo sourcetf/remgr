@@ -49,7 +49,18 @@ tokio-util = { workspace = true, features = ["rt"] }
 url = "2"
 
 # ---- integrated services (in-process libraries, no subprocesses, no IPC) ----
-easytier = { path = "../third_party/easytier/easytier", default-features = false, features = ["full", "management", "management-rpc"] }
+# `full` includes `openssl-crypto`, which makes openssl-sys build OpenSSL from
+# source 鈥?that needs a complete perl, and the build host here only has Git's
+# msys perl (no Locale::Maketext::Simple), so configure fails. `ring-crypto`
+# provides the same ciphers purely in Rust and is already required by
+# `wireguard` (part of `full`), so listing the individual features instead of
+# `full` keeps the functionality and drops the perl/OpenSSL build entirely.
+easytier = { path = "../third_party/easytier/easytier", default-features = false, features = [
+    "websocket", "wireguard", "aes-gcm", "smoltcp", "tun", "socks5", "kcp", "quic",
+    "faketcp", "magic-dns", "zstd", "upnp", "icmp-proxy", "management",
+    "endpoint-discovery", "extended-services", "tcp-hole-punch",
+    "management-rpc",
+] }
 easytier-web = { path = "../third_party/easytier/easytier-web", default-features = false, features = ["embed"] }
 password-auth = "1.0.0"
 # the dashboard API takes md5(password) as the credential (see frontend api.ts)

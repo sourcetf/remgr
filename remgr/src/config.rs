@@ -33,6 +33,28 @@ pub struct Config {
     pub config_path: PathBuf,
 }
 
+impl Config {
+    /// Fix up paths that cannot be expressed as serde defaults.
+    ///
+    /// `remgr-frps` is deliberately platform-independent (it is built and tested
+    /// on its own, see scripts/check-repo.sh), so its `FrpsConfig::default`
+    /// carries the unix `/etc/remgr/ssl/...` certificate paths. On Windows those
+    /// would be created as `C:\etc\...`, somewhere no operator would look, so the
+    /// console's own cert directory is substituted whenever the value is still the
+    /// unix default. A path the operator set (or cleared) is left alone.
+    fn apply_platform_defaults(&mut self) {
+        let unix_defaults = ["/etc/remgr/ssl/frps_cert.pem", "/etc/remgr/ssl/frps_key.pem"];
+        let ours = [path_in_cert_dir("frps_cert.pem"), path_in_cert_dir("frps_key.pem")];
+        let replace = |slot: &mut Option<String>, unix: &str, mine: &str| {
+            if slot.as_deref() == Some(unix) {
+                *slot = Some(mine.to_string());
+            }
+        };
+        replace(&mut self.frps.tls_cert_path, unix_defaults[0], &ours[0]);
+        replace(&mut self.frps.tls_key_path, unix_defaults[1], &ours[1]);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ConsoleConfig {
@@ -186,6 +208,7 @@ impl Config {
         } else {
             Config::default()
         };
+        cfg.apply_platform_defaults();
         cfg.config_path = path.to_path_buf();
         Ok(cfg)
     }
