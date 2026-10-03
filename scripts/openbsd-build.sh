@@ -12,15 +12,17 @@
 #
 # Verified combination (OpenBSD 7.9/amd64):
 #   rust / cargo 1.94.1   (packages, not rustup)
-#   llvm-19.1.7p14        -> /usr/local/llvm19/lib/libclang.so
+#   llvm-19.1.7p14        -> provides libclang.so, located below rather than assumed
 #   protobuf-6.34.1       -> /usr/local/bin/protoc
 #   git-2.53.0
 #
 # Every variable below is load-bearing; none is a leftover:
-#   LIBCLANG_PATH=/usr/local/llvm19/lib
+#   LIBCLANG_PATH
 #       kcp-sys (pulled in by the vendored easytier tree) runs bindgen through
-#       libclang. Without this it looks in the default compiler paths, finds no
-#       libclang.so there, and the build script fails.
+#       libclang. Without it bindgen looks in the default compiler paths, finds no
+#       libclang.so there, and the build fails. The directory is derived from the
+#       installed package (see below), and an LIBCLANG_PATH from the environment is
+#       honoured, so a caller that already knows can say so.
 #   RUSTC_BOOTSTRAP=1
 #       the vendored guarden crate uses the cfg_select! macro, which rustc 1.94
 #       rejects on the stable channel. Nothing in ReMgr's own sources needs it —
@@ -52,11 +54,28 @@ for t in cargo protoc git; do
 	command -v $t >/dev/null ||
 		{ echo "missing $t: pkg_add rust-1.94.1 llvm-19.1.7p14 protobuf-6.34.1 git-2.53.0" >&2; exit 1; }
 done
-[ -f /usr/local/llvm19/lib/libclang.so ] ||
-	echo "warning: /usr/local/llvm19/lib/libclang.so missing (pkg_add llvm19) — bindgen will fail" >&2
+
+# Where is libclang.so? Do not guess. A wrong LIBCLANG_PATH is not noticed until
+# bindgen runs, ~20 minutes into the build, and the versioned directory name is
+# easy to get wrong: `/usr/local/llvm19/lib` does not exist on 7.9 (the package is
+# llvm-19.1.7p14, and its prefix is not the package's stem). Look for the file on
+# disk, and fall back to asking the package that installed it.
+if [ -z "${LIBCLANG_PATH:-}" ]; then
+	clang=$(find /usr/local -maxdepth 4 -name 'libclang.so' -type f 2>/dev/null | head -1) || true
+	if [ -z "$clang" ]; then
+		clang=$(pkg_info -L 'llvm-*' 2>/dev/null | grep -E '/libclang\.so$' | head -1) || true
+	fi
+	[ -n "$clang" ] && LIBCLANG_PATH=$(dirname "$clang")
+fi
+if [ -n "${LIBCLANG_PATH:-}" ] && [ -f "$LIBCLANG_PATH/libclang.so" ]; then
+	echo "libclang: $LIBCLANG_PATH/libclang.so"
+else
+	echo "warning: libclang.so not found (pkg_add llvm-19.1.7p14) — bindgen will fail" >&2
+fi
+
 ulimit -n 1024
 export RUSTC_BOOTSTRAP=1
-export LIBCLANG_PATH=/usr/local/llvm19/lib
+export LIBCLANG_PATH
 export CARGO_NET_GIT_FETCH_WITH_CLI=true
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 export CARGO_INCREMENTAL=0

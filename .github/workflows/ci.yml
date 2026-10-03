@@ -155,12 +155,15 @@ jobs:
             # scripts/openbsd-build.sh records as verified.
             pkg_add rust-1.94.1 llvm-19.1.7p14 protobuf-6.34.1 git-2.53.0
             # And prove the environment is the one the build expects, here, where a
-            # message is cheap -- rather than 30 minutes into a compile.
+            # message is cheap -- rather than 30 minutes into a compile. libclang is
+            # located the same way the build script locates it (from the package
+            # that installed it), so this cannot disagree with the build.
             for t in cargo protoc git; do
               command -v $t >/dev/null || { echo "missing $t after pkg_add"; exit 1; }
             done
-            [ -f /usr/local/llvm19/lib/libclang.so ] || {
-              echo "libclang.so missing: the path scripts/openbsd-build.sh exports is wrong"; exit 1; }
+            clang=$(pkg_info -L 'llvm-*' 2>/dev/null | grep -E '/libclang\.so(\.|$)' | head -1) || true
+            [ -n "$clang" ] || { echo "libclang.so not installed by the llvm package"; exit 1; }
+            echo "libclang at $clang"
             echo "prepare ok: cargo=$(cargo --version), protoc=$(protoc --version), git=$(git --version)"
           run: |
             set -e
