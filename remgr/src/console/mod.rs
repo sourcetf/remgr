@@ -980,19 +980,26 @@ async fn put_config(
             // here instead, where the message can say exactly which tree is
             // readable.
             for (what, path) in [("tls_cert", &console.tls_cert), ("tls_key", &console.tls_key)] {
-                if !path.starts_with('/') || path.contains("..") {
+                // `Path::is_absolute`, not a leading '/': Windows paths are
+                // absolute as `C:\...` and as `\\server\share\...`, and a
+                // starts_with('/') test rejected every one of them ("must be an
+                // absolute path" for a path that plainly is one).
+                if !std::path::Path::new(path).is_absolute() || path.contains("..") {
                     return api_error(
                         StatusCode::BAD_REQUEST,
                         &format!("{what} must be an absolute path"),
                     );
                 }
                 if !secure::path_is_visible(path) {
+                    // Only reachable with the OpenBSD sandbox in place, where the
+                    // readable trees are the FHS ones the hint names.
                     return api_error(
                         StatusCode::BAD_REQUEST,
                         &format!(
                             "{what} is outside the sandbox's readable trees ({}) — \
-                             put the certificate under /etc/remgr/ssl",
-                            secure::VISIBLE_ROOTS.join(", ")
+                             put the certificate under {}",
+                            secure::VISIBLE_ROOTS.join(", "),
+                            crate::platform::cert_dir().display()
                         ),
                     );
                 }
