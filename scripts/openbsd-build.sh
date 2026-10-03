@@ -80,5 +80,7 @@ export LIBCLANG_PATH
 export CARGO_NET_GIT_FETCH_WITH_CLI=true
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 export CARGO_INCREMENTAL=0
+# CARGO_TARGET_DIR is honoured: a caller that must keep the several GB of
+# intermediates out of this tree (the CI VM syncs the workspace back) sets it.
 cargo build --release --locked --ignore-rust-version -p remgr
-echo "=== build ok: target/release/remgr ==="
+echo "=== build ok: ${CARGO_TARGET_DIR:-target}/release/remgr ==="
