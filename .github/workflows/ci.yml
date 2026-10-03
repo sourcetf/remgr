@@ -509,12 +509,12 @@ jobs:
           Write-Host "libclang   : $clang"
           Write-Host "protoc     : $(Try-Version $env:PROTOC)"
           Write-Host ''
-          Write-Host 'Both build axes are pinned (toolchain 1.99.0, --locked), so this'
-          Write-Host 'workflow is reproducible: the same commit yields the same bytes.'
-          Write-Host 'A build made on another machine is not byte-identical, because the'
-          Write-Host 'compiler embeds the host and the absolute paths it built from'
-          Write-Host '(this run uses the runner workspace and CARGO_HOME above).'
-          Write-Host 'Verify a downloaded asset against SHA256SUMS, and deploy that asset.'
+          Write-Host 'Pinning the toolchain and the dependency graph makes the build'
+          Write-Host 'predictable, not byte-identical: link.exe stamps the link time into'
+          Write-Host 'the PE header and rustc does not pass /Brepro, so two runs of the'
+          Write-Host 'same commit differ by that field alone. What is guaranteed is that'
+          Write-Host 'the published asset is the exact binary this run built and tested'
+          Write-Host '-- verify a download against SHA256SUMS and deploy that asset.'
 
       - name: Upload the binary
         uses: actions/upload-artifact@v4
@@ -625,11 +625,13 @@ jobs:
             echo "only. See the support table in the README."
             echo
             echo "Reproducibility: the compiler is pinned (\`toolchain: 1.99.0\`) and the"
-            echo "dependency graph is locked (\`--locked\`), so re-running this workflow on the"
-            echo "same commit yields the same binary. A build made on another machine will not"
-            echo "be byte-identical — the compiler embeds the host and the absolute paths it"
-            echo "built from — so verify a downloaded asset against \`SHA256SUMS\` rather than"
-            echo "against a locally built binary, and deploy the asset you verified."
+            echo "dependency graph is locked (\`--locked\`), which makes the build predictable"
+            echo "rather than byte-identical -- link.exe stamps the link time into the PE"
+            echo "header and rustc does not pass \`/Brepro\`, so two runs of one commit differ"
+            echo "by that field alone. What is guaranteed is that these assets are the exact"
+            echo "binaries this run built and smoke-tested: verify a download against"
+            echo "\`SHA256SUMS\` and deploy the asset you verified, rather than comparing it"
+            echo "with a binary built on another machine."
           } > body.md
           echo "ver=$ver" >> "$GITHUB_OUTPUT"
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
