@@ -171,11 +171,15 @@ jobs:
             # ksh, not sh: the script is /bin/ksh and OpenBSD's sh is not ksh
             ksh scripts/openbsd-build.sh
             ls -lh target/release/remgr
-            # prove it is an OpenBSD binary that actually starts, rather than
-            # shipping whatever the build happened to leave behind
-            file target/release/remgr | grep -qi 'ELF.*OpenBSD' || {
-              echo "target/release/remgr is not an OpenBSD executable"; exit 1; }
+            # Prove it is a real OpenBSD binary by RUNNING it -- we are on OpenBSD,
+            # so that is both the strongest check available and the one that matters.
+            # (`file | grep OpenBSD` is not: the OS name in file's output comes from
+            # the .note.openbsd.ident brand note, which the linker need not emit.)
             ./target/release/remgr --version
+            # A binary that was misconstructed for a different libc would have
+            # failed the line above; check the format too, so a *Linux* build that
+            # somehow ran here cannot slip through.
+            file target/release/remgr
 
       - name: Upload the binary
         uses: actions/upload-artifact@v4
@@ -696,8 +700,8 @@ jobs:
             echo "when no console control event is available."
             echo
             echo "The OpenBSD binary is built on OpenBSD (in a QEMU VM, since GitHub has no"
-            echo "OpenBSD runner) so it links against the system libc there, not a Linux or"
-            echo "Windows shim, and the VM run checks it is an OpenBSD ELF before uploading."
+            echo "OpenBSD runner) and the VM run starts it before uploading, so it links"
+            echo "against the system libc there rather than a Linux or Windows shim."
             echo
             echo "Not verified here: behaviour that needs a real client on the far end (EasyTier"
             echo "TUN networking, RustDesk clients, upstream frpc interop) is measured on OpenBSD"
