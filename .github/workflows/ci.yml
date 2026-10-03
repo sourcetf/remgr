@@ -170,14 +170,14 @@ jobs:
             echo "prepare ok: cargo=$(cargo --version), protoc=$(protoc --version), git=$(git --version)"
           run: |
             set -e
-            # Build outside the workspace, which is synced back to the runner: the
-            # intermediates are several GB and only the final binary is wanted.
-            #
-            # /root, not /tmp: OpenBSD mounts /tmp as an mfs -- a fixed slice of
-            # memory -- and a 4 GB target directory written into memory makes the
-            # VM swap, which turned a 43-minute build into an hour and a half. The
-            # root filesystem has the room.
-            export CARGO_TARGET_DIR=/root/remgr-target
+            # Where to build. The OpenBSD image's root partition is small -- a
+            # multi-GB target directory there dies with ENOSPC within minutes -- so
+            # the two candidates are the workspace (a mount from the host) and /tmp
+            # (mfs, i.e. memory plus swap). /tmp wins on speed of transfer and on
+            # not needing the 4 GB to be synced back; the cost is that the VM
+            # swaps, which makes the build roughly twice as long. The job timeout
+            # is set for that.
+            export CARGO_TARGET_DIR=/tmp/remgr-target
             # ksh, not sh: the script is /bin/ksh and OpenBSD's sh is not ksh
             ksh scripts/openbsd-build.sh
             ls -lh "$CARGO_TARGET_DIR/release/remgr"
@@ -188,10 +188,11 @@ jobs:
             "$CARGO_TARGET_DIR/release/remgr" --version
             file "$CARGO_TARGET_DIR/release/remgr"
             # Hand it to the host: anything written inside the workspace is synced
-            # back to the runner after this step. A fresh directory, because
+            # back to the runner after this step. A subdirectory, because
             # upload-artifact stores a lone file under its own name and the publish
-            # job reads every platform as `dist/<artifact>/remgr` (`remgr` itself is
-            # already a directory here -- the crate -- so it cannot be a file name).
+            # job reads every platform as `dist/<artifact>/remgr` -- and `remgr`
+            # itself is already a directory here (the crate), so it cannot be used
+            # as a file name at the workspace root.
             mkdir -p ob-amd64
             cp "$CARGO_TARGET_DIR/release/remgr" ob-amd64/remgr
             ls -lh ob-amd64/remgr
