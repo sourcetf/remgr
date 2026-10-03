@@ -156,13 +156,14 @@ jobs:
             pkg_add rust-1.94.1 llvm-19.1.7p14 protobuf-6.34.1 git-2.53.0
             # And prove the environment is the one the build expects, here, where a
             # message is cheap -- rather than 30 minutes into a compile. libclang is
-            # located the same way the build script locates it (from the package
-            # that installed it), so this cannot disagree with the build.
+            # located the same way the build script locates it, so this cannot
+            # disagree with the build. Note the name: the package installs
+            # `libclang.so.0.0` with no unversioned symlink.
             for t in cargo protoc git; do
               command -v $t >/dev/null || { echo "missing $t after pkg_add"; exit 1; }
             done
-            clang=$(pkg_info -L 'llvm-*' 2>/dev/null | grep -E '/libclang\.so(\.|$)' | head -1) || true
-            [ -n "$clang" ] || { echo "libclang.so not installed by the llvm package"; exit 1; }
+            clang=$(find /usr/local -maxdepth 4 -name 'libclang.so*' -type f 2>/dev/null | head -1) || true
+            [ -n "$clang" ] || { echo "libclang.so* not installed by the llvm package"; exit 1; }
             echo "libclang at $clang"
             echo "prepare ok: cargo=$(cargo --version), protoc=$(protoc --version), git=$(git --version)"
           run: |

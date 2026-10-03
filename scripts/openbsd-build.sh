@@ -55,22 +55,23 @@ for t in cargo protoc git; do
 		{ echo "missing $t: pkg_add rust-1.94.1 llvm-19.1.7p14 protobuf-6.34.1 git-2.53.0" >&2; exit 1; }
 done
 
-# Where is libclang.so? Do not guess. A wrong LIBCLANG_PATH is not noticed until
-# bindgen runs, ~20 minutes into the build, and the versioned directory name is
-# easy to get wrong: `/usr/local/llvm19/lib` does not exist on 7.9 (the package is
-# llvm-19.1.7p14, and its prefix is not the package's stem). Look for the file on
-# disk, and fall back to asking the package that installed it.
+# Where is libclang? Do not guess. A wrong LIBCLANG_PATH is not noticed until
+# bindgen runs, ~20 minutes into the build, and both the directory and the file name
+# are easy to get wrong: the OpenBSD package installs
+# `/usr/local/llvm19/lib/libclang.so.0.0` — no unversioned `libclang.so` — while
+# bindgen accepts `libclang.so` or `libclang.so.*`. So look for the file (by
+# pattern), not for a specific name.
 if [ -z "${LIBCLANG_PATH:-}" ]; then
-	clang=$(find /usr/local -maxdepth 4 -name 'libclang.so' -type f 2>/dev/null | head -1) || true
+	clang=$(find /usr/local -maxdepth 4 -name 'libclang.so*' -type f 2>/dev/null | head -1) || true
 	if [ -z "$clang" ]; then
-		clang=$(pkg_info -L 'llvm-*' 2>/dev/null | grep -E '/libclang\.so$' | head -1) || true
+		clang=$(pkg_info -L 'llvm-*' 2>/dev/null | grep -E '/libclang\.so' | head -1) || true
 	fi
 	[ -n "$clang" ] && LIBCLANG_PATH=$(dirname "$clang")
 fi
-if [ -n "${LIBCLANG_PATH:-}" ] && [ -f "$LIBCLANG_PATH/libclang.so" ]; then
-	echo "libclang: $LIBCLANG_PATH/libclang.so"
+if [ -n "${LIBCLANG_PATH:-}" ] && ls "$LIBCLANG_PATH"/libclang.so* >/dev/null 2>&1; then
+	echo "libclang: $LIBCLANG_PATH/$(ls "$LIBCLANG_PATH" | grep '^libclang\.so' | head -1)"
 else
-	echo "warning: libclang.so not found (pkg_add llvm-19.1.7p14) — bindgen will fail" >&2
+	echo "warning: libclang not found (pkg_add llvm-19.1.7p14) — bindgen will fail" >&2
 fi
 
 ulimit -n 1024
