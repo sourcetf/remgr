@@ -524,8 +524,19 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-  # Publish a release from a green run: a rolling `latest` from master, a versioned
-  # release from a `v*` tag. The assets are the binaries CI just built and verified.
+  # Publish a release from a green run: a rolling `latest` from master (and from a
+  # manual run), a versioned release from a `v*` tag. The assets are the binaries CI
+  # just built and verified.
+  #
+  # Runs only when every job above is green and only for the refs that can produce a
+  # shippable build: a push to master/main, a pushed `v*` tag, or a manual
+  # workflow_dispatch. Never for a pull request -- an unreviewed branch must not be
+  # able to publish over `latest`.
+  #
+  # The rolling tag is *moved* to the built commit before the release is written.
+  # Without that, `latest` keeps pointing at whichever commit first created it, so
+  # `git checkout latest` gives a tree that no longer matches the assets or the body
+  # ("build <sha>") the release advertises.
   #
   # OpenBSD is the sanctioned platform and GitHub has no runner for it, so its
   # binary cannot come from here: it is built on a real OpenBSD machine with
@@ -535,7 +546,10 @@ jobs:
   release:
     name: publish the release
     needs: [build, console, hygiene]
-    if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')) }}
+    # `success()` is spelled out on purpose: a custom `if` on a job with `needs`
+    # REPLACES the implicit "all dependencies succeeded" check, so without it this
+    # job would happily publish over `latest` from a run whose tests failed.
+    if: ${{ success() && (github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')))) }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -548,6 +562,32 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: dist
+
+      - name: Is this a versioned release or the rolling one?
+        id: kind
+        run: |
+          set -eu
+          if [ "${{ github.event_name }}" = "push" ] && [ "${GITHUB_REF#refs/tags/v}" != "$GITHUB_REF" ]; then
+            echo "versioned=true"  >> "$GITHUB_OUTPUT"
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+            echo "this run publishes versioned tag ${GITHUB_REF#refs/tags/}"
+          else
+            echo "versioned=false" >> "$GITHUB_OUTPUT"
+            echo "tag=latest"       >> "$GITHUB_OUTPUT"
+            echo "this run publishes the rolling latest tag"
+          fi
+          echo "ref=$GITHUB_REF  sha=$GITHUB_SHA"
+
+      # The tag has to point at what was built, or `latest` is a moving name for a
+      # fixed old tree. Force-moved only for the rolling tag: a versioned `v*` tag is
+      # the operator's own and is never touched.
+      - name: Move the rolling latest tag to the built commit
+        if: steps.kind.outputs.versioned == 'false'
+        run: |
+          set -eu
+          git tag -f latest "$GITHUB_SHA"
+          git push -f origin refs/tags/latest
+          echo "latest -> $(git rev-parse --short latest)"
 
       - name: Name them, checksum them, describe them
         id: pack
@@ -600,7 +640,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eu
-          tag="${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'latest' }}"
+          tag="${{ steps.kind.outputs.tag }}"
           ids=$(gh api "repos/${{ github.repository }}/releases/tags/$tag" --jq '.assets[].id' 2>/dev/null || true)
           for id in $ids; do
             gh api -X DELETE "repos/${{ github.repository }}/releases/assets/$id" >/dev/null || true
@@ -612,8 +652,8 @@ jobs:
       - name: Publish
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'latest' }}
-          name: ${{ startsWith(github.ref, 'refs/tags/v') && format('ReMgr {0}', github.ref_name) || 'ReMgr — latest master build' }}
+          tag_name: ${{ steps.kind.outputs.tag }}
+          name: ${{ steps.kind.outputs.versioned == 'true' && format('ReMgr {0}', steps.kind.outputs.tag) || 'ReMgr — latest master build' }}
           body_path: body.md
           files: |
             out/remgr-linux-x86_64
