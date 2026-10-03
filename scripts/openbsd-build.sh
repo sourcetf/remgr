@@ -1,12 +1,20 @@
 #!/bin/ksh
 # Build ReMgr on OpenBSD — records the exact environment the binary needs.
 #
-#   pkg_add rust llvm19 protobuf
+#   pkg_add rust-1.94.1 llvm-19.1.7p14 protobuf-6.34.1 git-2.53.0
 #
-# Verified combination (OpenBSD 7.9/amd64, single vcpu VPS):
+# Exact versions on purpose. `pkg_add` resolves a *stem*, and an ambiguous stem is
+# an error when there is no tty to prompt on (as in CI): there is no `llvm19`
+# package — the stem is `llvm`, whose branches are 19/20/21 — and a bare `rust`
+# also matches rust-analyzer, rust-bootstrap and rust-clippy. `git` is not part of
+# OpenBSD's base system, and cargo needs it for the vendored EasyTier patches,
+# which are git dependencies.
+#
+# Verified combination (OpenBSD 7.9/amd64):
 #   rust / cargo 1.94.1   (packages, not rustup)
 #   llvm-19.1.7p14        -> /usr/local/llvm19/lib/libclang.so
 #   protobuf-6.34.1       -> /usr/local/bin/protoc
+#   git-2.53.0
 #
 # Every variable below is load-bearing; none is a leftover:
 #   LIBCLANG_PATH=/usr/local/llvm19/lib
@@ -40,8 +48,9 @@
 #       descriptors than the limit above allows.
 set -e
 cd "$(dirname "$0")/.."
-for t in cargo protoc; do
-	command -v $t >/dev/null || { echo "missing $t: pkg_add rust llvm19 protobuf" >&2; exit 1; }
+for t in cargo protoc git; do
+	command -v $t >/dev/null ||
+		{ echo "missing $t: pkg_add rust-1.94.1 llvm-19.1.7p14 protobuf-6.34.1 git-2.53.0" >&2; exit 1; }
 done
 [ -f /usr/local/llvm19/lib/libclang.so ] ||
 	echo "warning: /usr/local/llvm19/lib/libclang.so missing (pkg_add llvm19) — bindgen will fail" >&2

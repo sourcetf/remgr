@@ -146,7 +146,22 @@ jobs:
           # back onto the runner; the binary comes out as an artifact below
           copyback: false
           prepare: |
-            pkg_add rust llvm19 protobuf
+            set -e
+            # Exact versions, because `pkg_add` resolves a stem and refuses an
+            # ambiguous one in a non-interactive shell: there is no `llvm19`
+            # package (the stem is `llvm`, with 19/20/21 as branches, so the bare
+            # name would have to guess) and `rust` alone matches rust-analyzer,
+            # rust-bootstrap and friends. These are the versions the header of
+            # scripts/openbsd-build.sh records as verified.
+            pkg_add rust-1.94.1 llvm-19.1.7p14 protobuf-6.34.1 git-2.53.0
+            # And prove the environment is the one the build expects, here, where a
+            # message is cheap -- rather than 30 minutes into a compile.
+            for t in cargo protoc git; do
+              command -v $t >/dev/null || { echo "missing $t after pkg_add"; exit 1; }
+            done
+            [ -f /usr/local/llvm19/lib/libclang.so ] || {
+              echo "libclang.so missing: the path scripts/openbsd-build.sh exports is wrong"; exit 1; }
+            echo "prepare ok: cargo=$(cargo --version), protoc=$(protoc --version), git=$(git --version)"
           run: |
             set -e
             # ksh, not sh: the script is /bin/ksh and OpenBSD's sh is not ksh
