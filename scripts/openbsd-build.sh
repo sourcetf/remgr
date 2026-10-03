@@ -33,6 +33,8 @@
 #       scripts/login.conf.d/remgr for why that cannot work.
 #   CARGO_BUILD_JOBS=2 / CARGO_INCREMENTAL=0
 #       one vcpu; more jobs only thrash, incremental artifacts are dead weight.
+#       Overridable from the environment so the CI VM (two vcpus) can ask for
+#       more without editing this file.
 #   CARGO_NET_GIT_FETCH_WITH_CLI=true
 #       the easytier patches are git dependencies and libgit2 needs more
 #       descriptors than the limit above allows.
@@ -47,7 +49,7 @@ ulimit -n 1024
 export RUSTC_BOOTSTRAP=1
 export LIBCLANG_PATH=/usr/local/llvm19/lib
 export CARGO_NET_GIT_FETCH_WITH_CLI=true
-export CARGO_BUILD_JOBS=2
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-2}"
 export CARGO_INCREMENTAL=0
 cargo build --release --locked --ignore-rust-version -p remgr
 echo "=== build ok: target/release/remgr ==="

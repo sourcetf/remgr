@@ -1,9 +1,11 @@
 # CI for ReMgr.
 #
-# ReMgr is developed for OpenBSD (it need(2)s pledge/unveil), and GitHub has no
-# OpenBSD runner, so the *sanctioned* platform cannot be built here — a green run
-# does not mean the OpenBSD daemon compiled. Everything that can be verified on
-# Linux/Windows is:
+# ReMgr is developed for OpenBSD (it need(2)s pledge/unveil). GitHub has no OpenBSD
+# *runner*, but it does have Linux runners that can boot one in QEMU, so the
+# sanctioned platform is built too — in a real OpenBSD VM, with the packages and
+# environment `scripts/openbsd-build.sh` documents. That is what makes the release
+# asset genuine rather than a locally built binary somebody remembers to attach.
+# Everything verified here:
 #
 #   1. `remgr-frps` — the frp wire-protocol implementation (server + client) —
 #      builds and its unit tests pass. Deliberately platform-independent, which
@@ -12,16 +14,17 @@
 #      inline attribute exists, every widget kind has a renderer, and every
 #      endpoint it calls exists in the router.
 #   3. Repository hygiene — no credentials/keys/logs/build output tracked.
-#   4. **Linux and Windows release builds of the whole service**, plus a runtime
-#      smoke test on Linux: start it against a scratch `REMGR_HOME`, fetch the
-#      console over HTTP, and shut it down with SIGTERM. That is what proves the
-#      portability layer actually works rather than merely compiling.
+#   4. **Linux, Windows and OpenBSD release builds of the whole service**, plus a
+#      runtime smoke test on Linux: start it against a scratch `REMGR_HOME`, fetch
+#      the console over HTTP, and shut it down with SIGTERM. That is what proves
+#      the portability layer actually works rather than merely compiling.
 #
-# Both platform builds need LLVM: `kcp-sys` (via EasyTier) and `machine-uid` (via
-# the RustDesk server) run bindgen at build time, which loads libclang.
+# The Linux and Windows builds need LLVM: `kcp-sys` (via EasyTier) and
+# `machine-uid` (via the RustDesk server) run bindgen at build time, which loads
+# libclang. The OpenBSD VM installs its own llvm/protobuf packages.
 #
-# Deployment on OpenBSD (build + install + rcctl) stays manual; see the README
-# and `scripts/preflight.sh`.
+# Deployment on OpenBSD (install + rcctl) stays manual; see the README and
+# `scripts/preflight.sh`.
 name: CI
 
 on:
@@ -110,6 +113,58 @@ jobs:
         with:
           fetch-depth: 0
       - run: sh scripts/check-repo.sh
+
+  # The sanctioned platform, built on the target's own kernel: a real OpenBSD VM in
+  # QEMU on a Linux runner. GitHub has no OpenBSD runner, which is why this used to
+  # be a manual step -- and a manual step is a step that gets skipped: the release
+  # lost its `remgr-openbsd-amd64` asset when a later publish deleted every asset it
+  # found and re-uploaded only the two CI builds, and nobody re-attached it.
+  #
+  # The packages and the variables are the ones `scripts/openbsd-build.sh` records
+  # as verified (rust 1.94.x, llvm19 for libclang, protobuf for protoc). The script
+  # itself is run, not re-implemented, so the documented build and the shipped
+  # binary cannot drift apart.
+  openbsd-build:
+    name: release build (openbsd-amd64)
+    needs: [frp-protocol]
+    runs-on: ubuntu-latest
+    # a cold release build of this dependency tree on two vCPUs, plus the VM boot
+    # and `pkg_add`. Generous on purpose: hitting this limit wastes the whole build.
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build in a real OpenBSD VM
+        uses: vmactions/openbsd-vm@v1.4.8
+        with:
+          release: '7.9'
+          # two cores and 8 GB: one vcpu thrashes on a build this size
+          cpu: 2
+          mem: 8192
+          sync: rsync
+          # the VM's target/ is the whole 4 GB build tree and must not be copied
+          # back onto the runner; the binary comes out as an artifact below
+          copyback: false
+          prepare: |
+            pkg_add rust llvm19 protobuf
+          run: |
+            set -e
+            # ksh, not sh: the script is /bin/ksh and OpenBSD's sh is not ksh
+            ksh scripts/openbsd-build.sh
+            ls -lh target/release/remgr
+            # prove it is an OpenBSD binary that actually starts, rather than
+            # shipping whatever the build happened to leave behind
+            file target/release/remgr | grep -qi 'ELF.*OpenBSD' || {
+              echo "target/release/remgr is not an OpenBSD executable"; exit 1; }
+            ./target/release/remgr --version
+
+      - name: Upload the binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: remgr-openbsd-amd64
+          path: target/release/remgr
+          if-no-files-found: error
+          retention-days: 30
 
   build:
     name: release build (${{ matrix.name }})
@@ -538,14 +593,16 @@ jobs:
   # `git checkout latest` gives a tree that no longer matches the assets or the body
   # ("build <sha>") the release advertises.
   #
-  # OpenBSD is the sanctioned platform and GitHub has no runner for it, so its
-  # binary cannot come from here: it is built on a real OpenBSD machine with
-  # scripts/openbsd-build.sh and attached to this same release by
-  # scripts/publish-openbsd-release.sh. The release body says exactly that, because
-  # a release that quietly ships two of three platforms would be a lie of omission.
+  # OpenBSD is the sanctioned platform and is built in a VM by the job above, so all
+  # three assets are produced by the same run and attached by the same step -- there
+  # is no longer a "attach it by hand afterwards" left open. That gap is exactly how
+  # the OpenBSD asset disappeared from the release: the clear step below removes
+  # every asset it finds, and a manual attachment that nobody repeated was removed
+  # with the rest. scripts/publish-openbsd-release.sh is kept for repairing a release
+  # by hand, not as the normal path.
   release:
     name: publish the release
-    needs: [build, console, hygiene]
+    needs: [build, openbsd-build, console, hygiene]
     # `success()` is spelled out on purpose: a custom `if` on a job with `needs`
     # REPLACES the implicit "all dependencies succeeded" check, so without it this
     # job would happily publish over `latest` from a run whose tests failed.
@@ -597,8 +654,10 @@ jobs:
           sha=$(git rev-parse --short HEAD)
           subject=$(git log -1 --pretty=%s)
           mkdir -p out
-          cp dist/remgr-linux-x86_64/remgr       out/remgr-linux-x86_64
-          cp dist/remgr-windows-x86_64/remgr.exe out/remgr-windows-x86_64.exe
+          cp dist/remgr-linux-x86_64/remgr        out/remgr-linux-x86_64
+          cp dist/remgr-windows-x86_64/remgr.exe  out/remgr-windows-x86_64.exe
+          cp dist/remgr-openbsd-amd64/remgr       out/remgr-openbsd-amd64
+          # one file covering all three, checked in the step below
           (cd out && sha256sum remgr-* > SHA256SUMS)
           {
             echo "ReMgr $ver — build $sha"
@@ -609,16 +668,17 @@ jobs:
             echo "|---|---|---|"
             echo "| Linux x86_64 | remgr-linux-x86_64 | service unit: scripts/systemd/remgr.service |"
             echo "| Windows x86_64 | remgr-windows-x86_64.exe | starts without Npcap; only the EasyTier node needs wintun + Npcap |"
-            echo "| OpenBSD amd64 | remgr-openbsd-amd64 | built on the target, attached afterwards (scripts/publish-openbsd-release.sh) |"
+            echo "| OpenBSD amd64 | remgr-openbsd-amd64 | built in an OpenBSD VM by this run, with scripts/openbsd-build.sh |"
             echo
-            echo "Built and verified by CI on GitHub-hosted runners: both platforms compile,"
-            echo "run their unit tests, and a runtime smoke test starts the service, serves the"
-            echo "console over HTTPS, then stops it again — on Windows through the stop file,"
-            echo "which is the graceful-stop path when no console control event is available."
+            echo "Built and verified by CI on GitHub-hosted runners: all three platforms"
+            echo "compile, the Linux and Windows jobs run their unit tests, and a runtime"
+            echo "smoke test starts the service, serves the console over HTTPS, then stops it"
+            echo "again — on Windows through the stop file, which is the graceful-stop path"
+            echo "when no console control event is available."
             echo
-            echo "The OpenBSD asset is the same binary scripts/openbsd-build.sh produces on the"
-            echo "sanctioned platform, with scripts/preflight.sh run against it. If it is missing"
-            echo "from this release, it has not been attached yet — the other two are unaffected."
+            echo "The OpenBSD binary is built on OpenBSD (in a QEMU VM, since GitHub has no"
+            echo "OpenBSD runner) so it links against the system libc there, not a Linux or"
+            echo "Windows shim, and the VM run checks it is an OpenBSD ELF before uploading."
             echo
             echo "Not verified here: behaviour that needs a real client on the far end (EasyTier"
             echo "TUN networking, RustDesk clients, upstream frpc interop) is measured on OpenBSD"
@@ -637,6 +697,20 @@ jobs:
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           ls -l out
 
+      # The clear step below deletes every asset the release holds, so anything that
+      # is supposed to survive has to be re-uploaded by this run. Refusing to go on
+      # without all three is what keeps a missing asset from turning into a silently
+      # incomplete release: it is exactly how remgr-openbsd-amd64 vanished -- a
+      # manual attachment, deleted by a later publish, never re-attached.
+      - name: Every platform must be present before anything is deleted
+        run: |
+          set -eu
+          for f in remgr-linux-x86_64 remgr-windows-x86_64.exe remgr-openbsd-amd64 SHA256SUMS; do
+            [ -s "out/$f" ] || { echo "out/$f is missing or empty — refusing to publish"; exit 1; }
+          done
+          echo "all four files present:"
+          cat out/SHA256SUMS
+
       - name: Clear the previous publish's assets (nothing stale may survive)
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -648,8 +722,6 @@ jobs:
             gh api -X DELETE "repos/${{ github.repository }}/releases/assets/$id" >/dev/null || true
           done
           echo "cleared: ${ids:-none}"
-          # the OpenBSD binary, if it was attached, is named in the body — say so
-          echo "note: remgr-openbsd-amd64 (if present before) must be re-attached"
 
       - name: Publish
         uses: softprops/action-gh-release@v2
@@ -660,5 +732,6 @@ jobs:
           files: |
             out/remgr-linux-x86_64
             out/remgr-windows-x86_64.exe
+            out/remgr-openbsd-amd64
             out/SHA256SUMS
           fail_on_unmatched_files: true
